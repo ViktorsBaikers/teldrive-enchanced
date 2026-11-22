@@ -7,15 +7,22 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 SNAPSHOT=""
 NATIVE="both"
+WANT_UI=false
+WANT_IMAGE=false
+IMAGE_TAG="teldrive-enchanced:build"
 GO_REQUIRED="go1.27.4"
 VERSION_STRING="v0.1.0-enchanced"
 RCLONE_UPSTREAM_BASE="v1.76.0"
 BUN_IMAGE="oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f"
+DISTROLESS_NAME="gcr.io/distroless/static-debian12:nonroot"
 
 usage() {
   cat >&2 <<'EOF'
-usage: build-repro.sh --snapshot DIR [--native teldrive|rclone|both]
+usage: build-repro.sh --snapshot DIR [--native teldrive|rclone|both] [--ui] [--image] [--image-tag TAG]
 Builds each selected artifact twice from a sealed snapshot and compares digests.
+  --ui         build the UI twice and compare sorted dist manifests
+  --image      build the Docker image twice and compare binary plus base layers
+  --image-tag  base image tag; runs use TAG-1 and TAG-2 (default teldrive-enchanced:build)
 EOF
   exit 2
 }
@@ -24,6 +31,9 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --snapshot) [[ $# -ge 2 ]] || usage; SNAPSHOT="$2"; shift 2 ;;
     --native) [[ $# -ge 2 ]] || usage; NATIVE="$2"; shift 2 ;;
+    --ui) WANT_UI=true; shift ;;
+    --image) WANT_IMAGE=true; shift ;;
+    --image-tag) [[ $# -ge 2 ]] || usage; IMAGE_TAG="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
@@ -54,7 +64,7 @@ printf '%s\n' "$go_version" | grep -Eq "(^| )$GO_REQUIRED( |$)" ||
   fail "Go toolchain must be exactly $GO_REQUIRED (found: $go_version)"
 GO_VERSION="$GO_REQUIRED"
 
-if [[ "$NATIVE" != rclone ]]; then
+if [[ "$NATIVE" != rclone || "$WANT_UI" == true || "$WANT_IMAGE" == true ]]; then
   docker image inspect "$BUN_IMAGE" >/dev/null 2>&1 ||
     fail "pinned Bun image is absent locally; pre-pull it before the gated build"
 fi
@@ -103,6 +113,19 @@ dirty_for() {
     "$SNAPSHOT/manifest.txt" | head -n 1
 }
 head_for() { cat "$SNAPSHOT/$1/HEAD"; }
+
+# --- Sealed metadata (never host checkout or clock) -------------------------
+meta_for() {
+  local repo="$1" root="$WORK/extract/$1"
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$(git -C "$root" rev-parse --short=12 HEAD)" \
+    "$(git -C "$root" log -1 --format=%cI)" \
+    "$(git -C "$root" log -1 --format=%ct)" \
+    "$(head_for "$repo")" \
+    "$(dirty_for "$repo")"
+}
+IFS=$'\t' read -r TD_SHORT TD_DATE TD_EPOCH TD_HEAD TD_DIRTY < <(meta_for teldrive-enchanced)
+IFS=$'\t' read -r RC_SHORT RC_DATE RC_EPOCH RC_HEAD RC_DIRTY < <(meta_for rclone-enchanced)
 
 # --- Warm caches outside the gated builds -----------------------------------
 # Module and Bun caches may be populated here (network allowed). The gated
@@ -184,10 +207,10 @@ OVERALL="PASS"
 build_teldrive() {
   local repo=teldrive-enchanced
   local head short cdate ldflags run root ui1 ui2 ui_eq bin_eq a1 a2
-  head="$(head_for "$repo")"
-  short="$(git -C "$WORK/extract/$repo" rev-parse --short=12 HEAD)"
-  cdate="$(git -C "$WORK/extract/$repo" log -1 --format=%cI)"
-  ldflags="-s -w -X main.version=$VERSION_STRING -X main.commit=$short -X main.date=$cdate"
+  head="$TD_HEAD"
+  short="$TD_SHORT"
+  cdate="$TD_DATE"
+  ldflags="-s -w -X main.version=$VERSION_STRING -X main.commit=$short -X main.date=$cdate -X main.snapshot=$SNAP_DIGEST -X main.dirty=$TD_DIRTY"
 
   for run in 1 2; do
     seed_run_caches "$run"
@@ -202,6 +225,10 @@ build_teldrive() {
   a2="$(sha256sum "$WORK/out2/teldrive" | cut -d' ' -f1)"
   [[ "$("$WORK/out1/teldrive" version | head -n 1)" == "teldrive $VERSION_STRING" ]] ||
     fail "teldrive binary does not report $VERSION_STRING"
+  "$WORK/out1/teldrive" version | grep -qx -- "- snapshot: $SNAP_DIGEST" ||
+    fail "teldrive binary does not report the sealed snapshot digest"
+  "$WORK/out1/teldrive" version | grep -qx -- "- dirty: $TD_DIRTY" ||
+    fail "teldrive binary does not report the sealed dirty state"
   bin_eq=false; cmp -s "$WORK/out1/teldrive" "$WORK/out2/teldrive" && bin_eq=true
   ui1="$(sha256sum "$WORK/ui-manifest1.txt" | cut -d' ' -f1)"
   ui2="$(sha256sum "$WORK/ui-manifest2.txt" | cut -d' ' -f1)"
@@ -227,10 +254,10 @@ build_teldrive() {
 build_rclone() {
   local repo=rclone-enchanced
   local head short cdate ldflags run out a1 a2 bin_eq
-  head="$(head_for "$repo")"
-  short="$(git -C "$WORK/extract/$repo" rev-parse --short=12 HEAD)"
-  cdate="$(git -C "$WORK/extract/$repo" log -1 --format=%cI)"
-  ldflags="-s -w -X github.com/rclone/rclone/fs.Version=$VERSION_STRING"
+  head="$RC_HEAD"
+  short="$RC_SHORT"
+  cdate="$RC_DATE"
+  ldflags="-s -w -X github.com/rclone/rclone/fs.Version=$VERSION_STRING -X github.com/rclone/rclone/fs.BuildCommit=$short -X github.com/rclone/rclone/fs.BuildDate=$cdate -X github.com/rclone/rclone/fs.BuildSnapshot=$SNAP_DIGEST -X github.com/rclone/rclone/fs.BuildDirty=$RC_DIRTY"
 
   for run in 1 2; do
     seed_run_caches "$run"
@@ -242,6 +269,10 @@ build_rclone() {
   a2="$(sha256sum "$WORK/out2/rclone" | cut -d' ' -f1)"
   [[ "$("$WORK/out1/rclone" version | head -n 1)" == "rclone $VERSION_STRING" ]] ||
     fail "rclone binary does not report $VERSION_STRING"
+  "$WORK/out1/rclone" version | grep -qx -- "- build/snapshot: $SNAP_DIGEST" ||
+    fail "rclone binary does not report the sealed snapshot digest"
+  "$WORK/out1/rclone" version | grep -qx -- "- build/commit: $short" ||
+    fail "rclone binary does not report the sealed commit"
   bin_eq=false; cmp -s "$WORK/out1/rclone" "$WORK/out2/rclone" && bin_eq=true
   [[ "$bin_eq" == true ]] || { printf 'build-repro: rclone artifact mismatch\n' >&2; OVERALL=FAIL; }
 
@@ -260,6 +291,92 @@ build_rclone() {
 [[ "$NATIVE" == rclone ]] || build_teldrive
 [[ "$NATIVE" == teldrive ]] || build_rclone
 
+UI_JSON="null"
+if [[ "$WANT_UI" == true ]]; then
+  for run in 1 2; do
+    root="$WORK/ui-tree$run"
+    remove_tree "$root"
+    cp -a "$WORK/extract/teldrive-enchanced" "$root"
+    remove_tree "$root/.git"
+    build_ui_tree "$root" "$run"
+    ui_manifest "$root" "$WORK/ui-only-manifest$run.txt"
+  done
+  ui_a="$(sha256sum "$WORK/ui-only-manifest1.txt" | cut -d' ' -f1)"
+  ui_b="$(sha256sum "$WORK/ui-only-manifest2.txt" | cut -d' ' -f1)"
+  ui_eq=false; cmp -s "$WORK/ui-only-manifest1.txt" "$WORK/ui-only-manifest2.txt" && ui_eq=true
+  [[ "$ui_eq" == true ]] || { printf 'build-repro: UI manifest mismatch\n' >&2; OVERALL=FAIL; }
+  UI_JSON="$(jq -n --arg a "$ui_a" --arg b "$ui_b" --argjson eq "$ui_eq" \
+    '{ui_manifest_sha256_run1:$a, ui_manifest_sha256_run2:$b, ui_manifest_equal:$eq, outcome:$([$eq]|if .[0] then "PASS" else "FAIL" end)}')"
+fi
+
+IMAGE_JSON="null"
+if [[ "$WANT_IMAGE" == true ]]; then
+  image_root="$WORK/extract/teldrive-enchanced"
+  distroless_digest="$(awk 'toupper($1)=="FROM" {print $2}' "$image_root/Dockerfile" |
+    sed -n 's/.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' | tail -n 1)"
+  [[ "$distroless_digest" == sha256:* ]] ||
+    fail "cannot read the pinned distroless digest from the Dockerfile"
+  for run in 1 2; do
+    root="$WORK/image-src$run"
+    remove_tree "$root"
+    cp -a "$image_root" "$root"
+    remove_tree "$root/.git"
+    tag="${IMAGE_TAG}-${run}"
+    log "building image $tag"
+    docker buildx build --no-cache --load --provenance=false \
+      --build-arg "VERSION=$VERSION_STRING" \
+      --build-arg "COMMIT=$TD_SHORT" \
+      --build-arg "BUILD_DATE=$TD_DATE" \
+      --build-arg "SNAPSHOT=$SNAP_DIGEST" \
+      --build-arg "DIRTY=$TD_DIRTY" \
+      --build-arg "SOURCE_DATE_EPOCH=$TD_EPOCH" \
+      --build-arg "DISTROLESS_DIGEST=$distroless_digest" \
+      -t "$tag" "$root" >/dev/null ||
+      fail "image build failed for $tag"
+    cid="$(docker create "$tag")"
+    docker cp "$cid:/usr/bin/teldrive" "$WORK/img-bin$run" >/dev/null
+    docker rm "$cid" >/dev/null
+    docker image inspect "$tag" --format '{{json .RootFS.Layers}}' > "$WORK/img-layers$run.json"
+    docker image inspect "$tag" --format '{{.Id}}' > "$WORK/img-id$run.txt"
+  done
+  img_a="$(sha256sum "$WORK/img-bin1" | cut -d' ' -f1)"
+  img_b="$(sha256sum "$WORK/img-bin2" | cut -d' ' -f1)"
+  img_bin_eq=false; cmp -s "$WORK/img-bin1" "$WORK/img-bin2" && img_bin_eq=true
+  base_eq="$(jq -n --slurpfile a "$WORK/img-layers1.json" --slurpfile b "$WORK/img-layers2.json" \
+    '($a[0][:-1] == $b[0][:-1])')"
+  app_a="$(jq -r '.[-1] // ""' "$WORK/img-layers1.json")"
+  app_b="$(jq -r '.[-1] // ""' "$WORK/img-layers2.json")"
+  layers_eq=false
+  [[ "$(cat "$WORK/img-layers1.json")" == "$(cat "$WORK/img-layers2.json")" ]] && layers_eq=true
+  if [[ "$img_bin_eq" != true ]]; then
+    image_outcome=FAIL
+    OVERALL=FAIL
+    printf 'build-repro: image binary mismatch\n' >&2
+  elif [[ "$layers_eq" == true ]]; then
+    image_outcome=PASS
+  elif [[ "$base_eq" == true ]]; then
+    image_outcome=PASS_WITH_LAYER_DIFFERENCE
+    printf 'build-repro: final layer differs (%s vs %s); binary and base layers match\n' "$app_a" "$app_b" >&2
+  else
+    image_outcome=FAIL
+    OVERALL=FAIL
+    printf 'build-repro: base image layers differ between runs\n' >&2
+  fi
+  IMAGE_JSON="$(jq -n \
+    --arg tag1 "${IMAGE_TAG}-1" --arg tag2 "${IMAGE_TAG}-2" \
+    --arg id1 "$(cat "$WORK/img-id1.txt")" --arg id2 "$(cat "$WORK/img-id2.txt")" \
+    --arg bin1 "$img_a" --arg bin2 "$img_b" --argjson bin_eq "$img_bin_eq" \
+    --argjson layers_eq "$layers_eq" --argjson base_eq "$base_eq" \
+    --arg app1 "$app_a" --arg app2 "$app_b" --arg outcome "$image_outcome" \
+    --arg distroless "$distroless_digest" \
+    --arg distroless_name "$DISTROLESS_NAME" \
+    '{tag_run1:$tag1, tag_run2:$tag2, image_id_run1:$id1, image_id_run2:$id2,
+      binary_sha256_run1:$bin1, binary_sha256_run2:$bin2, image_binary_equal:$bin_eq,
+      image_layers_equal:$layers_eq, image_base_layers_equal:$base_eq,
+      application_layer_sha256_run1:$app1, application_layer_sha256_run2:$app2,
+      base_image_name:$distroless_name, base_image_digest:$distroless, image_outcome:$outcome}')"
+fi
+
 artifacts="{}"
 for artifact in "${!ARTIFACT_JSON[@]}"; do
   artifacts="$(jq -c --arg k "$artifact" --argjson v "${ARTIFACT_JSON[$artifact]}" '. + {($k): $v}' <<<"$artifacts")"
@@ -267,11 +384,25 @@ done
 
 FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RECEIPT="$WORK/receipt.json"
+metadata="$(jq -n \
+  --arg version "$VERSION_STRING" --arg snap "$SNAP_DIGEST" \
+  --arg upstream "$RCLONE_UPSTREAM_BASE" \
+  --arg td_short "$TD_SHORT" --arg td_head "$TD_HEAD" --arg td_date "$TD_DATE" \
+  --arg td_epoch "$TD_EPOCH" --argjson td_dirty "$TD_DIRTY" \
+  --arg rc_short "$RC_SHORT" --arg rc_head "$RC_HEAD" --arg rc_date "$RC_DATE" \
+  --arg rc_epoch "$RC_EPOCH" --argjson rc_dirty "$RC_DIRTY" \
+  '{version:$version, snapshot_sha256:$snap, upstream_base:$upstream,
+    teldrive:{commit:$td_short, commit_full:$td_head, build_date:$td_date,
+      build_epoch:($td_epoch|tonumber), dirty:$td_dirty},
+    rclone:{commit:$rc_short, commit_full:$rc_head, build_date:$rc_date,
+      build_epoch:($rc_epoch|tonumber), dirty:$rc_dirty}}')"
 jq -n --arg snap "$SNAP_DIGEST" --arg go "$GO_VERSION" --arg version "$VERSION_STRING" \
-  --argjson artifacts "$artifacts" \
+  --argjson artifacts "$artifacts" --argjson metadata "$metadata" \
+  --argjson ui "$UI_JSON" --argjson image "$IMAGE_JSON" \
   --arg started "$STARTED_AT" --arg finished "$FINISHED_AT" --arg outcome "$OVERALL" \
   '{snapshot_sha256:$snap, version:$version, go_version:$go, started_at:$started,
-    finished_at:$finished, outcome:$outcome, artifacts:$artifacts}' > "$RECEIPT"
+    finished_at:$finished, outcome:$outcome, metadata:$metadata, ui:$ui, image:$image,
+    artifacts:$artifacts}' > "$RECEIPT"
 chmod 600 "$RECEIPT"
 
 printf 'BUILD %s snapshot_sha256=%s receipt=%s/work-%s/receipt.json\n' \
