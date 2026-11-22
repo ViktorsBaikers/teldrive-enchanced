@@ -28,6 +28,243 @@ environment:
 
 Only expose directories Teldrive is allowed to read.
 
+### Completion and resume compatibility
+
+Upgrade the service, every worker, browser assets, and custom rclone together. Upload sessions
+advertise `requiresCompletionManifest: true`. Updated clients refuse sessions without this
+capability; older clients that send an empty completion body are incompatible.
+
+Both owner and public-share completion endpoints require JSON containing `size`, the exact
+nonnegative plaintext byte count. An optional `hash` uses the existing BLAKE3 file-hash format.
+Completion checks the manifest against the stored parts before publishing the file. Repeating
+the same manifest after a successful completion returns the same file; a different manifest conflicts.
+The caller must still have access to the current completed file. Moving a result out of a
+shared folder does not let former folder editors replay completion to read its new metadata.
+
+Chunk geometry must align to 16 MiB blocks. Resume requires immutable checksums for stored
+parts and comparison with the current source bytes. Metadata equality alone does not prove
+that a source is unchanged. Legacy unaligned sessions and stored parts without usable proof
+cannot be safely resumed.
+
+Session responses preserve fractional RFC3339 `modTime` values. Resume identity compares
+source and stored timestamps at PostgreSQL's microsecond precision, not whole seconds.
+This metadata check never replaces current-byte verification.
+
+The tree hash is BLAKE3 over the ordered 16 MiB block digests. An empty file has no block
+digests, so its root is BLAKE3 of an empty digest sequence.
+
+Disabling `hashing-enabled` does not authorize an unverified replay. Clients that require
+part checksums, including the updated rclone backend, fail closed when proof is unavailable.
+
+HTTP imports consume one full response for MIME detection, part replay, and publication.
+Queued metadata, matching validators, or matching destination metadata cannot replace
+current-byte verification. Local imports also compare actual source bytes before skipping a file.
+Deferred local jobs recheck the current allowed-root policy and use root-anchored opens
+for transfer and skip verification. A queued path replaced by an escaping symlink is rejected.
+A matching plaintext destination cannot satisfy an explicitly encrypted import or required
+encryption policy; the import replaces it with encrypted content instead.
+
+### Lifecycle safety candidate: C1–C6
+
+The lifecycle candidate has isolated runtime proof, not final acceptance. Independent security
+and phase assessment still prevent closure; modeled legacy proof does not establish compatibility
+with the unavailable historical executable.
+This is not an upgrade instruction or deployment, release or production-restore approval.
+
+Contract names are C1 durable remote-attempt ledger, C2 short hierarchy transactions and
+lock order, C3 remote/SQL failure and bounded recovery, C4 HTTP/importer/client semantics,
+C5 events/generation/release compatibility, and C6 isolated migration/recovery proof.
+
+#### Durable provenance and deletion fences (C1–C3)
+
+Each remote message attempt reserves durable identity before sending. A positive receipt
+must match its owner, channel, lease and exact upload part or copy operation/result.
+An error, missing response, message listing or matching metadata does not establish ownership
+or prove deletion. Unknown outcomes remain retained and reportable rather than guessed away.
+
+Deletion requires current reference checks and a committed physical-message fence. Publication
+and legacy binders share that fence; a cleanup scan cannot delete a concurrently bound winner.
+Remote deletion runs outside SQL. Only confirmed deletion or confirmed absence acknowledges
+the exact committed claim. Publication ambiguity never authorizes compensating deletion.
+
+Each receipt has at most **four lifetime logical destructive invocations**, including immediate
+cleanup and later workers. Cancellation, ambiguous ACK, duplicate delivery, restart, removed
+River jobs and manual retry do not reset that budget. Destructive message/channel requests
+bypass both application retry and flood-wait middleware. This bounds forwarded logical
+invocations, not raw Telegram packets: lower gotd DC/reconnect/MTProto delivery remains a
+transport residual, not an exactly-once guarantee.
+
+#### Destination lifetime and completed replay (C2, C4–C5)
+
+Publication checks the complete current active ancestry, not just the immediate parent.
+Trash, purge and hierarchy replacement terminalize admitted destinations in the same
+transaction. Restoring a folder does not revive the old upload/copy attempt or its epoch.
+A publication-first winner remains a real child of later deletion; a deletion-first attempt
+cannot recreate its folder, replace another file or emit a successful publication event.
+
+Purge may detach ordinary aborted or expired sessions from removed parents while retaining
+their terminal state, reason and evidence. It does not turn them into new root uploads.
+Unknown-destination sessions keep their conservative veto.
+
+Completion atomically transfers the exact upload-part aliases to file ownership, captures
+immutable replay proof and retires those aliases. Direct part replay, claims, waiters and
+part listings use that proof after retirement. A completed session is not a blanket cleanup
+exemption. A historical file ID or completion manifest alone is not current success:
+replay reads the full current body through EOF, verifies its hash, then rechecks the current
+result identity, full active ancestry and actor/share access. Zero-byte results still require
+the exact manifest and current authorization.
+
+Existing event names and payloads remain unchanged. Same-key creation/copy replay emits
+no duplicate publication. Admission/pins add no SSE stream. A batch fenced before session
+creation records its retained failure without inventing `upload.aborted`. Losers emit no
+committed completing/completed/`file.created` transition; later deletion of a winner emits
+only its ordinary committed hierarchy events.
+
+#### Finite recovery and owner-visible reports (C3)
+
+The composition root binds one real receipt enqueuer exactly once before HTTP or workers.
+Its caller-transaction insert records owner metadata and returns the actual positive River
+job ID. Receipt disposition, immutable first `job_id`, current `wakeup_job_id` and insertion
+commit together. A sweep ID or guessed sequence is not an owner report.
+
+Recovery discovers ledger-only debt, including a crash after receipt observation but before
+cleanup enqueue. Each pass fixes a database cutoff and advances a `(created_at, id)` cursor
+over pages of exactly 1000, including retained rows. New debt waits for a later pass.
+Unknown, referenced, live, foreign or exhausted entries remain retained; they cannot trap
+the scan on its first page. Purge reports incomplete work while required physical cleanup
+is pending or unknown; catalog disappearance is not proof of remote deletion.
+
+Owner job views retain the first report even after River cancellation/removal or replacement
+wakeups. Unknown/no-message work remains report-only. Unresolved or exhausted work rejects
+explicit retry with `409/conflict`; it does not acquire a fresh lifetime budget.
+
+The enabled system schedule `receipt_cleanup_sweep` is mandatory:
+
+| Field | Required value |
+| --- | --- |
+| ID and kind | `receipt_cleanup_sweep` |
+| Args | `{}` |
+| Queue | `maintenance` |
+| Priority / max attempts | `2` / `3` |
+| Tags | empty |
+| Cron / timezone | `@every 12h` / `UTC` |
+| Paused | `false` |
+
+Startup upserts and validates the complete definition or fails; mere row existence is
+insufficient. Unchanged cron/timezone retain the existing due time. Every create, update,
+replace, pause, resume and delete writer protects the reserved ID and reserved-kind aliases.
+Periodic mutations require authentication and admin/owner role (`401`/`403` otherwise);
+even administrators receive `409/conflict` for unsafe system-schedule changes.
+Ordinary schedule management remains available. Reset atomically rebuilds all defaults
+while retaining/reconciling the required row and its unchanged due time. Interruption
+retains the prior catalog; unknown commit outcome is not reported as successful reset.
+
+Ordinary periodic definitions accept effective priorities 1–4. The total persisted definition
+count, including paused schedules and defaults, cannot exceed 10000. Startup fails without
+deleting retained rows when existing definitions violate those bounds.
+
+#### Request intent and source lifetime (C4)
+
+Upload/copy admission retains the original request key, fingerprint and selected target,
+scoped to owner and actor/share. Lost create ACKs and truncated terminal responses replay
+the same intent before any fresh folder/session allocation. Mismatched or in-progress
+requests conflict; not every `409` becomes a fatal command error. An explicit new intent
+is different from automatic retry of an admitted attempt.
+
+The owner browser queue retains its private process-local File and task identity through
+pause/retry. Public upload retains the selected File in the native input after failure;
+there is no public retained-task retry UI or persistent resume. A later explicit file
+selection is new intent. Successful public completion remains successful if refreshing the
+listing fails; the page reports the refresh error without aborting the completed upload.
+Neither path changes the user's original source bytes or promises browser-crash recovery.
+
+Rclone retains one identity across low-level retries and actual CLI command passes,
+including lost ACK/truncated errors before terminal classification. A decoded terminal
+destination failure stops the command even if another file already produced a retryable
+error. This does not disable unrelated transient retries or valid resume.
+Admission ownership precedence is durable VFS dirty generation, actual RC job, effective
+CLI command, inherited transient scope, then one ordinary Background Copy call.
+RC `_group` is not job identity. Fresh Fs objects inside one owner retain admission;
+independent jobs, commands and calls do not share it.
+
+Buffered/spooled raw Rcat owns one transient scope around its existing inner Retry after
+bytes become rewindable. `cmd.Run(false)` gains no outer CLI retries. Scope ends on return
+or cancellation; disappeared stdin has no cross-invocation or crash replay promise.
+Nonbuffered PutStream remains one-shot. VFS persists admission before send and selection
+before parts; unchanged reopen/requeue/reset retains identity and dirty bytes. Only actual
+changed content or destination creates a new dirty generation. Legacy/uncertain journals
+fail closed; do not remove dirty cache or let an old cache writer touch candidate evidence.
+Keep `--vfs-write-back 24h`.
+
+Original logical source and requested primary destination are separate from wire source,
+comparison FileID and transformed/effective destination. No inverse transform reconstructs
+intent. The same carrier reaches server/manual copy, Update, Put, PutUnchecked, PutStream,
+chunk writers and Rcat. Admission checks run before destination discovery, metadata equality,
+fallback upload, cleanup, backup lookup, case-change hops, source deletion and Move/DirMove
+path/cache preparation. All three comparison consumers propagate marked failures before
+transfer/rename/deletion enqueue; only positively unadmitted work retains ordinary fallback.
+Metadata equality cannot acknowledge admitted work without current byte/result proof.
+
+#### Durable imports, Q → A → S → B (C2, C4)
+
+Q records an immutable existing destination anchor (or explicit root), canonical remainder
+and request fingerprint before source preflight, stat/open or expansion. Pre-A anchor loss
+is terminal; replay does not resolve a replacement path or re-anchor at root.
+A commits folders, child identities, owner metadata and actual River child insertion
+atomically. S selects one upload UUID and immutable `selected_create` descriptor containing
+name, size/hash, MIME, canonical modification time, encryption choice/key version, conflict
+policy and part geometry. It contains no source credentials or encryption key bytes.
+B materializes only that selection; replay cannot allocate another session.
+
+Workers consume the saved descriptor, not today's preferred key/geometry/defaults.
+Current required encryption, key availability, allowed-root policy and root-anchored
+source containment can veto execution, but never renegotiate selection. Cancelled/removed
+River rows do not erase batch/attempt/result identity or permit replacement dispatch.
+Local and HTTP imports still verify current complete source bytes; queued validators
+or matching destination metadata cannot substitute for body EOF/hash and current result access.
+
+#### Retained channels and deliberate deletion (C1–C3)
+
+Successful remote channel creation is retained even if bot lookup/enrollment fails before
+the creator returns, including a known channel ID returned with an error. Rollover,
+ResolveMany and admin Create also retain it after SQL rollback, commit ACK loss or unavailable
+readback. Bounded readback reports `cleanup_not_attempted_retained` with known current
+selection or honest uncertainty; it does not restore an assumed selection or delete a winner.
+
+Separately authorized intentional whole-channel Delete remains destructive and useful.
+It can destroy unknown payload in that channel; receipt cleanup authority does not grant
+that broader permission. Delete first checks current selections, file/upload references
+and nondeleted receipt reservations across **all owners**, including reservations without
+a message ID. A short SQL transaction commits a sparse physical closing intent before the
+one explicit RPC. No SQL lock spans that RPC. Positive ACK permits exact-token finalization
+and removal of all registrations; the deleted tombstone remains.
+
+Cancellation, failure and ambiguous ACK leave the channel closed. There is no automatic
+retry or reopen. Discover filters closing/deleted identities; Sync, Select, explicit Resolve,
+Create/rollover hints and authoritative Claim/Reserve/Observe/Store/Complete/Copy gates
+cannot publish into them. Channel selection is only a hint, never a write reservation.
+
+### Coordinated cutover and isolated recovery limits (C5–C6)
+
+Old writable services are unsafe even with workers disabled: inline compensation can
+delete candidate winners. Do not mix old service, workers, browser, rclone or cache writers
+with candidate evidence. Evidence-bearing recovery is forward-only using fence-aware code.
+The migration's Down guard refuses retained receipts, request/import identity, unknown
+destination evidence and channel intents. An empty Down success is not old-binary approval.
+
+Legacy detached/root sessions and unassociated imports or dirty cache may be unavailable
+conservatively. `upload_destination_unknown` is a reason-only veto, not proof that a parent
+was deleted and not permission to reinterpret NULL as intentional root. A new explicit
+root intent is distinct. Revised acceptance uses explicitly modeled pre-migration fixtures,
+real dump and distinct restore, actual migration, and independent row, trigger and byte checks.
+This does not reconstruct historical source or prove compatibility with a lost executable.
+
+Lifecycle acceptance remains incomplete. Synthetic protocol tests cannot replace actual
+generated HTTP/SQL, checksum-bound CLI, durable cache restart or restored-database proof.
+No Plex/original-quality, Windows, live Telegram durability, performance, production restore
+or release acceptance follows. Preserve research and distinguish historical observations
+from currently retained raw evidence.
+
 ## Workers
 
 See [Jobs and queues](/operations/jobs-and-queues) for worker settings. At least one process sharing the database must run workers.

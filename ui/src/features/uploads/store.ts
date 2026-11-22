@@ -2,7 +2,8 @@ import { hashKey } from "@tanstack/react-query";
 import { create } from "zustand";
 import { apiFetch } from "@/api/client";
 import { invalidResponse, normalizeApiError, userMessage } from "@/api/errors";
-import type { FileEntry, UploadPart, UploadSession, UserPreferences } from "@/api/types";
+import type { components } from "@/api/schema";
+import type { FileEntry, UploadSession, UserPreferences } from "@/api/types";
 import { newClientId } from "@/features/shared/client-id";
 import { newIdempotencyKey } from "@/features/shared/idempotency";
 import { getQueryClient } from "@/lib/queryClient";
@@ -30,6 +31,8 @@ export type UploadTask = {
   progress: number;
   uploadedBytes: number;
   uploadId?: string;
+  createKey: string;
+  createPayload?: string;
   partSize?: number;
   fileId?: string;
   error?: string;
@@ -86,6 +89,7 @@ export const useUploadStore = create<UploadState>((set, get) => ({
         mimeType: file.type || "application/octet-stream",
         modTime: file.lastModified,
         parentId,
+        createKey: newIdempotencyKey(),
         path,
         relativePath,
         status: "queued",
@@ -145,45 +149,23 @@ async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-async function listStoredParts(uploadId: string, signal: AbortSignal) {
-  let cursor: string | undefined;
-  const result: UploadPart[] = [];
-  do {
-    const query = new URLSearchParams({ limit: "200" });
-    if (cursor) query.set("cursor", cursor);
-    const page = await jsonRequest<{ items: UploadPart[]; nextCursor?: string }>(
-      `/v1/uploads/${encodeURIComponent(uploadId)}/parts?${query}`,
-      { signal },
-    );
-    result.push(...page.items);
-    cursor = page.nextCursor || undefined;
-  } while (cursor);
-  return result.filter((part) => part.state === "stored");
-}
+type UploadCompleteRequest = components["schemas"]["UploadCompleteRequest"];
 
 async function getOrCreateSession(task: UploadTask, signal: AbortSignal): Promise<UploadSession> {
   if (task.uploadId) {
-    try {
-      const existing = await jsonRequest<UploadSession>(
-        `/v1/uploads/${encodeURIComponent(task.uploadId)}`,
-        { signal },
-      );
-      if (!validUploadSession(existing))
-        throw invalidResponse("The upload session response is malformed.");
-      return existing;
-    } catch (error) {
-      if (![404, 410].includes(normalizeApiError(error).status)) throw error;
-    }
+    const existing = await jsonRequest<UploadSession>(
+      `/v1/uploads/${encodeURIComponent(task.uploadId)}`,
+      { signal },
+    );
+    if (!validUploadSession(existing))
+      throw invalidResponse("The upload session response is malformed.");
+    return existing;
   }
-  const { uploads } = await getQueryClient().ensureQueryData(preferencesQueryOptions());
-  const parentId = await resolveTaskParent(task, signal);
-  const created = await jsonRequest<UploadSession>("/v1/uploads", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Idempotency-Key": newIdempotencyKey(),
-    },
-    body: JSON.stringify({
+  let payload = task.createPayload;
+  if (payload === undefined) {
+    const { uploads } = await getQueryClient().ensureQueryData(preferencesQueryOptions());
+    const parentId = await resolveTaskParent(task, signal);
+    payload = JSON.stringify({
       parentId,
       name: task.name,
       size: task.size,
@@ -192,7 +174,17 @@ async function getOrCreateSession(task: UploadTask, signal: AbortSignal): Promis
       encryption: uploads.encryption,
       conflictPolicy: uploads.conflictPolicy,
       preferredPartSize: uploads.preferredPartSize,
-    }),
+    });
+    // Persist before sending: a lost response must replay this exact admission.
+    useUploadStore.getState().patchTask(task.id, { createPayload: payload });
+  }
+  const created = await jsonRequest<UploadSession>("/v1/uploads", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Idempotency-Key": task.createKey,
+    },
+    body: payload,
     signal,
   });
   if (!validUploadSession(created))
@@ -324,9 +316,12 @@ function validUploadSession(value: UploadSession) {
   return Boolean(
     value &&
       typeof value.id === "string" &&
-      typeof value.partSize === "number" &&
+      value.id.length > 0 &&
+      value.requiresCompletionManifest === true &&
+      Number.isSafeInteger(value.partSize) &&
       value.partSize > 0 &&
-      typeof value.state === "string",
+      value.partSize % (16 * 1024 * 1024) === 0 &&
+      (value.state === "open" || value.state === "completed"),
   );
 }
 
@@ -347,34 +342,22 @@ async function runTask(taskId: string) {
   controllers.set(taskId, controller);
   store.patchTask(taskId, { status: "running", error: undefined });
   try {
+    if (!Number.isSafeInteger(file.size) || file.size < 0)
+      throw invalidResponse("The upload session response is malformed.");
     const session = await getOrCreateSession(task, controller.signal);
-    if (session.state === "completed") {
-      files.delete(taskId);
-      store.patchTask(taskId, {
-        status: "completed",
-        progress: 100,
-        uploadedBytes: task.size,
-        uploadId: session.id,
-        fileId: session.fileId,
-      });
-      refreshUploadedFiles();
-      return;
-    }
-    if (session.state !== "open") throw new Error(`Upload session is ${session.state}.`);
+    if (Math.ceil(file.size / session.partSize) > 2147483647)
+      throw invalidResponse("The upload session response is malformed.");
     store.patchTask(taskId, { uploadId: session.id, partSize: session.partSize });
-    const storedParts = await listStoredParts(session.id, controller.signal);
-    const stored = new Map(storedParts.map((part) => [part.partNo, part.plainSize]));
-    let uploaded = [...stored.values()].reduce((sum, size) => sum + size, 0);
+    let uploaded = 0;
     store.patchTask(taskId, {
       uploadedBytes: uploaded,
       progress: task.size ? Math.round((uploaded / task.size) * 100) : 100,
     });
-    const totalParts = task.size === 0 ? 0 : Math.ceil(task.size / session.partSize);
+    const totalParts = file.size === 0 ? 0 : Math.ceil(file.size / session.partSize);
     for (let partNo = 1; partNo <= totalParts; partNo++) {
       if (controller.signal.aborted) throw new DOMException("Upload paused", "AbortError");
-      if (stored.has(partNo)) continue;
       const start = (partNo - 1) * session.partSize;
-      const end = Math.min(task.size, start + session.partSize);
+      const end = Math.min(file.size, start + session.partSize);
       const blob = file.slice(start, end);
       const uploadedBeforePart = uploaded;
       await uploadPart(session.id, partNo, blob, controller.signal, (partUploadedBytes) => {
@@ -394,7 +377,11 @@ async function runTask(taskId: string) {
       `/v1/uploads/${encodeURIComponent(session.id)}/complete`,
       {
         method: "POST",
-        headers: { "Idempotency-Key": newIdempotencyKey() },
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": newIdempotencyKey(),
+        },
+        body: JSON.stringify({ size: file.size } satisfies UploadCompleteRequest),
         signal: controller.signal,
       },
     );

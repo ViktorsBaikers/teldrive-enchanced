@@ -382,7 +382,8 @@ async function installApi(page: Page) {
           modTime: now,
           encryption: false,
           conflictPolicy: "rename",
-          partSize: 16,
+          partSize: 16 * 1024 * 1024,
+          requiresCompletionManifest: true,
           state: "open",
           expiresAt: now,
           createdAt: now,
@@ -393,6 +394,7 @@ async function installApi(page: Page) {
       return route.fulfill({ json: { items: [] } });
     }
     if (path === "/v1/uploads/66666666-6666-4666-8666-666666666666/parts/1" && method === "PUT") {
+      expect(request.postDataBuffer()).toEqual(Buffer.from("hello world!"));
       return route.fulfill({
         status: 201,
         json: {
@@ -406,6 +408,8 @@ async function installApi(page: Page) {
       });
     }
     if (path === "/v1/uploads/66666666-6666-4666-8666-666666666666/complete" && method === "POST") {
+      expect(request.headers()["content-type"]).toContain("application/json");
+      expect(request.postDataJSON()).toEqual({ size: 12 });
       uploaded = true;
       return route.fulfill({
         status: 201,
@@ -429,7 +433,8 @@ async function installApi(page: Page) {
                   modTime: now,
                   encryption: false,
                   conflictPolicy: "rename",
-                  partSize: 16,
+                  partSize: 16 * 1024 * 1024,
+                  requiresCompletionManifest: true,
                   state: "completed",
                   expiresAt: now,
                   createdAt: now,
