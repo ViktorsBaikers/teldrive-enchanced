@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 )
 
 // Sync upserts Telegram channels the authenticated user can administer. It
@@ -39,6 +40,16 @@ func (s *Service) Sync(ctx context.Context, userID int64, remote []RemoteChannel
 		return nil, fmt.Errorf("begin channel sync: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := lifecycle.LockOwnerTx(ctx, tx, userID); err != nil {
+		return nil, err
+	}
+	channelIDs := make([]int64, 0, len(items))
+	for _, item := range items {
+		channelIDs = append(channelIDs, item.ID)
+	}
+	if err := lifecycle.RequireWritableChannelsTx(ctx, tx, channelIDs); err != nil {
+		return nil, err
+	}
 	queries := s.queries.WithTx(tx)
 	encoded, err := json.Marshal(items)
 	if err != nil {

@@ -120,18 +120,18 @@ func (s *GotdStorage) Upload(ctx context.Context, request UploadRequest) (Stored
 		if err != nil {
 			return fmt.Errorf("publish Telegram document message: %w", err)
 		}
-		messageID, documentSize, err := uploadedMessage(response)
+		messageID, documentSize, err := uploadedDestinationMessage(response, request.ChannelID)
 		if err != nil {
 			return err
 		}
+		stored = StoredPart{ChannelID: request.ChannelID, MessageID: messageID, Size: documentSize}
 		if documentSize != request.Size {
 			return fmt.Errorf("%w: got %d, want %d", ErrSizeMismatch, documentSize, request.Size)
 		}
-		stored = StoredPart{ChannelID: request.ChannelID, MessageID: messageID, Size: documentSize}
 		return nil
 	})
 	if err != nil {
-		return StoredPart{}, err
+		return stored, err
 	}
 	if stored.MessageID == 0 {
 		if cause := context.Cause(ctx); cause != nil {
@@ -647,18 +647,21 @@ func (s *GotdStorage) CopyPart(ctx context.Context, userID, sourceChannelID, sou
 		if err != nil {
 			return fmt.Errorf("copy Telegram document: %w", err)
 		}
-		messageID, copiedSize, err := uploadedMessage(response)
+		messageID, copiedSize, err := uploadedDestinationMessage(response, destinationChannelID)
 		if err != nil {
 			return err
 		}
+		if destinationChannelID == sourceChannelID && messageID == sourceMessageID {
+			return ErrInvalidRequest
+		}
+		copied = StoredPart{ChannelID: destinationChannelID, MessageID: messageID, Size: copiedSize}
 		if copiedSize != size {
 			return fmt.Errorf("%w: copied %d, source %d", ErrSizeMismatch, copiedSize, size)
 		}
-		copied = StoredPart{ChannelID: destinationChannelID, MessageID: messageID, Size: copiedSize}
 		return nil
 	})
 	if err != nil {
-		return StoredPart{}, err
+		return copied, err
 	}
 	return copied, nil
 }
@@ -670,21 +673,29 @@ func (s *GotdStorage) DeleteMessages(ctx context.Context, userID, channelID int6
 	if len(messageIDs) == 0 {
 		return nil
 	}
+	unique := make([]int64, 0, len(messageIDs))
+	seen := make(map[int64]struct{}, len(messageIDs))
+	for _, id := range messageIDs {
+		if id <= 0 || int64(int(id)) != id {
+			return ErrInvalidRequest
+		}
+		if _, exists := seen[id]; !exists {
+			seen[id] = struct{}{}
+			unique = append(unique, id)
+		}
+	}
 	return s.runner.Run(ctx, userID, OperationManage, func(runCtx context.Context, api *tg.Client) error {
 		channel, err := inputChannel(runCtx, api, channelID)
-		if errors.Is(err, ErrInvalidChannel) {
-			return nil
-		}
 		if err != nil {
 			return err
 		}
-		for start := 0; start < len(messageIDs); start += deleteBatchSize {
-			end := min(start+deleteBatchSize, len(messageIDs))
+		for start := 0; start < len(unique); start += deleteBatchSize {
+			if err := runCtx.Err(); err != nil {
+				return err
+			}
+			end := min(start+deleteBatchSize, len(unique))
 			ids := make([]int, 0, end-start)
-			for _, id := range messageIDs[start:end] {
-				if id <= 0 {
-					return ErrInvalidRequest
-				}
+			for _, id := range unique[start:end] {
 				ids = append(ids, int(id))
 			}
 			if _, err := api.ChannelsDeleteMessages(runCtx, &tg.ChannelsDeleteMessagesRequest{Channel: channel, ID: ids}); err != nil {
@@ -760,29 +771,33 @@ func (s *GotdStorage) CreateChannel(ctx context.Context, userID int64, name stri
 		}
 		for _, chat := range updates.Chats {
 			channel, ok := chat.(*tg.Channel)
-			if !ok || !isBroadcastChannel(channel) {
+			if !ok || channel.ID == 0 || !isBroadcastChannel(channel) {
 				continue
 			}
+			created = Channel{ID: channel.ID, Name: channel.Title}
 			if s.botProvider != nil {
 				bots, botErr := s.botProvider.ChannelBots(runCtx, userID, api)
 				if botErr != nil {
-					_, _ = api.ChannelsDeleteChannel(runCtx, channel.AsInput())
 					return fmt.Errorf("resolve Telegram upload bots: %w", botErr)
 				}
 				for _, bot := range bots {
 					if adminErr := setBotAdmin(runCtx, api, channel.AsInput(), bot); adminErr != nil {
-						_, _ = api.ChannelsDeleteChannel(runCtx, channel.AsInput())
 						return fmt.Errorf("add Telegram upload bot as channel admin: %w", adminErr)
 					}
 				}
 			}
-			created = Channel{ID: channel.ID, Name: channel.Title}
 			return nil
 		}
 		return ErrInvalidChannel
 	})
 	if err != nil {
-		return Channel{}, err
+		if created.ID != 0 {
+			return created, &ChannelCreationError{UserID: userID, ChannelID: created.ID, Err: err}
+		}
+		return created, err
+	}
+	if created.ID == 0 {
+		return Channel{}, ErrInvalidChannel
 	}
 	return created, nil
 }
@@ -793,9 +808,6 @@ func (s *GotdStorage) DeleteChannel(ctx context.Context, userID, channelID int64
 	}
 	return s.runner.Run(ctx, userID, OperationManage, func(runCtx context.Context, api *tg.Client) error {
 		channel, err := fullChannel(runCtx, api, channelID)
-		if errors.Is(err, ErrInvalidChannel) {
-			return nil
-		}
 		if err != nil {
 			return err
 		}
@@ -905,14 +917,15 @@ func fullChannel(ctx context.Context, api *tg.Client, channelID int64) (*tg.Chan
 	if len(chats) == 0 {
 		return nil, ErrInvalidChannel
 	}
-	channel, ok := chats[0].(*tg.Channel)
-	if !ok {
-		return nil, fmt.Errorf("unexpected Telegram chat %T", chats[0])
+	for _, chat := range chats {
+		if channel, ok := chat.(*tg.Channel); ok && channel.ID == channelID && channel.ID != 0 {
+			return channel, nil
+		}
 	}
-	return channel, nil
+	return nil, ErrInvalidChannel
 }
 
-func uploadedMessage(response tg.UpdatesClass) (int64, int64, error) {
+func uploadedDestinationMessage(response tg.UpdatesClass, destination int64) (int64, int64, error) {
 	updates, ok := response.(*tg.Updates)
 	if !ok {
 		return 0, 0, fmt.Errorf("unexpected Telegram upload response %T", response)
@@ -924,6 +937,10 @@ func uploadedMessage(response tg.UpdatesClass) (int64, int64, error) {
 		}
 		msg, ok := channelMessage.Message.(*tg.Message)
 		if !ok {
+			continue
+		}
+		peer, ok := msg.PeerID.(*tg.PeerChannel)
+		if !ok || peer.ChannelID != destination || destination == 0 || msg.ID <= 0 {
 			continue
 		}
 		document, ok := messageDocument(msg)

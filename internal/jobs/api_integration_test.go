@@ -15,10 +15,7 @@ import (
 
 func TestRuntimeRetryClearsCancellationMarker(t *testing.T) {
 	db := testpostgres.New(t)
-	runtime, err := NewRuntime(db.Pool, defaultsStorage{})
-	if err != nil {
-		t.Fatalf("NewRuntime() error = %v", err)
-	}
+	runtime := newDefaultsRuntime(t, db.Pool)
 	ctx := context.Background()
 	inserted, err := runtime.client.Insert(ctx, UploadCleanupSweepArgs{}, &river.InsertOpts{
 		Metadata: []byte(`{"custom":"kept"}`),
@@ -55,10 +52,7 @@ func TestRuntimeRetryClearsCancellationMarker(t *testing.T) {
 
 func TestRuntimeRetryPreservesRunningCancellationMarker(t *testing.T) {
 	db := testpostgres.New(t)
-	runtime, err := NewRuntime(db.Pool, defaultsStorage{})
-	if err != nil {
-		t.Fatalf("NewRuntime() error = %v", err)
-	}
+	runtime := newDefaultsRuntime(t, db.Pool)
 	ctx := context.Background()
 	inserted, err := runtime.client.Insert(ctx, UploadCleanupSweepArgs{}, nil)
 	if err != nil {

@@ -77,7 +77,7 @@ func TestChannelAdminLifecycleAgainstRealPostgres(t *testing.T) {
 	if _, err := conflictingService.Create(ctx, 1001, "conflict", false); err == nil {
 		t.Fatal("expected create conflict")
 	}
-	if conflictingCreator.deleteCalls() != 1 {
-		t.Fatalf("create compensation deletes = %d", conflictingCreator.deleteCalls())
+	if conflictingCreator.deleteCalls() != 0 {
+		t.Fatalf("automatic create deletes = %d", conflictingCreator.deleteCalls())
 	}
 }

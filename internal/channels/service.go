@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 )
 
 var (
@@ -32,6 +34,8 @@ type RemoteChannel struct {
 
 // Creator performs Telegram-side channel lifecycle operations. Implementations
 // are expected to add the configured upload bots before returning from Create.
+// Create may return a known channel alongside a provisioning error. Callers must
+// retain that identity and must never automatically delete the remote channel.
 type Creator interface {
 	Create(ctx context.Context, userID int64, name string) (RemoteChannel, error)
 	Delete(ctx context.Context, userID, channelID int64) error
@@ -91,6 +95,9 @@ func (s *Service) Resolve(ctx context.Context, userID, requestedChannelID int64)
 		if full {
 			return 0, ErrChannelFull
 		}
+		if err := s.requireWritableHint(ctx, userID, requestedChannelID); err != nil {
+			return 0, err
+		}
 		return requestedChannelID, nil
 	}
 
@@ -102,6 +109,9 @@ func (s *Service) Resolve(ctx context.Context, userID, requestedChannelID int64)
 				return 0, countErr
 			}
 			if !full {
+				if err := s.requireWritableHint(ctx, userID, selected.ChannelID); err != nil {
+					return 0, err
+				}
 				return selected.ChannelID, nil
 			}
 		}
@@ -118,8 +128,8 @@ func (s *Service) Resolve(ctx context.Context, userID, requestedChannelID int64)
 	return s.rollover(ctx, userID)
 }
 
-// ResolveMany reserves channel capacity for count parts while holding the
-// rollover lock. The returned channel IDs correspond to parts in input order.
+// ResolveMany plans channel capacity under the rollover lock, in part order.
+// Returned IDs are hints; each remote write still requires a committed receipt reservation.
 func (s *Service) ResolveMany(ctx context.Context, userID int64, count int) (channelIDs []int64, err error) {
 	if userID <= 0 {
 		return nil, ErrInvalidOwner
@@ -167,6 +177,9 @@ func (s *Service) ResolveMany(ctx context.Context, userID int64, count int) (cha
 			capacity = min(capacity, count-len(channelIDs))
 		}
 		if channelID != 0 && capacity > 0 {
+			if err := s.requireWritableHint(ctx, userID, channelID); err != nil {
+				return nil, err
+			}
 			for range capacity {
 				channelIDs = append(channelIDs, channelID)
 			}
@@ -197,7 +210,7 @@ func (s *Service) createSelectedChannel(ctx context.Context, conn *pgxpool.Conn,
 	name := fmt.Sprintf("%s_%s", strings.TrimSpace(s.config.NamePrefix), s.now().UTC().Format("20060102_150405"))
 	remote, err := s.creator.Create(ctx, userID, name)
 	if err != nil {
-		return nil, fmt.Errorf("create Telegram channel: %w", err)
+		return nil, s.retainAllocation(userID, remote.ID, nil, fmt.Errorf("create Telegram channel: %w", err))
 	}
 	if remote.ID == 0 {
 		return nil, errors.New("Telegram returned an empty channel id")
@@ -207,27 +220,28 @@ func (s *Service) createSelectedChannel(ctx context.Context, conn *pgxpool.Conn,
 	}
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		s.compensateDelete(userID, remote.ID)
-		return nil, fmt.Errorf("begin channel allocation transaction: %w", err)
+		return nil, s.retainAllocation(userID, remote.ID, nil, fmt.Errorf("begin channel allocation: %w", err))
 	}
 	defer tx.Rollback(ctx)
+	if err := lifecycle.LockOwnerTx(ctx, tx, userID); err != nil {
+		return nil, s.retainAllocation(userID, remote.ID, tx, err)
+	}
+	if err := lifecycle.RequireWritableChannelsTx(ctx, tx, []int64{remote.ID}); err != nil {
+		return nil, s.retainAllocation(userID, remote.ID, tx, err)
+	}
 	q := queries.WithTx(tx)
 	if err := q.ClearSelectedChannel(ctx, userID); err != nil {
-		s.compensateDelete(userID, remote.ID)
-		return nil, fmt.Errorf("clear selected channel: %w", err)
+		return nil, s.retainAllocation(userID, remote.ID, tx, fmt.Errorf("clear selected channel: %w", err))
 	}
 	if _, err := q.CreateChannel(ctx, sqlcgen.CreateChannelParams{ChannelID: remote.ID, UserID: userID, Name: remote.Name}); err != nil {
-		s.compensateDelete(userID, remote.ID)
-		return nil, fmt.Errorf("create channel record: %w", err)
+		return nil, s.retainAllocation(userID, remote.ID, tx, fmt.Errorf("create channel record: %w", err))
 	}
 	selected, err := q.SelectChannel(ctx, sqlcgen.SelectChannelParams{UserID: userID, ChannelID: remote.ID})
 	if err != nil {
-		s.compensateDelete(userID, remote.ID)
-		return nil, fmt.Errorf("select channel record: %w", err)
+		return nil, s.retainAllocation(userID, remote.ID, tx, fmt.Errorf("select channel record: %w", err))
 	}
 	if err := tx.Commit(ctx); err != nil {
-		s.compensateDelete(userID, remote.ID)
-		return nil, fmt.Errorf("commit channel allocation: %w", err)
+		return nil, s.retainAllocation(userID, remote.ID, nil, fmt.Errorf("commit channel allocation: %w", err))
 	}
 	return selected, nil
 }
@@ -278,61 +292,124 @@ func (s *Service) rollover(ctx context.Context, userID int64) (channelID int64, 
 			return 0, countErr
 		}
 		if !full {
+			if err := s.requireWritableHint(ctx, userID, selected.ChannelID); err != nil {
+				return 0, err
+			}
 			return selected.ChannelID, nil
 		}
 	} else if selectedErr != nil && !errors.Is(selectedErr, pgx.ErrNoRows) {
 		return 0, fmt.Errorf("recheck selected channel: %w", selectedErr)
 	}
-
-	name := fmt.Sprintf("%s_%s", strings.TrimSpace(s.config.NamePrefix), s.now().UTC().Format("20060102_150405"))
-	remote, err := s.creator.Create(ctx, userID, name)
+	selected, err = s.createSelectedChannel(ctx, conn, lockedQueries, userID)
 	if err != nil {
-		return 0, fmt.Errorf("create Telegram channel: %w", err)
+		return 0, err
 	}
-	if remote.ID == 0 {
-		return 0, errors.New("Telegram returned an empty channel id")
-	}
-	if strings.TrimSpace(remote.Name) == "" {
-		remote.Name = name
-	}
-
-	tx, err := conn.BeginTx(ctx, pgx.TxOptions{})
-	if err != nil {
-		s.compensateDelete(userID, remote.ID)
-		return 0, fmt.Errorf("begin channel rollover transaction: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	q := lockedQueries.WithTx(tx)
-	if err := q.ClearSelectedChannel(ctx, userID); err != nil {
-		s.compensateDelete(userID, remote.ID)
-		return 0, fmt.Errorf("clear selected channel: %w", err)
-	}
-	if _, err := q.CreateChannel(ctx, sqlcgen.CreateChannelParams{
-		ChannelID: remote.ID,
-		UserID:    userID,
-		Name:      remote.Name,
-	}); err != nil {
-		s.compensateDelete(userID, remote.ID)
-		return 0, fmt.Errorf("create channel record: %w", err)
-	}
-	if _, err := q.SelectChannel(ctx, sqlcgen.SelectChannelParams{
-		UserID:    userID,
-		ChannelID: remote.ID,
-	}); err != nil {
-		s.compensateDelete(userID, remote.ID)
-		return 0, fmt.Errorf("select channel record: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		s.compensateDelete(userID, remote.ID)
-		return 0, fmt.Errorf("commit channel rollover: %w", err)
-	}
-	return remote.ID, nil
+	return selected.ChannelID, nil
 }
 
-func (s *Service) compensateDelete(userID, channelID int64) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+// AllocationFailure reports retention, never remote cleanup authority.
+type AllocationFailure struct {
+	UserID      int64
+	ChannelID   int64
+	Disposition string
+	State       string
+	Cause       error
+	Secondary   error
+}
+
+func (e *AllocationFailure) Error() string {
+	return fmt.Sprintf("channel allocation failed: owner=%d channel=%d disposition=%s state=%s", e.UserID, e.ChannelID, e.Disposition, e.State)
+}
+
+func (e *AllocationFailure) Unwrap() []error {
+	if e.Secondary == nil {
+		return []error{e.Cause}
+	}
+	return []error{e.Cause, e.Secondary}
+}
+
+func (s *Service) retainAllocation(userID, channelID int64, tx pgx.Tx, cause error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = s.creator.Delete(ctx, userID, channelID)
+	report := &AllocationFailure{UserID: userID, ChannelID: channelID,
+		Disposition: "cleanup_not_attempted_retained", State: "unknown_retained", Cause: cause}
+	defer func() {
+		secondaryCode := "none"
+		if report.Secondary != nil {
+			secondaryCode = "allocation_reconciliation_failed"
+		}
+		slog.WarnContext(ctx, "channel allocation retained", "user_id", userID, "channel_id", channelID,
+			"disposition", report.Disposition, "state", report.State,
+			"primary_code", "channel_allocation_failed", "secondary_code", secondaryCode)
+	}()
+	rolledBack := errors.Is(cause, pgx.ErrTxCommitRollback)
+	if tx != nil {
+		if err := tx.Rollback(ctx); err != nil {
+			report.Secondary = errors.Join(report.Secondary, fmt.Errorf("rollback allocation: %w", err))
+		} else {
+			rolledBack = true
+		}
+	}
+	// A separate pool acquisition never reuses the failed allocation transaction.
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		report.Secondary = errors.Join(report.Secondary, fmt.Errorf("read retained allocation: %w", err))
+		return report
+	}
+	defer conn.Release()
+	q := sqlcgen.New(conn)
+	var rowErr error
+	if channelID != 0 {
+		_, rowErr = q.GetChannelForUser(ctx, sqlcgen.GetChannelForUserParams{UserID: userID, ChannelID: channelID})
+	}
+	_, selectedErr := q.GetSelectedChannel(ctx, userID)
+	if selectedErr != nil && !errors.Is(selectedErr, pgx.ErrNoRows) {
+		report.Secondary = errors.Join(report.Secondary, fmt.Errorf("read retained selection: %w", selectedErr))
+	}
+	selectionKnown := selectedErr == nil || errors.Is(selectedErr, pgx.ErrNoRows)
+	if channelID != 0 && rowErr == nil && selectionKnown {
+		report.State = "committed_row_retained"
+	} else if errors.Is(rowErr, pgx.ErrNoRows) && rolledBack && selectionKnown {
+		report.State = "known_rollback_unpersisted_retained"
+	} else if rowErr != nil && !errors.Is(rowErr, pgx.ErrNoRows) {
+		report.Secondary = errors.Join(report.Secondary, fmt.Errorf("read retained channel: %w", rowErr))
+	}
+	return report
+}
+
+func (s *Service) requireWritableHint(ctx context.Context, userID, channelID int64) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err = lifecycle.LockOwnerTx(ctx, tx, userID); err != nil {
+		return err
+	}
+	if err = lifecycle.RequireWritableChannelsTx(ctx, tx, []int64{channelID}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// FilterDiscoverable is read-only; discovery never grants later write authority.
+func (s *Service) FilterDiscoverable(ctx context.Context, userID int64, remote []RemoteChannel) ([]RemoteChannel, error) {
+	if s == nil || s.pool == nil || userID <= 0 {
+		return nil, ErrInvalidOwner
+	}
+	result := make([]RemoteChannel, 0, len(remote))
+	for _, channel := range remote {
+		if channel.ID == 0 {
+			return nil, ErrInvalidChannel
+		}
+		_, err := s.queries.GetChannelDeletionIntent(ctx, channel.ID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			result = append(result, channel)
+		} else if err != nil {
+			return nil, fmt.Errorf("filter channel intent: %w", err)
+		}
+	}
+	return result, nil
 }
 
 func advisoryLockID(userID int64) int64 {

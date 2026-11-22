@@ -139,8 +139,16 @@ func TestRolloverCompensatesDatabaseFailure(t *testing.T) {
 	if _, err := svc.Resolve(context.Background(), 1001, 0); err == nil {
 		t.Fatal("expected database conflict")
 	}
-	if creator.deleteCalls() != 1 {
-		t.Fatalf("compensating deletes = %d, want 1", creator.deleteCalls())
+	if creator.deleteCalls() != 0 {
+		t.Fatalf("automatic deletes = %d, want 0", creator.deleteCalls())
+	}
+	var selected int64
+	if err := db.Pool.QueryRow(context.Background(), "SELECT channel_id FROM channels WHERE user_id=1001 AND selected").Scan(&selected); err != nil || selected != 9001 {
+		t.Fatalf("existing selection changed: %d, %v", selected, err)
+	}
+	var retained bool
+	if err := db.Pool.QueryRow(context.Background(), "SELECT EXISTS(SELECT 1 FROM channels WHERE user_id=1001 AND channel_id=9999)").Scan(&retained); err != nil || !retained {
+		t.Fatalf("conflicting existing registration lost: %v", err)
 	}
 }
 

@@ -115,6 +115,22 @@ func TestPrettyHandlerWithoutColor(t *testing.T) {
 	}
 }
 
+func TestPrettyHandlerEscapes(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	logger := slog.New(newPrettyHandler(&out, slog.LevelInfo, false))
+	logger.Info("started", "value", "first\nsecond=forged")
+
+	got := out.String()
+	if strings.Count(got, "\n") != 1 {
+		t.Fatalf("value forged extra lines: %q", got)
+	}
+	if !strings.Contains(got, `value="first\nsecond=forged"`) {
+		t.Fatalf("value was not quoted: %q", got)
+	}
+}
+
 func TestJSONLoggerRemainsUncolored(t *testing.T) {
 	t.Parallel()
 

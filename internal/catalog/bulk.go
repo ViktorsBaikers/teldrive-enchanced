@@ -4,17 +4,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
 	"github.com/tgdrive/teldrive/v2/internal/dbtypes"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 )
 
 const maxBulkFiles = 500
@@ -53,15 +52,41 @@ func (s *Service) BulkTrash(ctx context.Context, userID int64, rawIDs []uuid.UUI
 		return nil, fmt.Errorf("begin bulk trash: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	// A subtree update emits one event per affected row. This transaction-local
+	// lane keeps the gate wait and absolute budget but lifts only the row cap.
+	// SET LOCAL ends with the transaction, so the pool never inherits it.
+	if _, err = tx.Exec(ctx, "SET LOCAL teldrive.event_bulk = 'on'"); err != nil {
+		return nil, fmt.Errorf("select bulk event lane: %w", err)
+	}
 	queries := s.queries.WithTx(tx)
 	fileIDs := pgUUIDs(ids)
+	if err := lifecycle.LockOwnerTx(ctx, tx, userID); err != nil {
+		return nil, err
+	}
+	if s.lifecycle == nil {
+		return nil, ErrLifecycleUnavailable
+	}
 
-	roots, err := queries.LockActiveFiles(ctx, sqlcgen.LockActiveFilesParams{UserID: userID, FileIds: fileIDs})
+	roots, err := queries.ListActiveFilesForLifecycle(ctx, sqlcgen.ListActiveFilesForLifecycleParams{UserID: userID, FileIds: fileIDs})
 	if err != nil {
-		return nil, fmt.Errorf("lock bulk trash roots: %w", err)
+		return nil, fmt.Errorf("load bulk trash roots: %w", err)
 	}
 	if len(roots) != len(ids) {
 		return nil, ErrNotFound
+	}
+	subtree, err := queries.ListLifecycleSubtreeIDs(ctx, sqlcgen.ListLifecycleSubtreeIDsParams{UserID: userID, RootIds: fileIDs})
+	if err != nil {
+		return nil, err
+	}
+	subtreeIDs := make([]uuid.UUID, len(subtree))
+	for i, id := range subtree {
+		subtreeIDs[i] = uuid.UUID(id.Bytes)
+	}
+	if err = s.lifecycle.TerminalizeDestinationsTx(ctx, tx, userID, subtreeIDs); err != nil {
+		return nil, err
+	}
+	if err = queries.LockCatalogRowsForLifecycle(ctx, sqlcgen.LockCatalogRowsForLifecycleParams{UserID: userID, FileIds: subtree}); err != nil {
+		return nil, err
 	}
 	items, err := queries.TrashFileSubtrees(ctx, sqlcgen.TrashFileSubtreesParams{UserID: userID, FileIds: fileIDs})
 	if err != nil {
@@ -116,30 +141,27 @@ func (s *Service) bulkMove(ctx context.Context, userID int64, rawIDs []uuid.UUID
 	defer tx.Rollback(ctx)
 	queries := s.queries.WithTx(tx)
 
-	if parentID != nil {
-		if _, err := queries.LockActiveFolder(ctx, sqlcgen.LockActiveFolderParams{
-			FolderID: dbtypes.UUID(*parentID), UserID: userID,
-		}); errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrInvalidParent
-		} else if err != nil {
-			return nil, fmt.Errorf("lock bulk move destination: %w", err)
-		}
+	if err := lifecycle.LockOwnerTx(ctx, tx, userID); err != nil {
+		return nil, err
 	}
-	if err := queries.AcquireAdvisoryTransactionLock(ctx, catalogDestinationLockID(userID, parentID)); err != nil {
-		return nil, fmt.Errorf("lock bulk move namespace: %w", err)
+	if err := checkActiveParent(ctx, queries, userID, parentID); err != nil {
+		return nil, err
 	}
-
-	lockedRows, err := queries.LockActiveFiles(ctx, sqlcgen.LockActiveFilesParams{
-		UserID: userID, FileIds: pgUUIDs(ids),
-	})
+	lockedRows, err := queries.ListActiveFilesForLifecycle(ctx, sqlcgen.ListActiveFilesForLifecycleParams{UserID: userID, FileIds: pgUUIDs(ids)})
 	if err != nil {
-		return nil, fmt.Errorf("lock bulk move files: %w", err)
+		return nil, err
 	}
 	locked := make(map[uuid.UUID]*sqlcgen.File, len(ids))
 	for _, file := range lockedRows {
 		id, ok := fileUUID(file)
 		if !ok {
 			return nil, ErrNotFound
+		}
+		if file.ParentID.Valid {
+			parent := uuid.UUID(file.ParentID.Bytes)
+			if err := checkActiveParent(ctx, queries, userID, &parent); err != nil {
+				return nil, err
+			}
 		}
 		locked[id] = file
 	}
@@ -169,7 +191,7 @@ func (s *Service) bulkMove(ctx context.Context, userID int64, rawIDs []uuid.UUID
 		}
 	}
 
-	destination, err := queries.LockActiveDestinationEntries(ctx, sqlcgen.LockActiveDestinationEntriesParams{
+	destination, err := queries.ListActiveDestinationEntries(ctx, sqlcgen.ListActiveDestinationEntriesParams{
 		UserID: userID, ParentID: dbtypes.OptionalUUID(parentID),
 	})
 	if err != nil {
@@ -241,6 +263,19 @@ func (s *Service) bulkMove(ctx context.Context, userID int64, rawIDs []uuid.UUID
 				invalidated = append(invalidated, id)
 			}
 		}
+		if s.lifecycle == nil {
+			return nil, ErrLifecycleUnavailable
+		}
+		if err = s.lifecycle.TerminalizeDestinationsTx(ctx, tx, userID, invalidated); err != nil {
+			return nil, err
+		}
+		lockIDs := append(pgUUIDs(ids), pgUUIDs(invalidated)...)
+		if parentID != nil {
+			lockIDs = append(lockIDs, dbtypes.UUID(*parentID))
+		}
+		if err = queries.LockCatalogRowsForLifecycle(ctx, sqlcgen.LockCatalogRowsForLifecycleParams{UserID: userID, FileIds: lockIDs}); err != nil {
+			return nil, err
+		}
 		if err := queries.MarkFileSubtreesDeletionPending(ctx, sqlcgen.MarkFileSubtreesDeletionPendingParams{
 			FileIds: pgUUIDs(replacedRoots), UserID: userID,
 		}); err != nil {
@@ -251,6 +286,16 @@ func (s *Service) bulkMove(ctx context.Context, userID int64, rawIDs []uuid.UUID
 		}); err != nil {
 			return nil, fmt.Errorf("revoke replaced subtree shares: %w", err)
 		}
+	}
+	catalogIDs := append(pgUUIDs(ids), pgUUIDs(invalidated)...)
+	if parentID != nil {
+		catalogIDs = append(catalogIDs, dbtypes.UUID(*parentID))
+	}
+	if err = queries.LockCatalogRowsForLifecycle(ctx, sqlcgen.LockCatalogRowsForLifecycleParams{UserID: userID, FileIds: catalogIDs}); err != nil {
+		return nil, err
+	}
+	if err = queries.AcquireAdvisoryTransactionLock(ctx, catalogDestinationLockID(userID, parentID)); err != nil {
+		return nil, err
 	}
 
 	updatedRows, err := queries.MoveFilesWithNames(ctx, sqlcgen.MoveFilesWithNamesParams{

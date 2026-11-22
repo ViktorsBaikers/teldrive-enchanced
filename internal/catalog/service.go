@@ -18,17 +18,20 @@ import (
 	"github.com/tgdrive/teldrive/v2/internal/cache"
 	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
 	"github.com/tgdrive/teldrive/v2/internal/dbtypes"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 )
 
 var (
-	ErrNotFound      = errors.New("file not found")
-	ErrConflict      = errors.New("file name conflict")
-	ErrInvalidName   = errors.New("invalid file name")
-	ErrInvalidOwner  = errors.New("invalid owner")
-	ErrInvalidParent = errors.New("invalid parent folder")
-	ErrNotAFile      = errors.New("catalog entry is not an active file")
-	ErrCycle         = errors.New("folder move would create a cycle")
-	ErrPrecondition  = errors.New("generation precondition failed")
+	ErrNotFound             = errors.New("file not found")
+	ErrConflict             = errors.New("file name conflict")
+	ErrInvalidName          = errors.New("invalid file name")
+	ErrInvalidOwner         = errors.New("invalid owner")
+	ErrInvalidParent        = errors.New("invalid parent folder")
+	ErrNotAFile             = errors.New("catalog entry is not an active file")
+	ErrCycle                = errors.New("folder move would create a cycle")
+	ErrPrecondition         = errors.New("generation precondition failed")
+	ErrParentUnavailable    = errors.New("upload destination folder is unavailable")
+	ErrLifecycleUnavailable = errors.New("catalog lifecycle is not configured")
 )
 
 type Service struct {
@@ -37,10 +40,19 @@ type Service struct {
 	now          func() time.Time
 	cache        cache.Cacher
 	cacheStripes [64]sync.RWMutex
+	lifecycle    *lifecycle.Service
 }
 
 func NewService(pool *pgxpool.Pool, c cache.Cacher) *Service {
 	return &Service{pool: pool, queries: sqlcgen.New(pool), now: time.Now, cache: c}
+}
+
+func (s *Service) BindLifecycle(policy *lifecycle.Service) error {
+	if policy == nil || s.lifecycle != nil {
+		return ErrLifecycleUnavailable
+	}
+	s.lifecycle = policy
+	return nil
 }
 
 func (s *Service) cacheKey(parts ...any) string {
@@ -62,30 +74,28 @@ func (s *Service) CreateFolder(ctx context.Context, in CreateFolderInput) (*sqlc
 	if in.UserID <= 0 {
 		return nil, ErrInvalidOwner
 	}
-	if in.ParentID != nil {
-		if _, err := s.queries.GetActiveFolderForUser(ctx, sqlcgen.GetActiveFolderForUserParams{
-			FolderID: dbtypes.UUID(*in.ParentID),
-			UserID:   in.UserID,
-		}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return nil, ErrInvalidParent
-			}
-			return nil, fmt.Errorf("get parent folder: %w", err)
-		}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if err = lifecycle.LockOwnerTx(ctx, tx, in.UserID); err != nil {
+		return nil, err
+	}
+	q := s.queries.WithTx(tx)
+	if err = checkActiveParent(ctx, q, in.UserID, in.ParentID); err != nil {
+		return nil, err
 	}
 	modTime := in.ModTime
 	if modTime.IsZero() {
 		modTime = s.now().UTC()
 	}
-	file, err := s.queries.CreateFolder(ctx, sqlcgen.CreateFolderParams{
-		ID:       dbtypes.UUID(uuid.New()),
-		UserID:   in.UserID,
-		ParentID: dbtypes.OptionalUUID(in.ParentID),
-		Name:     in.Name,
-		ModTime:  dbtypes.Time(modTime.UTC()),
-	})
+	file, err := q.CreateFolder(ctx, sqlcgen.CreateFolderParams{ID: dbtypes.UUID(uuid.New()), UserID: in.UserID, ParentID: dbtypes.OptionalUUID(in.ParentID), Name: in.Name, ModTime: dbtypes.Time(modTime.UTC())})
 	if err != nil {
 		return nil, classifyWriteError("create folder", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
 	}
 	return file, nil
 }
@@ -422,7 +432,31 @@ func (s *Service) Rename(ctx context.Context, userID int64, fileID uuid.UUID, ex
 	if userID <= 0 {
 		return nil, ErrInvalidOwner
 	}
-	file, err := s.queries.UpdateFileMetadata(ctx, sqlcgen.UpdateFileMetadataParams{
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if err = lifecycle.LockOwnerTx(ctx, tx, userID); err != nil {
+		return nil, err
+	}
+	q := s.queries.WithTx(tx)
+	current, err := q.GetFileForUser(ctx, sqlcgen.GetFileForUserParams{UserID: userID, FileID: dbtypes.UUID(fileID)})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	parent, _ := dbtypes.GoogleUUID(current.ParentID)
+	var parentID *uuid.UUID
+	if current.ParentID.Valid {
+		parentID = &parent
+	}
+	if err = checkActiveParent(ctx, q, userID, parentID); err != nil {
+		return nil, err
+	}
+	file, err := q.UpdateFileMetadata(ctx, sqlcgen.UpdateFileMetadataParams{
 		Name:               dbtypes.Text(rawName),
 		FileID:             dbtypes.UUID(fileID),
 		UserID:             userID,
@@ -436,6 +470,9 @@ func (s *Service) Rename(ctx context.Context, userID int64, fileID uuid.UUID, ex
 	}
 	if err != nil {
 		return nil, classifyWriteError("rename file", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
 	}
 	s.invalidateFile(ctx, userID, fileID)
 	return file, nil
@@ -462,7 +499,36 @@ func (s *Service) Restore(ctx context.Context, userID int64, fileID uuid.UUID) (
 	if userID <= 0 {
 		return nil, ErrInvalidOwner
 	}
-	files, err := s.queries.RestoreFileSubtree(ctx, sqlcgen.RestoreFileSubtreeParams{FileID: dbtypes.UUID(fileID), UserID: userID})
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if err = lifecycle.LockOwnerTx(ctx, tx, userID); err != nil {
+		return nil, err
+	}
+	q := s.queries.WithTx(tx)
+	current, err := q.GetFileForUser(ctx, sqlcgen.GetFileForUserParams{UserID: userID, FileID: dbtypes.UUID(fileID)})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if current.ParentID.Valid {
+		parent := uuid.UUID(current.ParentID.Bytes)
+		if err = checkActiveParent(ctx, q, userID, &parent); err != nil {
+			return nil, err
+		}
+	}
+	subtree, err := q.ListLifecycleSubtreeIDs(ctx, sqlcgen.ListLifecycleSubtreeIDsParams{UserID: userID, RootIds: []pgtype.UUID{dbtypes.UUID(fileID)}})
+	if err != nil {
+		return nil, err
+	}
+	if err = q.LockCatalogRowsForLifecycle(ctx, sqlcgen.LockCatalogRowsForLifecycleParams{UserID: userID, FileIds: subtree}); err != nil {
+		return nil, err
+	}
+	files, err := q.RestoreFileSubtree(ctx, sqlcgen.RestoreFileSubtreeParams{FileID: dbtypes.UUID(fileID), UserID: userID})
 	if err != nil {
 		return nil, classifyWriteError("restore file subtree", err)
 	}
@@ -492,6 +558,9 @@ func (s *Service) Restore(ctx context.Context, userID int64, fileID uuid.UUID) (
 	}
 	if root == nil {
 		return nil, ErrNotFound
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
 	}
 	s.InvalidateFiles(ctx, userID, ids...)
 	return root, nil
@@ -525,4 +594,70 @@ func classifyWriteError(action string, err error) error {
 		return ErrConflict
 	}
 	return fmt.Errorf("%s: %w", action, err)
+}
+
+func checkActiveParent(ctx context.Context, q *sqlcgen.Queries, userID int64, parentID *uuid.UUID) error {
+	if parentID == nil {
+		return nil
+	}
+	active, err := q.IsLifecycleDestinationActive(ctx, sqlcgen.IsLifecycleDestinationActiveParams{UserID: userID, ParentID: dbtypes.UUID(*parentID)})
+	if err != nil {
+		return err
+	}
+	if !active {
+		return ErrParentUnavailable
+	}
+	return nil
+}
+
+type CheckActiveImportResultInput struct {
+	UserID               int64
+	FileID               uuid.UUID
+	ParentID             *uuid.UUID
+	Encryption           bool
+	EncryptionKeyVersion *int32
+}
+
+// CheckActiveImportResultTx composes with source selection; it never starts a nested transaction.
+func (s *Service) CheckActiveImportResultTx(ctx context.Context, tx pgx.Tx, in CheckActiveImportResultInput) (*sqlcgen.File, error) {
+	if in.UserID <= 0 || in.FileID == uuid.Nil || tx == nil {
+		return nil, ErrInvalidOwner
+	}
+	if err := lifecycle.LockOwnerTx(ctx, tx, in.UserID); err != nil {
+		return nil, err
+	}
+	q := s.queries.WithTx(tx)
+	if err := checkActiveParent(ctx, q, in.UserID, in.ParentID); err != nil {
+		return nil, err
+	}
+	file, err := q.GetFileForUser(ctx, sqlcgen.GetFileForUserParams{UserID: in.UserID, FileID: dbtypes.UUID(in.FileID)})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if file.Status != sqlcgen.FileStatusActive || file.Kind != sqlcgen.FileKindFile || file.ParentID != dbtypes.OptionalUUID(in.ParentID) {
+		return nil, ErrParentUnavailable
+	}
+	if file.Encryption != in.Encryption || file.EncryptionKeyVersion != dbtypes.OptionalInt4(in.EncryptionKeyVersion) {
+		return nil, ErrConflict
+	}
+	return file, nil
+}
+
+func (s *Service) CheckActiveImportResult(ctx context.Context, in CheckActiveImportResultInput) (*sqlcgen.File, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	file, err := s.CheckActiveImportResultTx(ctx, tx, in)
+	if err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return file, nil
 }

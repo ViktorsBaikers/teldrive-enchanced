@@ -35,7 +35,16 @@ func TestFilenameSearchWordsAndIndex(t *testing.T) {
 	ctx := context.Background()
 	seedUser(t, db.Pool, 1001)
 	seedUser(t, db.Pool, 2002)
-	_, err := db.Pool.Exec(ctx, `
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	// This fixture seed inserts thousands of event-emitting rows in one transaction.
+	if _, err := tx.Exec(ctx, "SET LOCAL teldrive.event_bulk = 'on'"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = tx.Exec(ctx, `
 INSERT INTO files (id, user_id, name, kind, size, encryption, status, mod_time, deleted_at)
 VALUES
     (gen_random_uuid(), 1001, 'The.Terminal.List.S02.720p.10bit.WEBRip.2CH.x265.HEVC-PSA', 'file', 1, false, 'active', now(), NULL),
@@ -48,6 +57,9 @@ INSERT INTO files (id, user_id, name, kind, size, encryption, status, mod_time)
 SELECT gen_random_uuid(), 1001, md5(i::text) || '.unrelated.mkv', 'file', 1, false, 'active', now()
 FROM generate_series(1, 3000) i;`)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Pool.Exec(ctx, "VACUUM ANALYZE files"); err != nil {

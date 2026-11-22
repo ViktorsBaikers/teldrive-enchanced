@@ -7,15 +7,25 @@ import (
 	"testing"
 
 	"github.com/tgdrive/teldrive/v2/internal/jobs"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
+	fixture "github.com/tgdrive/teldrive/v2/internal/testutil/lifecycle"
 	testpostgres "github.com/tgdrive/teldrive/v2/internal/testutil/postgres"
 )
 
 func TestRuntimeInsertStartAndStopAgainstRealPostgres(t *testing.T) {
 	db := testpostgres.New(t)
-	storage := &cleanupStorage{}
-	runtime, err := jobs.NewRuntime(db.Pool, storage)
+	storage := &cleanupStorage{
+		Storage: fixture.NewStorage(t, []fixture.ChannelScope{
+			{ChannelID: 9001, Actors: []int64{1001}},
+		}),
+	}
+	policy := lifecycle.NewService(db.Pool, storage)
+	runtime, err := jobs.NewRuntime(db.Pool, storage, policy)
 	if err != nil {
 		t.Fatalf("NewRuntime() error = %v", err)
+	}
+	if err := policy.BindReceiptEnqueuer(runtime); err != nil {
+		t.Fatalf("BindReceiptEnqueuer() error = %v", err)
 	}
 	ctx := context.Background()
 	if err := runtime.InsertCleanup(ctx); err != nil {

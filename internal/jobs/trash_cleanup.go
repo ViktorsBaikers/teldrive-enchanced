@@ -35,22 +35,29 @@ type TrashCleanupWorker struct {
 	pool    *pgxpool.Pool
 	queries *sqlcgen.Queries
 	service PurgeService
-	now     func() time.Time
 }
 
 func NewTrashCleanupWorker(pool *pgxpool.Pool, service PurgeService) *TrashCleanupWorker {
-	return &TrashCleanupWorker{pool: pool, queries: sqlcgen.New(pool), service: service, now: time.Now}
+	return &TrashCleanupWorker{pool: pool, queries: sqlcgen.New(pool), service: service}
 }
 
 func (w *TrashCleanupWorker) Timeout(*river.Job[TrashCleanupSweepArgs]) time.Duration {
 	return 2 * time.Hour
 }
 
-func (w *TrashCleanupWorker) Work(ctx context.Context, job *river.Job[TrashCleanupSweepArgs]) error {
+func (w *TrashCleanupWorker) Work(ctx context.Context, job *river.Job[TrashCleanupSweepArgs]) (workErr error) {
+	output := PurgeSweepOutput{}
+	defer func() {
+		output.Incomplete = workErr != nil
+		workErr = errors.Join(workErr, recordCleanupOutput(ctx, job != nil && job.JobRow != nil, output))
+	}()
 	if w == nil || w.pool == nil || w.service == nil {
 		return ErrTrashCleanupNotConfigured
 	}
-	retentionText := job.Args.Retention
+	retentionText := ""
+	if job != nil {
+		retentionText = job.Args.Retention
+	}
 	if retentionText == "" {
 		retentionText = "720h"
 	}
@@ -58,28 +65,51 @@ func (w *TrashCleanupWorker) Work(ctx context.Context, job *river.Job[TrashClean
 	if err != nil || retention <= 0 {
 		return fmt.Errorf("invalid trash retention %q", retentionText)
 	}
-	deletedBefore := dbtypes.Time(w.now().Add(-retention))
+	cutoff, err := w.queries.GetCleanupSweepCutoff(ctx)
+	if err != nil {
+		return fmt.Errorf("read trash cleanup cutoff: %w", err)
+	}
+	if !cutoff.Valid {
+		return errors.New("invalid trash cleanup cutoff")
+	}
+	output.Cutoff = cutoff.Time
+	params := sqlcgen.ListTrashedRootsBeforeParams{PassCutoff: cutoff, DeletedBefore: dbtypes.Time(cutoff.Time.Add(-retention))}
+	var failures purgeSweepFailure
 	for {
-		rows, err := w.queries.ListTrashedRootsBefore(ctx, deletedBefore)
+		if err := ctx.Err(); err != nil {
+			return errors.Join(failures.err(), err)
+		}
+		rows, err := w.queries.ListTrashedRootsBefore(ctx, params)
+		output.Pages++
 		if err != nil {
-			return fmt.Errorf("list expired trash roots: %w", err)
+			return errors.Join(failures.err(), fmt.Errorf("list expired trash roots: %w", err))
 		}
 		if len(rows) == 0 {
-			return nil
+			return failures.err()
 		}
 		byUser := make(map[int64][]uuid.UUID)
+		created, id := params.AfterCreatedAt, params.AfterID
 		for _, item := range rows {
-			fileID, ok := dbtypes.GoogleUUID(item.FileID)
-			if !ok {
-				return errors.New("expired trash root has invalid file ID")
+			if item.UserID <= 0 || !validPurgeCursor(item.CreatedAt, item.FileID, cutoff, created, id) {
+				return errors.Join(failures.err(), errors.New("invalid expired trash root cursor"))
 			}
-			byUser[item.UserID] = append(byUser[item.UserID], fileID)
+			created, id = item.CreatedAt, item.FileID
+			byUser[item.UserID] = append(byUser[item.UserID], uuid.UUID(item.FileID.Bytes))
 		}
-		userIDs := slices.Sorted(maps.Keys(byUser))
-		for _, userID := range userIDs {
-			if err := w.service.PurgeMany(ctx, userID, byUser[userID]); err != nil {
-				return fmt.Errorf("purge expired trash files for user %d: %w", userID, err)
+		output.Roots += len(rows)
+		for _, userID := range slices.Sorted(maps.Keys(byUser)) {
+			if err := ctx.Err(); err != nil {
+				return errors.Join(failures.err(), err)
 			}
+			output.OwnerBatches++
+			if err := w.service.PurgeMany(ctx, userID, byUser[userID]); err != nil {
+				output.FailedBatches++
+				failures.add(err)
+			}
+		}
+		params.AfterCreatedAt, params.AfterID = created, id
+		if len(rows) < 1000 {
+			return failures.err()
 		}
 	}
 }

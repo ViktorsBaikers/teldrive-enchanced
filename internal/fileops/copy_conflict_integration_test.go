@@ -34,6 +34,7 @@ func TestCopyConflictPolicies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	composeFileopsFixture(t, service)
 
 	t.Run("fail", func(t *testing.T) {
 		name := "fail-target"
