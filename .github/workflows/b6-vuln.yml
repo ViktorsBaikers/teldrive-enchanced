@@ -1,0 +1,58 @@
+---
+# B6 vulnerability gate job.
+#
+# Scope: pinned govulncheck source-mode reachability for this repository only,
+# with a sanitized summary report as the artifact. The both-module scan, binary
+# symbol scan, image scan, and SBOM are run locally by an operator because the
+# CI job must not require a credential for the sibling rclone repository.
+#
+# Triggers: manual dispatch and the disposable `b6-vuln-proof` test branch.
+# Never add pull-request, tag, release, package-write, or secret-bearing steps.
+
+name: b6-vuln
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - b6-vuln-proof
+
+permissions:
+  contents: read
+
+concurrency:
+  group: b6-vuln-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vuln:
+    name: Pinned source-mode vulnerability gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+          check-latest: false
+          cache: false
+
+      - name: Run pinned vulnerability gate
+        run: |
+          ./scripts/b6/vuln-gate.sh \
+            --source teldrive \
+            --out "$RUNNER_TEMP/b6-vuln"
+
+      - name: Upload sanitized report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: b6-vuln-report
+          path: ${{ runner.temp }}/b6-vuln/summary.txt
+          if-no-files-found: ignore
+          retention-days: 7
