@@ -306,7 +306,8 @@ if [[ "$WANT_UI" == true ]]; then
   ui_eq=false; cmp -s "$WORK/ui-only-manifest1.txt" "$WORK/ui-only-manifest2.txt" && ui_eq=true
   [[ "$ui_eq" == true ]] || { printf 'build-repro: UI manifest mismatch\n' >&2; OVERALL=FAIL; }
   UI_JSON="$(jq -n --arg a "$ui_a" --arg b "$ui_b" --argjson eq "$ui_eq" \
-    '{ui_manifest_sha256_run1:$a, ui_manifest_sha256_run2:$b, ui_manifest_equal:$eq, outcome:$([$eq]|if .[0] then "PASS" else "FAIL" end)}')"
+    --arg outcome "$([[ "$ui_eq" == true ]] && echo PASS || echo FAIL)" \
+    '{ui_manifest_sha256_run1:$a, ui_manifest_sha256_run2:$b, ui_manifest_equal:$eq, outcome:$outcome}')"
 fi
 
 IMAGE_JSON="null"
