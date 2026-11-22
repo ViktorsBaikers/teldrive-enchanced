@@ -281,7 +281,7 @@ build_rclone() {
     --arg go "$GO_VERSION" --arg a1 "$a1" --arg a2 "$a2" --argjson bin_eq "$bin_eq" \
     --arg upstream "$RCLONE_UPSTREAM_BASE" \
     --argjson commands "$(json_commands \
-      "GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOPROXY=off CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags '-X github.com/rclone/rclone/fs.Version=$VERSION_STRING' -o out/rclone .")" \
+      "GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOPROXY=off CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags '$ldflags' -o out/rclone .")" \
     --arg outcome "$([[ "$bin_eq" == true ]] && echo PASS || echo FAIL)" \
     '{repo:$repo, head:$head, dirty:($dirty=="true"), go_version:$go,
       artifact_sha256_run1:$a1, artifact_sha256_run2:$a2, binary_equal:$bin_eq,
