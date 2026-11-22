@@ -94,7 +94,7 @@ else
   meta_snap="$(jq -r '.metadata.snapshot_sha256 // empty' "$RECEIPT")"
   meta_commit="$(jq -r '.metadata.teldrive.commit // empty' "$RECEIPT")"
   meta_date="$(jq -r '.metadata.teldrive.build_date // empty' "$RECEIPT")"
-  meta_dirty="$(jq -r '.metadata.teldrive.dirty // empty' "$RECEIPT")"
+  meta_dirty="$(jq -r '.metadata.teldrive.dirty | if . == null then "" else tostring end' "$RECEIPT")"
   require_value receipt.version "$meta_version"
   require_value receipt.snapshot_sha256 "$meta_snap"
   require_value receipt.teldrive.commit "$meta_commit"
