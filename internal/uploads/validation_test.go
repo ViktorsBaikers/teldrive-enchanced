@@ -48,7 +48,17 @@ func TestServiceRejectsInvalidInputsBeforeDatabaseAccess(t *testing.T) {
 		{name: "get owner", call: func() error { _, err := svc.Get(ctx, 0, id); return err }, want: ErrInvalidInput},
 		{name: "claim basic", call: func() error { _, err := svc.ClaimPart(ctx, ClaimPartInput{}); return err }, want: ErrInvalidInput},
 		{name: "store basic", call: func() error { _, err := svc.StorePart(ctx, StorePartInput{}); return err }, want: ErrInvalidInput},
-		{name: "complete owner", call: func() error { _, err := svc.Complete(ctx, 0, id); return err }, want: ErrInvalidInput},
+		{name: "complete owner", call: func() error { _, err := svc.Complete(ctx, CompleteInput{UploadID: id}); return err }, want: ErrInvalidInput},
+		{name: "complete negative size", call: func() error {
+			_, err := svc.Complete(ctx, CompleteInput{UserID: 1, UploadID: id, Size: -1})
+			return err
+		}, want: ErrInvalidInput},
+		{name: "complete missing upload", call: func() error { _, err := svc.Complete(ctx, CompleteInput{UserID: 1}); return err }, want: ErrInvalidInput},
+		{name: "complete hash pair", call: func() error {
+			_, err := svc.Complete(ctx, CompleteInput{UserID: 1, UploadID: id, HashAlgorithm: &algorithm})
+			return err
+		}, want: ErrInvalidInput},
+		{name: "create negative preference", call: func() error { _, err := svc.Create(ctx, CreateInput{UserID: 1, Name: "x", PartSize: -1}); return err }, want: ErrInvalidInput},
 		{name: "abort owner", call: func() error { _, err := svc.Abort(ctx, 0, id); return err }, want: ErrInvalidInput},
 	}
 
