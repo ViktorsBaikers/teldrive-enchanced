@@ -33,8 +33,11 @@ INSERT INTO channels (channel_id, user_id, name, selected) VALUES
 	}
 	uploadService := uploads.NewService(db.Pool)
 	channelService := channels.NewService(db.Pool, nil, channels.Config{PartLimit: 1})
-	pipeline := transfer.NewPipeline(uploadService, channelService, &apiMemoryStorage{}, nil, transfer.Config{})
-	handler := api.NewHandler(catalog.NewService(db.Pool, nil), uploadService, pipeline, nil, health.NewService("test", db.Pool), 0, nil)
+	storage := &apiMemoryStorage{}
+	catalogService := catalog.NewService(db.Pool, nil)
+	receipts := bindAPIReceiptPolicy(t, db.Pool, storage, catalogService, uploadService)
+	pipeline := transfer.NewPipeline(uploadService, channelService, storage, nil, transfer.Config{Receipts: receipts})
+	handler := api.NewHandler(catalogService, uploadService, pipeline, nil, health.NewService("test", db.Pool), 0, nil)
 	server, err := api.NewServer(handler, api.NewSecurity(apiAuthenticator{}))
 	if err != nil {
 		t.Fatal(err)

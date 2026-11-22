@@ -33,7 +33,8 @@ INSERT INTO channels (channel_id, user_id, name, selected) VALUES (9001, 1001, '
 	uploadService := uploads.NewService(db.Pool)
 	storage := &apiMemoryStorage{}
 	keys := transfer.StaticKeyProvider{1: "upload-encryption-policy-test-key"}
-	pipeline := transfer.NewPipeline(uploadService, apiFixedResolver(9001), storage, keys, transfer.Config{})
+	receipts := bindAPIReceiptPolicy(t, db.Pool, storage, catalogService, uploadService)
+	pipeline := transfer.NewPipeline(uploadService, apiFixedResolver(9001), storage, keys, transfer.Config{Receipts: receipts})
 	downloader := transfer.NewDownloader(catalogService, storage, keys)
 	handler := api.NewHandler(catalogService, uploadService, pipeline, downloader, health.NewService("test", db.Pool), 1, nil)
 	server, err := api.NewServer(handler, api.NewSecurity(apiAuthenticator{}))
@@ -88,7 +89,8 @@ INSERT INTO channels (channel_id, user_id, name, selected) VALUES (9001, 1001, '
 						t.Fatalf("Telegram payload is plaintext=%t, want encryption=%t", plaintext, wantEncrypted)
 					}
 					headers["Idempotency-Key"] = uuid.NewString()
-					completed := performRequest(t, server, http.MethodPost, path+"/complete", nil, headers)
+					headers["Content-Type"] = "application/json"
+					completed := performRequest(t, server, http.MethodPost, path+"/complete", []byte(`{"size":6}`), headers)
 					if completed.Code != http.StatusCreated {
 						t.Fatalf("complete: %d %s", completed.Code, completed.Body.String())
 					}

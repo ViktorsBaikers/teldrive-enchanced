@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +28,8 @@ import (
 	"github.com/tgdrive/teldrive/v2/internal/dbtypes"
 	"github.com/tgdrive/teldrive/v2/internal/events"
 	"github.com/tgdrive/teldrive/v2/internal/fileops"
+	"github.com/tgdrive/teldrive/v2/internal/jobs"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 	"github.com/tgdrive/teldrive/v2/internal/shares"
 	"github.com/tgdrive/teldrive/v2/internal/transfer"
 	"github.com/tgdrive/teldrive/v2/internal/uploads"
@@ -55,10 +58,19 @@ func mapServiceError(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, context.Canceled) {
-		return err
-	}
 	switch {
+	case errors.Is(err, uploads.ErrRecoveryChanged):
+		return problem(http.StatusPreconditionFailed, "upload_recovery_changed", "upload recovery incarnation changed", err)
+	case errors.Is(err, uploads.ErrGuardConflict):
+		return problem(http.StatusPreconditionFailed, "upload_destination_changed", "upload destination changed", err)
+	case errors.Is(err, uploads.ErrGuardedRouteRequired):
+		return problem(http.StatusConflict, "conflict", "upload route does not match the session", err)
+	case errors.Is(err, uploads.ErrParentUnavailable), errors.Is(err, catalog.ErrParentUnavailable), errors.Is(err, lifecycle.ErrCopyDestinationUnavailable):
+		return problem(http.StatusConflict, "upload_parent_unavailable", "upload destination folder is unavailable", err)
+	case errors.Is(err, lifecycle.ErrChannelWriteUnavailable), errors.Is(err, lifecycle.ErrRequestMismatch), errors.Is(err, jobs.ErrReceiptRetryUnavailable):
+		return problem(http.StatusConflict, "conflict", "operation conflicts with current state", err)
+	case errors.Is(err, context.Canceled):
+		return err
 	case errors.Is(err, context.DeadlineExceeded):
 		return problem(http.StatusGatewayTimeout, "request_timeout", "request timed out", err)
 	case errors.Is(err, authn.ErrPasswordInvalid):
@@ -83,6 +95,10 @@ func mapServiceError(err error) error {
 		return problem(http.StatusConflict, "upload_part_busy", "upload part is still being uploaded; retry after the active attempt finishes", err)
 	case errors.Is(err, uploads.ErrPartConflict):
 		return problem(http.StatusConflict, "upload_part_conflict", "upload part size or checksum differs from the stored part", err)
+	case errors.Is(err, uploads.ErrIncomplete):
+		return problem(http.StatusConflict, "upload_incomplete", "upload parts do not cover the completion manifest", err)
+	case errors.Is(err, transfer.ErrBodyTooShort), errors.Is(err, transfer.ErrBodyTooLong):
+		return problem(http.StatusUnprocessableEntity, "invalid_request", "upload body length does not match", err)
 	case errors.Is(err, uploads.ErrInvalidState):
 		return problem(http.StatusConflict, "upload_invalid_state", "upload session is no longer open", err)
 	case errors.Is(err, uploads.ErrNameConflict):
@@ -103,8 +119,14 @@ func mapServiceError(err error) error {
 }
 
 func ErrorHandler(ctx context.Context, w http.ResponseWriter, _ *http.Request, err error) {
-	if errors.Is(err, context.Canceled) {
+	if errors.Is(ctx.Err(), context.Canceled) {
 		return
+	}
+	if errors.Is(err, context.Canceled) {
+		var mapped *Problem
+		if !errors.As(err, &mapped) {
+			return
+		}
 	}
 	requestID := middleware.GetReqID(ctx)
 	status := http.StatusInternalServerError
@@ -119,6 +141,21 @@ func ErrorHandler(ctx context.Context, w http.ResponseWriter, _ *http.Request, e
 		code = "unauthorized"
 		message = "authentication is required"
 	case errors.As(err, &decodeRequestErr), errors.As(err, &decodeParamsErr):
+		if decodeParamsErr != nil && decodeParamsErr.OperationContext.Name == gen.StreamEventsOperation {
+			facts := streamQueryContext(ctx)
+			if facts.modePresent && !facts.modeValid {
+				status = http.StatusUnprocessableEntity
+				code = "invalid_event_mode"
+				message = "event stream mode is invalid"
+				break
+			}
+			if facts.modeValid && facts.afterPresent {
+				status = http.StatusUnprocessableEntity
+				code = "invalid_event_cursor"
+				message = "event cursor is invalid"
+				break
+			}
+		}
 		status = http.StatusBadRequest
 		code = "invalid_request"
 		message = "request could not be decoded"
@@ -140,7 +177,7 @@ func ErrorHandler(ctx context.Context, w http.ResponseWriter, _ *http.Request, e
 		}
 	}
 	if status >= http.StatusInternalServerError {
-		slog.ErrorContext(ctx, "api.request_failed", "status", status, "code", code, "request_id", requestID, "error", err)
+		slog.ErrorContext(ctx, "api.request_failed", "status", status, "code", code, "request_id", requestID, "error_kind", ErrorKind(err))
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -151,13 +188,80 @@ func ErrorHandler(ctx context.Context, w http.ResponseWriter, _ *http.Request, e
 	})
 }
 
-func NewServer(handler *Handler, security *Security, opts ...gen.ServerOption) (http.Handler, error) {
+func NewServer(handler *Handler, security *Security, opts ...gen.ServerOption) (*Server, error) {
 	opts = append([]gen.ServerOption{gen.WithErrorHandler(ErrorHandler)}, opts...)
-	server, err := gen.NewServer(handler, NewRawHandler(handler), security, opts...)
-	if err != nil || security == nil || !security.publicFileContent {
-		return server, err
+	generated, err := gen.NewServer(handler, NewRawHandler(handler), security, opts...)
+	if err != nil {
+		return nil, err
 	}
-	return publicFileContentHandler(server), nil
+	server := streamQueryFactsHandler(generated)
+	var result http.Handler = server
+	if security != nil && security.publicFileContent {
+		result = publicFileContentHandler(server)
+	}
+	return &Server{Handler: result, routes: generated}, nil
+}
+
+type streamQueryFactsKey struct{}
+
+type streamQueryFacts struct {
+	modePresent  bool
+	modeValid    bool
+	afterPresent bool
+}
+
+// streamQueryFactsHandler records ordered-mode and raw after presence before
+// ogen decodes parameters. It never responds or rejects; malformed escapes are
+// classified from raw keys so ordered cursor rejection survives decode errors.
+func streamQueryFactsHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/events" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		facts := classifyStreamQuery(r.URL.RawQuery)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), streamQueryFactsKey{}, facts)))
+	})
+}
+
+func classifyStreamQuery(rawQuery string) streamQueryFacts {
+	var facts streamQueryFacts
+	modeCount, orderedCount := 0, 0
+	for _, part := range strings.Split(rawQuery, "&") {
+		if part == "" {
+			continue
+		}
+		key, value, _ := strings.Cut(part, "=")
+		decodedKey, err := url.QueryUnescape(key)
+		if err != nil {
+			continue
+		}
+		switch decodedKey {
+		case "after":
+			facts.afterPresent = true
+		case "mode":
+			modeCount++
+			if decoded, err := url.QueryUnescape(value); err == nil && decoded == "ordered" {
+				orderedCount++
+			}
+		}
+	}
+	facts.modePresent = modeCount > 0
+	facts.modeValid = modeCount == 1 && orderedCount == 1
+	return facts
+}
+
+func streamQueryContext(ctx context.Context) streamQueryFacts {
+	facts, _ := ctx.Value(streamQueryFactsKey{}).(streamQueryFacts)
+	return facts
+}
+
+func isOrderedStreamRequest(ctx context.Context) bool {
+	return streamQueryContext(ctx).modeValid
+}
+
+func streamAfterPresent(ctx context.Context) bool {
+	return streamQueryContext(ctx).afterPresent
 }
 
 // publicFileContentHandler activates the configured bypass only for the two
@@ -269,6 +373,7 @@ func uploadSession(session *sqlcgen.UploadSession) (gen.UploadSession, error) {
 		Encryption: session.Encryption, ConflictPolicy: gen.NameConflictPolicy(session.ConflictPolicy),
 		PartSize: session.PartSize, State: gen.UploadState(session.State), ExpiresAt: session.ExpiresAt.Time,
 		CreatedAt: session.CreatedAt.Time, FileId: optionalAPIUUID(session.FileID),
+		RequiresCompletionManifest: true,
 	}
 	if session.ExpectedHashAlgorithm.Valid && session.ExpectedHashValue.Valid {
 		result.ExpectedHash = gen.NewOptFileHash(gen.FileHash{

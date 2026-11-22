@@ -15,12 +15,17 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/riverqueue/river"
+	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	varccache "github.com/tgdrive/varc/cache"
 
 	api "github.com/tgdrive/teldrive/v2/internal/api"
 	"github.com/tgdrive/teldrive/v2/internal/api/gen"
 	"github.com/tgdrive/teldrive/v2/internal/catalog"
 	"github.com/tgdrive/teldrive/v2/internal/health"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 	"github.com/tgdrive/teldrive/v2/internal/shares"
 	"github.com/tgdrive/teldrive/v2/internal/telegramstore"
 	testpostgres "github.com/tgdrive/teldrive/v2/internal/testutil/postgres"
@@ -46,7 +51,8 @@ func testServerUploadCompleteAndRangeDownload(t *testing.T, cached bool) {
 	catalogService := catalog.NewService(db.Pool, nil)
 	uploadService := uploads.NewService(db.Pool)
 	storage := &apiMemoryStorage{}
-	pipeline := transfer.NewPipeline(uploadService, apiFixedResolver(9001), storage, nil, transfer.Config{})
+	receipts := bindAPIReceiptPolicy(t, db.Pool, storage, catalogService, uploadService)
+	pipeline := transfer.NewPipeline(uploadService, apiFixedResolver(9001), storage, nil, transfer.Config{Receipts: receipts})
 	downloader := transfer.NewDownloader(catalogService, storage, nil)
 	var downloadCache *varccache.Cache
 	if cached {
@@ -95,6 +101,9 @@ func testServerUploadCompleteAndRangeDownload(t *testing.T, cached bool) {
 	if err := json.Unmarshal(created.Body.Bytes(), &session); err != nil {
 		t.Fatalf("decode upload session: %v", err)
 	}
+	if !session.RequiresCompletionManifest || session.PartSize != 16<<20 {
+		t.Fatalf("upload integrity capability/geometry = %#v", session)
+	}
 
 	payload := []byte("abcdefghij")
 	partPath := "/v1/uploads/" + uuid.UUID(session.ID).String() + "/parts/1"
@@ -107,8 +116,9 @@ func testServerUploadCompleteAndRangeDownload(t *testing.T, cached bool) {
 	}
 
 	completePath := "/v1/uploads/" + uuid.UUID(session.ID).String() + "/complete"
-	completed := performRequest(t, server, http.MethodPost, completePath, nil, map[string]string{
+	completed := performRequest(t, server, http.MethodPost, completePath, []byte(`{"size":10}`), map[string]string{
 		"Authorization":   "Bearer test-token",
+		"Content-Type":    "application/json",
 		"Idempotency-Key": uuid.NewString(),
 	})
 	if completed.Code != http.StatusCreated {
@@ -397,3 +407,45 @@ func (*apiMemoryStorage) CreateChannel(context.Context, int64, string) (telegram
 	return telegramstore.Channel{}, errors.New("not implemented")
 }
 func (*apiMemoryStorage) DeleteChannel(context.Context, int64, int64) error { return nil }
+
+type apiReceiptArgs struct {
+	UserID     int64       `json:"user_id"`
+	ReceiptIDs []uuid.UUID `json:"receipt_ids"`
+}
+
+func (apiReceiptArgs) Kind() string { return "api_receipt_fixture" }
+
+type apiReceiptQueue struct{ client *river.Client[pgx.Tx] }
+
+func (q apiReceiptQueue) EnqueueReceiptCleanupTx(ctx context.Context, tx pgx.Tx, in lifecycle.ReceiptCleanupInput) (int64, error) {
+	metadata := strconv.AppendInt([]byte(`{"user_id":`), in.UserID, 10)
+	metadata = append(metadata, '}')
+	result, err := q.client.InsertTx(ctx, tx, apiReceiptArgs{UserID: in.UserID, ReceiptIDs: in.ReceiptIDs}, &river.InsertOpts{MaxAttempts: 3, Metadata: metadata})
+	if err != nil {
+		return 0, err
+	}
+	if result == nil || result.Job == nil || result.Job.ID <= 0 {
+		return 0, errors.New("missing actual receipt fixture job ID")
+	}
+	return result.Job.ID, nil
+}
+
+// Fixture jobs prove transactional identity, not production worker scheduling.
+func bindAPIReceiptPolicy(t testing.TB, pool *pgxpool.Pool, storage lifecycle.MessageDeleter, catalogService *catalog.Service, uploadService *uploads.Service) *lifecycle.Service {
+	t.Helper()
+	client, err := river.NewClient(riverpgxv5.New(pool), &river.Config{Schema: "teldrive", SkipUnknownJobCheck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := lifecycle.NewService(pool, storage)
+	if err := policy.BindReceiptEnqueuer(apiReceiptQueue{client: client}); err != nil {
+		t.Fatal(err)
+	}
+	if err := catalogService.BindLifecycle(policy); err != nil {
+		t.Fatal(err)
+	}
+	if err := uploadService.BindLifecycle(policy); err != nil {
+		t.Fatal(err)
+	}
+	return policy
+}

@@ -16,6 +16,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
@@ -455,7 +456,7 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (*TokenPair,
 	return &TokenPair{AccessToken: access, RefreshToken: newToken, ExpiresIn: ttlSeconds(s.config.AccessTokenTTL)}, nil
 }
 
-func (s *Service) AuthenticateBearer(ctx context.Context, raw string) (principal.Identity, error) {
+func (s *Service) accessClaims(raw string) (*accessClaims, error) {
 	claims := &accessClaims{}
 	token, err := jwt.ParseWithClaims(strings.TrimSpace(raw), claims, func(token *jwt.Token) (any, error) {
 		if token.Method != jwt.SigningMethodHS256 {
@@ -464,7 +465,15 @@ func (s *Service) AuthenticateBearer(ctx context.Context, raw string) (principal
 		return []byte(s.config.SigningKey), nil
 	}, jwt.WithIssuer(s.config.Issuer), jwt.WithExpirationRequired())
 	if err != nil || !token.Valid || claims.Subject == "" || claims.SessionID == uuid.Nil {
-		return principal.Identity{}, ErrInvalidCredential
+		return nil, ErrInvalidCredential
+	}
+	return claims, nil
+}
+
+func (s *Service) AuthenticateBearer(ctx context.Context, raw string) (principal.Identity, error) {
+	claims, err := s.accessClaims(raw)
+	if err != nil {
+		return principal.Identity{}, err
 	}
 	userID, err := parseUserID(claims.Subject)
 	if err != nil {
@@ -481,6 +490,156 @@ func (s *Service) AuthenticateBearer(ctx context.Context, raw string) (principal
 		return principal.Identity{}, ErrInvalidCredential
 	}
 	return principal.Identity{UserID: userID, SessionID: claims.SessionID, Roles: roles, Source: "bearer"}, nil
+}
+
+const orderedValidationTimeout = 2 * time.Second
+
+// AuthenticateOrderedBearer validates the JWT and its active session together
+// with the owner incarnation in one bounded read-only Repeatable Read snapshot.
+// The proof carries the earliest known expiry; no later lookup re-binds the
+// numeric user ID.
+func (s *Service) AuthenticateOrderedBearer(ctx context.Context, raw string) (principal.OrderedProof, error) {
+	if s == nil || s.pool == nil {
+		return principal.OrderedProof{}, ErrInvalidCredential
+	}
+	claims, err := s.accessClaims(raw)
+	if err != nil {
+		return principal.OrderedProof{}, err
+	}
+	userID, err := parseUserID(claims.Subject)
+	if err != nil || claims.ExpiresAt == nil {
+		return principal.OrderedProof{}, ErrInvalidCredential
+	}
+	validatedAt := s.now().UTC()
+	txCtx, cancel := context.WithTimeout(ctx, orderedValidationTimeout)
+	defer cancel()
+	tx, err := s.pool.BeginTx(txCtx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return principal.OrderedProof{}, fmt.Errorf("begin ordered bearer snapshot: %w", err)
+	}
+	defer rollbackReadSnapshot(tx)
+	queries := sqlcgen.New(tx)
+	session, err := queries.GetActiveSession(txCtx, sqlcgen.GetActiveSessionParams{SessionID: dbtypes.UUID(claims.SessionID), UserID: userID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return principal.OrderedProof{}, ErrInvalidCredential
+	}
+	if err != nil {
+		return principal.OrderedProof{}, fmt.Errorf("get ordered bearer session: %w", err)
+	}
+	incarnation, err := queries.GetEventOwnerIncarnation(txCtx, userID)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !incarnation.Valid) {
+		return principal.OrderedProof{}, ErrInvalidCredential
+	}
+	if err != nil {
+		return principal.OrderedProof{}, fmt.Errorf("get ordered bearer incarnation: %w", err)
+	}
+	return principal.OrderedProof{
+		UserID: userID, OwnerIncarnation: incarnationUUID(incarnation), CredentialKind: "bearer",
+		CredentialID: claims.SessionID.String(), ValidatedAt: validatedAt,
+		ExpiresAt: earliestExpiry(claims.ExpiresAt.Time, session.ExpiresAt.Time),
+	}, nil
+}
+
+// AuthenticateOrderedAPIKey validates the exact key row and owner incarnation in
+// one bounded read-only Repeatable Read snapshot.
+func (s *Service) AuthenticateOrderedAPIKey(ctx context.Context, raw string) (principal.OrderedProof, error) {
+	if s == nil || s.pool == nil {
+		return principal.OrderedProof{}, ErrInvalidCredential
+	}
+	hash := hashToken(strings.TrimSpace(raw))
+	if len(hash) == 0 {
+		return principal.OrderedProof{}, ErrInvalidCredential
+	}
+	validatedAt := s.now().UTC()
+	txCtx, cancel := context.WithTimeout(ctx, orderedValidationTimeout)
+	defer cancel()
+	tx, err := s.pool.BeginTx(txCtx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return principal.OrderedProof{}, fmt.Errorf("begin ordered API key snapshot: %w", err)
+	}
+	defer rollbackReadSnapshot(tx)
+	queries := sqlcgen.New(tx)
+	key, err := queries.GetActiveAPIKeyByHash(txCtx, hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return principal.OrderedProof{}, ErrInvalidCredential
+	}
+	if err != nil {
+		return principal.OrderedProof{}, fmt.Errorf("get ordered API key: %w", err)
+	}
+	incarnation, err := queries.GetEventOwnerIncarnation(txCtx, key.UserID)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !incarnation.Valid) {
+		return principal.OrderedProof{}, ErrInvalidCredential
+	}
+	if err != nil {
+		return principal.OrderedProof{}, fmt.Errorf("get ordered API key incarnation: %w", err)
+	}
+	credentialID, ok := dbtypes.GoogleUUID(key.ID)
+	if !ok {
+		return principal.OrderedProof{}, ErrInvalidCredential
+	}
+	proof := principal.OrderedProof{
+		UserID: key.UserID, OwnerIncarnation: incarnationUUID(incarnation), CredentialKind: "api_key",
+		CredentialID: credentialID.String(), ValidatedAt: validatedAt,
+	}
+	if key.ExpiresAt.Valid {
+		proof.ExpiresAt = key.ExpiresAt.Time.UTC()
+	}
+	return proof, nil
+}
+
+// CheckOrderedAuthority reports whether a previously admitted bearer session is
+// still active. Credential kinds without an exact read-only check are governed by
+// the proof deadline instead.
+func (s *Service) CheckOrderedAuthority(ctx context.Context, proof principal.OrderedProof) error {
+	if s == nil || s.queries == nil || proof.UserID <= 0 {
+		return ErrInvalidCredential
+	}
+	switch proof.CredentialKind {
+	case "bearer":
+		sessionID, err := uuid.Parse(proof.CredentialID)
+		if err != nil {
+			return ErrInvalidCredential
+		}
+		if _, err := s.queries.GetActiveSession(ctx, sqlcgen.GetActiveSessionParams{SessionID: dbtypes.UUID(sessionID), UserID: proof.UserID}); errors.Is(err, pgx.ErrNoRows) {
+			return ErrInvalidCredential
+		} else if err != nil {
+			return fmt.Errorf("check ordered bearer authority: %w", err)
+		}
+		return nil
+	case "api_key":
+		return nil
+	default:
+		return ErrInvalidCredential
+	}
+}
+
+func rollbackReadSnapshot(tx pgx.Tx) {
+	if tx == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = tx.Rollback(ctx)
+}
+
+func incarnationUUID(value pgtype.UUID) uuid.UUID {
+	if !value.Valid {
+		return uuid.Nil
+	}
+	return value.Bytes
+}
+
+func earliestExpiry(values ...time.Time) time.Time {
+	var earliest time.Time
+	for _, value := range values {
+		if value.IsZero() {
+			continue
+		}
+		if earliest.IsZero() || value.Before(earliest) {
+			earliest = value
+		}
+	}
+	return earliest.UTC()
 }
 
 func (s *Service) AuthenticateAPIKey(ctx context.Context, raw string) (principal.Identity, error) {
