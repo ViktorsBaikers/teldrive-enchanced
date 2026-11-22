@@ -267,10 +267,11 @@ done
 
 FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RECEIPT="$WORK/receipt.json"
-jq -n --arg snap "$SNAP_DIGEST" --arg go "$GO_VERSION" --argjson artifacts "$artifacts" \
+jq -n --arg snap "$SNAP_DIGEST" --arg go "$GO_VERSION" --arg version "$VERSION_STRING" \
+  --argjson artifacts "$artifacts" \
   --arg started "$STARTED_AT" --arg finished "$FINISHED_AT" --arg outcome "$OVERALL" \
-  '{snapshot_sha256:$snap, go_version:$go, started_at:$started, finished_at:$finished,
-    outcome:$outcome, artifacts:$artifacts}' > "$RECEIPT"
+  '{snapshot_sha256:$snap, version:$version, go_version:$go, started_at:$started,
+    finished_at:$finished, outcome:$outcome, artifacts:$artifacts}' > "$RECEIPT"
 chmod 600 "$RECEIPT"
 
 printf 'BUILD %s snapshot_sha256=%s receipt=%s/work-%s/receipt.json\n' \
