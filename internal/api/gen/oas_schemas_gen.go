@@ -13,6 +13,10 @@ import (
 	"github.com/google/uuid"
 )
 
+type AbortPublicShareUploadConflict ErrorEnvelope
+
+func (*AbortPublicShareUploadConflict) abortPublicShareUploadRes() {}
+
 type AbortPublicShareUploadForbidden ErrorEnvelope
 
 func (*AbortPublicShareUploadForbidden) abortPublicShareUploadRes() {}
@@ -1463,6 +1467,50 @@ type CleanTrashNoContent struct{}
 
 func (*CleanTrashNoContent) cleanTrashRes() {}
 
+type CompleteGuardedUploadBadRequest ErrorEnvelope
+
+func (*CompleteGuardedUploadBadRequest) completeGuardedUploadRes() {}
+
+type CompleteGuardedUploadConflict ErrorEnvelope
+
+func (*CompleteGuardedUploadConflict) completeGuardedUploadRes() {}
+
+type CompleteGuardedUploadCreated GuardedFileEntryHeaders
+
+func (*CompleteGuardedUploadCreated) completeGuardedUploadRes() {}
+
+type CompleteGuardedUploadForbidden ErrorEnvelope
+
+func (*CompleteGuardedUploadForbidden) completeGuardedUploadRes() {}
+
+type CompleteGuardedUploadGone ErrorEnvelope
+
+func (*CompleteGuardedUploadGone) completeGuardedUploadRes() {}
+
+type CompleteGuardedUploadNotFound ErrorEnvelope
+
+func (*CompleteGuardedUploadNotFound) completeGuardedUploadRes() {}
+
+type CompleteGuardedUploadOK GuardedFileEntryHeaders
+
+func (*CompleteGuardedUploadOK) completeGuardedUploadRes() {}
+
+type CompleteGuardedUploadPreconditionFailed ErrorEnvelope
+
+func (*CompleteGuardedUploadPreconditionFailed) completeGuardedUploadRes() {}
+
+type CompleteGuardedUploadUnauthorized ErrorEnvelope
+
+func (*CompleteGuardedUploadUnauthorized) completeGuardedUploadRes() {}
+
+type CompleteGuardedUploadUnprocessableEntity ErrorEnvelope
+
+func (*CompleteGuardedUploadUnprocessableEntity) completeGuardedUploadRes() {}
+
+type CompletePublicShareUploadBadRequest ErrorEnvelope
+
+func (*CompletePublicShareUploadBadRequest) completePublicShareUploadRes() {}
+
 type CompletePublicShareUploadConflict ErrorEnvelope
 
 func (*CompletePublicShareUploadConflict) completePublicShareUploadRes() {}
@@ -1495,6 +1543,10 @@ type CompletePublicShareUploadUnprocessableEntity ErrorEnvelope
 
 func (*CompletePublicShareUploadUnprocessableEntity) completePublicShareUploadRes() {}
 
+type CompleteUploadBadRequest ErrorEnvelope
+
+func (*CompleteUploadBadRequest) completeUploadRes() {}
+
 type CompleteUploadConflict ErrorEnvelope
 
 func (*CompleteUploadConflict) completeUploadRes() {}
@@ -1502,6 +1554,10 @@ func (*CompleteUploadConflict) completeUploadRes() {}
 type CompleteUploadCreated CopyFileCreatedHeaders
 
 func (*CompleteUploadCreated) completeUploadRes() {}
+
+type CompleteUploadForbidden ErrorEnvelope
+
+func (*CompleteUploadForbidden) completeUploadRes() {}
 
 type CompleteUploadGone ErrorEnvelope
 
@@ -1722,6 +1778,10 @@ func (s *CopyFileCreatedHeaders) SetResponse(val FileEntry) {
 func (*CopyFileCreatedHeaders) copyFileRes()     {}
 func (*CopyFileCreatedHeaders) createFolderRes() {}
 
+type CopyFileForbidden ErrorEnvelope
+
+func (*CopyFileForbidden) copyFileRes() {}
+
 type CopyFileNotFound ErrorEnvelope
 
 func (*CopyFileNotFound) copyFileRes() {}
@@ -1818,6 +1878,42 @@ type CreateFolderUnprocessableEntity ErrorEnvelope
 
 func (*CreateFolderUnprocessableEntity) createFolderRes() {}
 
+type CreateGuardedUploadBadRequest ErrorEnvelope
+
+func (*CreateGuardedUploadBadRequest) createGuardedUploadRes() {}
+
+type CreateGuardedUploadConflict ErrorEnvelope
+
+func (*CreateGuardedUploadConflict) createGuardedUploadRes() {}
+
+type CreateGuardedUploadForbidden ErrorEnvelope
+
+func (*CreateGuardedUploadForbidden) createGuardedUploadRes() {}
+
+type CreateGuardedUploadNotFound ErrorEnvelope
+
+func (*CreateGuardedUploadNotFound) createGuardedUploadRes() {}
+
+type CreateGuardedUploadPreconditionFailed ErrorEnvelope
+
+func (*CreateGuardedUploadPreconditionFailed) createGuardedUploadRes() {}
+
+type CreateGuardedUploadRequestEntityTooLarge ErrorEnvelope
+
+func (*CreateGuardedUploadRequestEntityTooLarge) createGuardedUploadRes() {}
+
+type CreateGuardedUploadTooManyRequests ErrorEnvelope
+
+func (*CreateGuardedUploadTooManyRequests) createGuardedUploadRes() {}
+
+type CreateGuardedUploadUnauthorized ErrorEnvelope
+
+func (*CreateGuardedUploadUnauthorized) createGuardedUploadRes() {}
+
+type CreateGuardedUploadUnprocessableEntity ErrorEnvelope
+
+func (*CreateGuardedUploadUnprocessableEntity) createGuardedUploadRes() {}
+
 type CreateJobBadRequest ErrorEnvelope
 
 func (*CreateJobBadRequest) createJobRes() {}
@@ -1837,6 +1933,10 @@ func (*CreatePeriodicJobBadRequest) createPeriodicJobRes() {}
 type CreatePeriodicJobConflict ErrorEnvelope
 
 func (*CreatePeriodicJobConflict) createPeriodicJobRes() {}
+
+type CreatePeriodicJobForbidden ErrorEnvelope
+
+func (*CreatePeriodicJobForbidden) createPeriodicJobRes() {}
 
 type CreatePeriodicJobUnauthorized ErrorEnvelope
 
@@ -1861,6 +1961,10 @@ func (*CreatePublicShareFolderUnauthorized) createPublicShareFolderRes() {}
 type CreatePublicShareFolderUnprocessableEntity ErrorEnvelope
 
 func (*CreatePublicShareFolderUnprocessableEntity) createPublicShareFolderRes() {}
+
+type CreatePublicShareUploadBadRequest ErrorEnvelope
+
+func (*CreatePublicShareUploadBadRequest) createPublicShareUploadRes() {}
 
 type CreatePublicShareUploadConflict ErrorEnvelope
 
@@ -1902,13 +2006,33 @@ type CreateShareUnprocessableEntity ErrorEnvelope
 
 func (*CreateShareUnprocessableEntity) createShareRes() {}
 
+type CreateUploadBadRequest ErrorEnvelope
+
+func (*CreateUploadBadRequest) createUploadRes() {}
+
 type CreateUploadConflict ErrorEnvelope
 
 func (*CreateUploadConflict) createUploadRes() {}
 
+type CreateUploadForbidden ErrorEnvelope
+
+func (*CreateUploadForbidden) createUploadRes() {}
+
 type CreateUploadImportBadRequest ErrorEnvelope
 
 func (*CreateUploadImportBadRequest) createUploadImportRes() {}
+
+type CreateUploadImportConflict ErrorEnvelope
+
+func (*CreateUploadImportConflict) createUploadImportRes() {}
+
+type CreateUploadImportForbidden ErrorEnvelope
+
+func (*CreateUploadImportForbidden) createUploadImportRes() {}
+
+type CreateUploadImportNotFound ErrorEnvelope
+
+func (*CreateUploadImportNotFound) createUploadImportRes() {}
 
 type CreateUploadImportServiceUnavailable ErrorEnvelope
 
@@ -1999,6 +2123,14 @@ func (*DeleteJobNotFound) deleteJobRes() {}
 type DeleteJobUnauthorized ErrorEnvelope
 
 func (*DeleteJobUnauthorized) deleteJobRes() {}
+
+type DeletePeriodicJobConflict ErrorEnvelope
+
+func (*DeletePeriodicJobConflict) deletePeriodicJobRes() {}
+
+type DeletePeriodicJobForbidden ErrorEnvelope
+
+func (*DeletePeriodicJobForbidden) deletePeriodicJobRes() {}
 
 // DeletePeriodicJobNoContent is response for DeletePeriodicJob operation.
 type DeletePeriodicJobNoContent struct{}
@@ -4049,6 +4181,7 @@ func (s *ErrorEnvelope) SetError(val ErrorDetail) {
 
 func (*ErrorEnvelope) cleanTrashRes()                {}
 func (*ErrorEnvelope) deleteFileViewStateRes()       {}
+func (*ErrorEnvelope) discoverGuardedUploadRes()     {}
 func (*ErrorEnvelope) getCurrentUserRes()            {}
 func (*ErrorEnvelope) getDriveStatisticsRes()        {}
 func (*ErrorEnvelope) getFileCategoryStatisticsRes() {}
@@ -4068,7 +4201,6 @@ func (*ErrorEnvelope) listSharedWithMeRes()          {}
 func (*ErrorEnvelope) logoutCookieSessionRes()       {}
 func (*ErrorEnvelope) logoutSessionRes()             {}
 func (*ErrorEnvelope) removeFileBookmarksRes()       {}
-func (*ErrorEnvelope) resetPeriodicJobsRes()         {}
 
 // Ref: #/components/schemas/EventStreamTicket
 type EventStreamTicket struct {
@@ -5777,6 +5909,68 @@ type GetFileViewStateUnauthorized ErrorEnvelope
 
 func (*GetFileViewStateUnauthorized) getFileViewStateRes() {}
 
+type GetGuardedUploadConflict ErrorEnvelope
+
+func (*GetGuardedUploadConflict) getGuardedUploadRes() {}
+
+type GetGuardedUploadForbidden ErrorEnvelope
+
+func (*GetGuardedUploadForbidden) getGuardedUploadRes() {}
+
+type GetGuardedUploadGone ErrorEnvelope
+
+func (*GetGuardedUploadGone) getGuardedUploadRes() {}
+
+type GetGuardedUploadNotFound ErrorEnvelope
+
+func (*GetGuardedUploadNotFound) getGuardedUploadRes() {}
+
+type GetGuardedUploadOKXTelDriveUploadGuard string
+
+const (
+	GetGuardedUploadOKXTelDriveUploadGuard1 GetGuardedUploadOKXTelDriveUploadGuard = "1"
+)
+
+// AllValues returns all GetGuardedUploadOKXTelDriveUploadGuard values.
+func (GetGuardedUploadOKXTelDriveUploadGuard) AllValues() []GetGuardedUploadOKXTelDriveUploadGuard {
+	return []GetGuardedUploadOKXTelDriveUploadGuard{
+		GetGuardedUploadOKXTelDriveUploadGuard1,
+	}
+}
+
+// MarshalText implements encoding.TextMarshaler.
+func (s GetGuardedUploadOKXTelDriveUploadGuard) MarshalText() ([]byte, error) {
+	switch s {
+	case GetGuardedUploadOKXTelDriveUploadGuard1:
+		return []byte(s), nil
+	default:
+		return nil, errors.Errorf("invalid value: %q", s)
+	}
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler.
+func (s *GetGuardedUploadOKXTelDriveUploadGuard) UnmarshalText(data []byte) error {
+	switch GetGuardedUploadOKXTelDriveUploadGuard(data) {
+	case GetGuardedUploadOKXTelDriveUploadGuard1:
+		*s = GetGuardedUploadOKXTelDriveUploadGuard1
+		return nil
+	default:
+		return errors.Errorf("invalid value: %q", data)
+	}
+}
+
+type GetGuardedUploadPreconditionFailed ErrorEnvelope
+
+func (*GetGuardedUploadPreconditionFailed) getGuardedUploadRes() {}
+
+type GetGuardedUploadUnauthorized ErrorEnvelope
+
+func (*GetGuardedUploadUnauthorized) getGuardedUploadRes() {}
+
+type GetGuardedUploadUnprocessableEntity ErrorEnvelope
+
+func (*GetGuardedUploadUnprocessableEntity) getGuardedUploadRes() {}
+
 type GetJobNotFound ErrorEnvelope
 
 func (*GetJobNotFound) getJobRes() {}
@@ -5889,6 +6083,14 @@ type GetPublicShareUnauthorized ErrorEnvelope
 
 func (*GetPublicShareUnauthorized) getPublicShareRes() {}
 
+type GetUploadConflict ErrorEnvelope
+
+func (*GetUploadConflict) getUploadRes() {}
+
+type GetUploadForbidden ErrorEnvelope
+
+func (*GetUploadForbidden) getUploadRes() {}
+
 type GetUploadGone ErrorEnvelope
 
 func (*GetUploadGone) getUploadRes() {}
@@ -5912,6 +6114,913 @@ func (*GetUploadStatisticsUnprocessableEntity) getUploadStatisticsRes() {}
 type GetUploadUnauthorized ErrorEnvelope
 
 func (*GetUploadUnauthorized) getUploadRes() {}
+
+type GetUploadUnprocessableEntity ErrorEnvelope
+
+func (*GetUploadUnprocessableEntity) getUploadRes() {}
+
+// Immutable publication receipt for a reauthorized exact guarded result.
+// Ref: #/components/schemas/GuardedCompletedReceipt
+type GuardedCompletedReceipt struct {
+	AdmissionKey string           `json:"admissionKey"`
+	UploadId     UUID             `json:"uploadId"`
+	Size         int64            `json:"size"`
+	Hash         FileHash         `json:"hash"`
+	Result       GuardedFileEntry `json:"result"`
+}
+
+// GetAdmissionKey returns the value of AdmissionKey.
+func (s *GuardedCompletedReceipt) GetAdmissionKey() string {
+	return s.AdmissionKey
+}
+
+// GetUploadId returns the value of UploadId.
+func (s *GuardedCompletedReceipt) GetUploadId() UUID {
+	return s.UploadId
+}
+
+// GetSize returns the value of Size.
+func (s *GuardedCompletedReceipt) GetSize() int64 {
+	return s.Size
+}
+
+// GetHash returns the value of Hash.
+func (s *GuardedCompletedReceipt) GetHash() FileHash {
+	return s.Hash
+}
+
+// GetResult returns the value of Result.
+func (s *GuardedCompletedReceipt) GetResult() GuardedFileEntry {
+	return s.Result
+}
+
+// SetAdmissionKey sets the value of AdmissionKey.
+func (s *GuardedCompletedReceipt) SetAdmissionKey(val string) {
+	s.AdmissionKey = val
+}
+
+// SetUploadId sets the value of UploadId.
+func (s *GuardedCompletedReceipt) SetUploadId(val UUID) {
+	s.UploadId = val
+}
+
+// SetSize sets the value of Size.
+func (s *GuardedCompletedReceipt) SetSize(val int64) {
+	s.Size = val
+}
+
+// SetHash sets the value of Hash.
+func (s *GuardedCompletedReceipt) SetHash(val FileHash) {
+	s.Hash = val
+}
+
+// SetResult sets the value of Result.
+func (s *GuardedCompletedReceipt) SetResult(val GuardedFileEntry) {
+	s.Result = val
+}
+
+// Merged schema.
+// Ref: #/components/schemas/GuardedFileEntry
+type GuardedFileEntry struct {
+	ID         UUID        `json:"id"`
+	ParentId   OptUUID     `json:"parentId"`
+	Name       string      `json:"name"`
+	Kind       FileKind    `json:"kind"`
+	MimeType   OptString   `json:"mimeType"`
+	Size       OptInt64    `json:"size"`
+	Hash       OptFileHash `json:"hash"`
+	Encryption bool        `json:"encryption"`
+	Status     FileStatus  `json:"status"`
+	ModTime    time.Time   `json:"modTime"`
+	Generation int64       `json:"generation"`
+	CreatedAt  time.Time   `json:"createdAt"`
+	UpdatedAt  time.Time   `json:"updatedAt"`
+	// Location path, included for drive and recursive listings.
+	ParentPath     OptString `json:"parentPath"`
+	ParentSegments []string  `json:"parentSegments"`
+}
+
+// GetID returns the value of ID.
+func (s *GuardedFileEntry) GetID() UUID {
+	return s.ID
+}
+
+// GetParentId returns the value of ParentId.
+func (s *GuardedFileEntry) GetParentId() OptUUID {
+	return s.ParentId
+}
+
+// GetName returns the value of Name.
+func (s *GuardedFileEntry) GetName() string {
+	return s.Name
+}
+
+// GetKind returns the value of Kind.
+func (s *GuardedFileEntry) GetKind() FileKind {
+	return s.Kind
+}
+
+// GetMimeType returns the value of MimeType.
+func (s *GuardedFileEntry) GetMimeType() OptString {
+	return s.MimeType
+}
+
+// GetSize returns the value of Size.
+func (s *GuardedFileEntry) GetSize() OptInt64 {
+	return s.Size
+}
+
+// GetHash returns the value of Hash.
+func (s *GuardedFileEntry) GetHash() OptFileHash {
+	return s.Hash
+}
+
+// GetEncryption returns the value of Encryption.
+func (s *GuardedFileEntry) GetEncryption() bool {
+	return s.Encryption
+}
+
+// GetStatus returns the value of Status.
+func (s *GuardedFileEntry) GetStatus() FileStatus {
+	return s.Status
+}
+
+// GetModTime returns the value of ModTime.
+func (s *GuardedFileEntry) GetModTime() time.Time {
+	return s.ModTime
+}
+
+// GetGeneration returns the value of Generation.
+func (s *GuardedFileEntry) GetGeneration() int64 {
+	return s.Generation
+}
+
+// GetCreatedAt returns the value of CreatedAt.
+func (s *GuardedFileEntry) GetCreatedAt() time.Time {
+	return s.CreatedAt
+}
+
+// GetUpdatedAt returns the value of UpdatedAt.
+func (s *GuardedFileEntry) GetUpdatedAt() time.Time {
+	return s.UpdatedAt
+}
+
+// GetParentPath returns the value of ParentPath.
+func (s *GuardedFileEntry) GetParentPath() OptString {
+	return s.ParentPath
+}
+
+// GetParentSegments returns the value of ParentSegments.
+func (s *GuardedFileEntry) GetParentSegments() []string {
+	return s.ParentSegments
+}
+
+// SetID sets the value of ID.
+func (s *GuardedFileEntry) SetID(val UUID) {
+	s.ID = val
+}
+
+// SetParentId sets the value of ParentId.
+func (s *GuardedFileEntry) SetParentId(val OptUUID) {
+	s.ParentId = val
+}
+
+// SetName sets the value of Name.
+func (s *GuardedFileEntry) SetName(val string) {
+	s.Name = val
+}
+
+// SetKind sets the value of Kind.
+func (s *GuardedFileEntry) SetKind(val FileKind) {
+	s.Kind = val
+}
+
+// SetMimeType sets the value of MimeType.
+func (s *GuardedFileEntry) SetMimeType(val OptString) {
+	s.MimeType = val
+}
+
+// SetSize sets the value of Size.
+func (s *GuardedFileEntry) SetSize(val OptInt64) {
+	s.Size = val
+}
+
+// SetHash sets the value of Hash.
+func (s *GuardedFileEntry) SetHash(val OptFileHash) {
+	s.Hash = val
+}
+
+// SetEncryption sets the value of Encryption.
+func (s *GuardedFileEntry) SetEncryption(val bool) {
+	s.Encryption = val
+}
+
+// SetStatus sets the value of Status.
+func (s *GuardedFileEntry) SetStatus(val FileStatus) {
+	s.Status = val
+}
+
+// SetModTime sets the value of ModTime.
+func (s *GuardedFileEntry) SetModTime(val time.Time) {
+	s.ModTime = val
+}
+
+// SetGeneration sets the value of Generation.
+func (s *GuardedFileEntry) SetGeneration(val int64) {
+	s.Generation = val
+}
+
+// SetCreatedAt sets the value of CreatedAt.
+func (s *GuardedFileEntry) SetCreatedAt(val time.Time) {
+	s.CreatedAt = val
+}
+
+// SetUpdatedAt sets the value of UpdatedAt.
+func (s *GuardedFileEntry) SetUpdatedAt(val time.Time) {
+	s.UpdatedAt = val
+}
+
+// SetParentPath sets the value of ParentPath.
+func (s *GuardedFileEntry) SetParentPath(val OptString) {
+	s.ParentPath = val
+}
+
+// SetParentSegments sets the value of ParentSegments.
+func (s *GuardedFileEntry) SetParentSegments(val []string) {
+	s.ParentSegments = val
+}
+
+// GuardedFileEntryHeaders wraps GuardedFileEntry with response headers.
+type GuardedFileEntryHeaders struct {
+	Etag     ETag
+	Location URI
+	Response GuardedFileEntry
+}
+
+// GetEtag returns the value of Etag.
+func (s *GuardedFileEntryHeaders) GetEtag() ETag {
+	return s.Etag
+}
+
+// GetLocation returns the value of Location.
+func (s *GuardedFileEntryHeaders) GetLocation() URI {
+	return s.Location
+}
+
+// GetResponse returns the value of Response.
+func (s *GuardedFileEntryHeaders) GetResponse() GuardedFileEntry {
+	return s.Response
+}
+
+// SetEtag sets the value of Etag.
+func (s *GuardedFileEntryHeaders) SetEtag(val ETag) {
+	s.Etag = val
+}
+
+// SetLocation sets the value of Location.
+func (s *GuardedFileEntryHeaders) SetLocation(val URI) {
+	s.Location = val
+}
+
+// SetResponse sets the value of Response.
+func (s *GuardedFileEntryHeaders) SetResponse(val GuardedFileEntry) {
+	s.Response = val
+}
+
+// Empty-slot intent: the admitted destination must stay empty through commit.
+// Ref: #/components/schemas/GuardedSlotAbsent
+type GuardedSlotAbsent struct {
+	Kind GuardedSlotAbsentKind `json:"kind"`
+}
+
+// GetKind returns the value of Kind.
+func (s *GuardedSlotAbsent) GetKind() GuardedSlotAbsentKind {
+	return s.Kind
+}
+
+// SetKind sets the value of Kind.
+func (s *GuardedSlotAbsent) SetKind(val GuardedSlotAbsentKind) {
+	s.Kind = val
+}
+
+type GuardedSlotAbsentKind string
+
+const (
+	GuardedSlotAbsentKindAbsent GuardedSlotAbsentKind = "absent"
+)
+
+// AllValues returns all GuardedSlotAbsentKind values.
+func (GuardedSlotAbsentKind) AllValues() []GuardedSlotAbsentKind {
+	return []GuardedSlotAbsentKind{
+		GuardedSlotAbsentKindAbsent,
+	}
+}
+
+// MarshalText implements encoding.TextMarshaler.
+func (s GuardedSlotAbsentKind) MarshalText() ([]byte, error) {
+	switch s {
+	case GuardedSlotAbsentKindAbsent:
+		return []byte(s), nil
+	default:
+		return nil, errors.Errorf("invalid value: %q", s)
+	}
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler.
+func (s *GuardedSlotAbsentKind) UnmarshalText(data []byte) error {
+	switch GuardedSlotAbsentKind(data) {
+	case GuardedSlotAbsentKindAbsent:
+		*s = GuardedSlotAbsentKindAbsent
+		return nil
+	default:
+		return errors.Errorf("invalid value: %q", data)
+	}
+}
+
+// Ref: #/components/schemas/GuardedSlotExpectation
+// GuardedSlotExpectation represents sum type.
+type GuardedSlotExpectation struct {
+	// Type selects the active sum variant, switch on this field.
+	Type               GuardedSlotExpectationType
+	GuardedSlotAbsent  GuardedSlotAbsent
+	GuardedSlotVersion GuardedSlotVersion
+}
+
+// GuardedSlotExpectationType is oneOf type of GuardedSlotExpectation.
+type GuardedSlotExpectationType string
+
+// Possible values for GuardedSlotExpectationType.
+const (
+	GuardedSlotAbsentGuardedSlotExpectation  GuardedSlotExpectationType = "GuardedSlotAbsent"
+	GuardedSlotVersionGuardedSlotExpectation GuardedSlotExpectationType = "GuardedSlotVersion"
+)
+
+// IsGuardedSlotAbsent reports whether GuardedSlotExpectation is GuardedSlotAbsent.
+func (s GuardedSlotExpectation) IsGuardedSlotAbsent() bool {
+	return s.Type == GuardedSlotAbsentGuardedSlotExpectation
+}
+
+// IsGuardedSlotVersion reports whether GuardedSlotExpectation is GuardedSlotVersion.
+func (s GuardedSlotExpectation) IsGuardedSlotVersion() bool {
+	return s.Type == GuardedSlotVersionGuardedSlotExpectation
+}
+
+// SetGuardedSlotAbsent sets GuardedSlotExpectation to GuardedSlotAbsent.
+func (s *GuardedSlotExpectation) SetGuardedSlotAbsent(v GuardedSlotAbsent) {
+	s.Type = GuardedSlotAbsentGuardedSlotExpectation
+	s.GuardedSlotAbsent = v
+}
+
+// GetGuardedSlotAbsent returns GuardedSlotAbsent and true boolean if GuardedSlotExpectation is GuardedSlotAbsent.
+func (s GuardedSlotExpectation) GetGuardedSlotAbsent() (v GuardedSlotAbsent, ok bool) {
+	if !s.IsGuardedSlotAbsent() {
+		return v, false
+	}
+	return s.GuardedSlotAbsent, true
+}
+
+// NewGuardedSlotAbsentGuardedSlotExpectation returns new GuardedSlotExpectation from GuardedSlotAbsent.
+func NewGuardedSlotAbsentGuardedSlotExpectation(v GuardedSlotAbsent) GuardedSlotExpectation {
+	var s GuardedSlotExpectation
+	s.SetGuardedSlotAbsent(v)
+	return s
+}
+
+// SetGuardedSlotVersion sets GuardedSlotExpectation to GuardedSlotVersion.
+func (s *GuardedSlotExpectation) SetGuardedSlotVersion(v GuardedSlotVersion) {
+	s.Type = GuardedSlotVersionGuardedSlotExpectation
+	s.GuardedSlotVersion = v
+}
+
+// GetGuardedSlotVersion returns GuardedSlotVersion and true boolean if GuardedSlotExpectation is GuardedSlotVersion.
+func (s GuardedSlotExpectation) GetGuardedSlotVersion() (v GuardedSlotVersion, ok bool) {
+	if !s.IsGuardedSlotVersion() {
+		return v, false
+	}
+	return s.GuardedSlotVersion, true
+}
+
+// NewGuardedSlotVersionGuardedSlotExpectation returns new GuardedSlotExpectation from GuardedSlotVersion.
+func NewGuardedSlotVersionGuardedSlotExpectation(v GuardedSlotVersion) GuardedSlotExpectation {
+	var s GuardedSlotExpectation
+	s.SetGuardedSlotVersion(v)
+	return s
+}
+
+// Occupied-slot intent: exactly this file identity and generation are replaced.
+// Ref: #/components/schemas/GuardedSlotVersion
+type GuardedSlotVersion struct {
+	Kind   GuardedSlotVersionKind `json:"kind"`
+	FileId UUID                   `json:"fileId"`
+	// Positive canonical int64 decimal file generation.
+	Generation string `json:"generation"`
+}
+
+// GetKind returns the value of Kind.
+func (s *GuardedSlotVersion) GetKind() GuardedSlotVersionKind {
+	return s.Kind
+}
+
+// GetFileId returns the value of FileId.
+func (s *GuardedSlotVersion) GetFileId() UUID {
+	return s.FileId
+}
+
+// GetGeneration returns the value of Generation.
+func (s *GuardedSlotVersion) GetGeneration() string {
+	return s.Generation
+}
+
+// SetKind sets the value of Kind.
+func (s *GuardedSlotVersion) SetKind(val GuardedSlotVersionKind) {
+	s.Kind = val
+}
+
+// SetFileId sets the value of FileId.
+func (s *GuardedSlotVersion) SetFileId(val UUID) {
+	s.FileId = val
+}
+
+// SetGeneration sets the value of Generation.
+func (s *GuardedSlotVersion) SetGeneration(val string) {
+	s.Generation = val
+}
+
+type GuardedSlotVersionKind string
+
+const (
+	GuardedSlotVersionKindVersion GuardedSlotVersionKind = "version"
+)
+
+// AllValues returns all GuardedSlotVersionKind values.
+func (GuardedSlotVersionKind) AllValues() []GuardedSlotVersionKind {
+	return []GuardedSlotVersionKind{
+		GuardedSlotVersionKindVersion,
+	}
+}
+
+// MarshalText implements encoding.TextMarshaler.
+func (s GuardedSlotVersionKind) MarshalText() ([]byte, error) {
+	switch s {
+	case GuardedSlotVersionKindVersion:
+		return []byte(s), nil
+	default:
+		return nil, errors.Errorf("invalid value: %q", s)
+	}
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler.
+func (s *GuardedSlotVersionKind) UnmarshalText(data []byte) error {
+	switch GuardedSlotVersionKind(data) {
+	case GuardedSlotVersionKindVersion:
+		*s = GuardedSlotVersionKindVersion
+		return nil
+	default:
+		return errors.Errorf("invalid value: %q", data)
+	}
+}
+
+// Guarded completion always carries the exact plaintext size and BLAKE3 tree digest.
+// Ref: #/components/schemas/GuardedUploadCompleteRequest
+type GuardedUploadCompleteRequest struct {
+	Size int64    `json:"size"`
+	Hash FileHash `json:"hash"`
+}
+
+// GetSize returns the value of Size.
+func (s *GuardedUploadCompleteRequest) GetSize() int64 {
+	return s.Size
+}
+
+// GetHash returns the value of Hash.
+func (s *GuardedUploadCompleteRequest) GetHash() FileHash {
+	return s.Hash
+}
+
+// SetSize sets the value of Size.
+func (s *GuardedUploadCompleteRequest) SetSize(val int64) {
+	s.Size = val
+}
+
+// SetHash sets the value of Hash.
+func (s *GuardedUploadCompleteRequest) SetHash(val FileHash) {
+	s.Hash = val
+}
+
+// Guarded create body. The destination owns the parent slot, so the legacy `parentId` and derived
+// `conflictPolicy` are not accepted here.
+// Ref: #/components/schemas/GuardedUploadCreateRequest
+type GuardedUploadCreateRequest struct {
+	Destination GuardedUploadDestination `json:"destination"`
+	Name        string                   `json:"name"`
+	// Expected size in bytes, or -1 when the size is unknown until completion.
+	Size       int64       `json:"size"`
+	MimeType   OptString   `json:"mimeType"`
+	ModTime    time.Time   `json:"modTime"`
+	Hash       OptFileHash `json:"hash"`
+	Encryption OptBool     `json:"encryption"`
+	// Optional preferred part size, rounded upward to a 16 MiB multiple.
+	PreferredPartSize OptInt64 `json:"preferredPartSize"`
+}
+
+// GetDestination returns the value of Destination.
+func (s *GuardedUploadCreateRequest) GetDestination() GuardedUploadDestination {
+	return s.Destination
+}
+
+// GetName returns the value of Name.
+func (s *GuardedUploadCreateRequest) GetName() string {
+	return s.Name
+}
+
+// GetSize returns the value of Size.
+func (s *GuardedUploadCreateRequest) GetSize() int64 {
+	return s.Size
+}
+
+// GetMimeType returns the value of MimeType.
+func (s *GuardedUploadCreateRequest) GetMimeType() OptString {
+	return s.MimeType
+}
+
+// GetModTime returns the value of ModTime.
+func (s *GuardedUploadCreateRequest) GetModTime() time.Time {
+	return s.ModTime
+}
+
+// GetHash returns the value of Hash.
+func (s *GuardedUploadCreateRequest) GetHash() OptFileHash {
+	return s.Hash
+}
+
+// GetEncryption returns the value of Encryption.
+func (s *GuardedUploadCreateRequest) GetEncryption() OptBool {
+	return s.Encryption
+}
+
+// GetPreferredPartSize returns the value of PreferredPartSize.
+func (s *GuardedUploadCreateRequest) GetPreferredPartSize() OptInt64 {
+	return s.PreferredPartSize
+}
+
+// SetDestination sets the value of Destination.
+func (s *GuardedUploadCreateRequest) SetDestination(val GuardedUploadDestination) {
+	s.Destination = val
+}
+
+// SetName sets the value of Name.
+func (s *GuardedUploadCreateRequest) SetName(val string) {
+	s.Name = val
+}
+
+// SetSize sets the value of Size.
+func (s *GuardedUploadCreateRequest) SetSize(val int64) {
+	s.Size = val
+}
+
+// SetMimeType sets the value of MimeType.
+func (s *GuardedUploadCreateRequest) SetMimeType(val OptString) {
+	s.MimeType = val
+}
+
+// SetModTime sets the value of ModTime.
+func (s *GuardedUploadCreateRequest) SetModTime(val time.Time) {
+	s.ModTime = val
+}
+
+// SetHash sets the value of Hash.
+func (s *GuardedUploadCreateRequest) SetHash(val OptFileHash) {
+	s.Hash = val
+}
+
+// SetEncryption sets the value of Encryption.
+func (s *GuardedUploadCreateRequest) SetEncryption(val OptBool) {
+	s.Encryption = val
+}
+
+// SetPreferredPartSize sets the value of PreferredPartSize.
+func (s *GuardedUploadCreateRequest) SetPreferredPartSize(val OptInt64) {
+	s.PreferredPartSize = val
+}
+
+// Immutable destination intent for a guarded upload. A null mountRoot or parentId explicitly means the
+// account root; omissions are invalid. The leaf is the guarded create `name` and is never a path or
+// rename request.
+// Ref: #/components/schemas/GuardedUploadDestination
+type GuardedUploadDestination struct {
+	MountRoot NilUUID                `json:"mountRoot"`
+	ParentId  NilUUID                `json:"parentId"`
+	Expected  GuardedSlotExpectation `json:"expected"`
+}
+
+// GetMountRoot returns the value of MountRoot.
+func (s *GuardedUploadDestination) GetMountRoot() NilUUID {
+	return s.MountRoot
+}
+
+// GetParentId returns the value of ParentId.
+func (s *GuardedUploadDestination) GetParentId() NilUUID {
+	return s.ParentId
+}
+
+// GetExpected returns the value of Expected.
+func (s *GuardedUploadDestination) GetExpected() GuardedSlotExpectation {
+	return s.Expected
+}
+
+// SetMountRoot sets the value of MountRoot.
+func (s *GuardedUploadDestination) SetMountRoot(val NilUUID) {
+	s.MountRoot = val
+}
+
+// SetParentId sets the value of ParentId.
+func (s *GuardedUploadDestination) SetParentId(val NilUUID) {
+	s.ParentId = val
+}
+
+// SetExpected sets the value of Expected.
+func (s *GuardedUploadDestination) SetExpected(val GuardedSlotExpectation) {
+	s.Expected = val
+}
+
+// Authorized guarded discovery response; the body is intentionally empty.
+// Ref: #/components/schemas/GuardedUploadDiscovery
+type GuardedUploadDiscovery struct{}
+
+// GuardedUploadDiscoveryHeaders wraps GuardedUploadDiscovery with response headers.
+type GuardedUploadDiscoveryHeaders struct {
+	XTelDriveRecoveryIncarnation UUID
+	Response                     GuardedUploadDiscovery
+}
+
+// GetXTelDriveRecoveryIncarnation returns the value of XTelDriveRecoveryIncarnation.
+func (s *GuardedUploadDiscoveryHeaders) GetXTelDriveRecoveryIncarnation() UUID {
+	return s.XTelDriveRecoveryIncarnation
+}
+
+// GetResponse returns the value of Response.
+func (s *GuardedUploadDiscoveryHeaders) GetResponse() GuardedUploadDiscovery {
+	return s.Response
+}
+
+// SetXTelDriveRecoveryIncarnation sets the value of XTelDriveRecoveryIncarnation.
+func (s *GuardedUploadDiscoveryHeaders) SetXTelDriveRecoveryIncarnation(val UUID) {
+	s.XTelDriveRecoveryIncarnation = val
+}
+
+// SetResponse sets the value of Response.
+func (s *GuardedUploadDiscoveryHeaders) SetResponse(val GuardedUploadDiscovery) {
+	s.Response = val
+}
+
+func (*GuardedUploadDiscoveryHeaders) discoverGuardedUploadRes() {}
+
+// Merged schema.
+// Ref: #/components/schemas/GuardedUploadSession
+type GuardedUploadSession struct {
+	ID             UUID               `json:"id"`
+	ParentId       OptUUID            `json:"parentId"`
+	Name           string             `json:"name"`
+	ExpectedSize   int64              `json:"expectedSize"`
+	ExpectedHash   OptFileHash        `json:"expectedHash"`
+	MimeType       OptString          `json:"mimeType"`
+	ModTime        time.Time          `json:"modTime"`
+	Encryption     bool               `json:"encryption"`
+	ConflictPolicy NameConflictPolicy `json:"conflictPolicy"`
+	PartSize       int64              `json:"partSize"`
+	// Requires current-attempt completion proof and exact-body part replay.
+	RequiresCompletionManifest GuardedUploadSessionRequiresCompletionManifest `json:"requiresCompletionManifest"`
+	State                      UploadState                                    `json:"state"`
+	ExpiresAt                  time.Time                                      `json:"expiresAt"`
+	CreatedAt                  time.Time                                      `json:"createdAt"`
+	CompletedAt                OptDateTime                                    `json:"completedAt"`
+	FileId                     OptUUID                                        `json:"fileId"`
+	// Present only for a reauthorized exact result in the current incarnation.
+	CompletedReceipt OptGuardedCompletedReceipt `json:"completedReceipt"`
+}
+
+// GetID returns the value of ID.
+func (s *GuardedUploadSession) GetID() UUID {
+	return s.ID
+}
+
+// GetParentId returns the value of ParentId.
+func (s *GuardedUploadSession) GetParentId() OptUUID {
+	return s.ParentId
+}
+
+// GetName returns the value of Name.
+func (s *GuardedUploadSession) GetName() string {
+	return s.Name
+}
+
+// GetExpectedSize returns the value of ExpectedSize.
+func (s *GuardedUploadSession) GetExpectedSize() int64 {
+	return s.ExpectedSize
+}
+
+// GetExpectedHash returns the value of ExpectedHash.
+func (s *GuardedUploadSession) GetExpectedHash() OptFileHash {
+	return s.ExpectedHash
+}
+
+// GetMimeType returns the value of MimeType.
+func (s *GuardedUploadSession) GetMimeType() OptString {
+	return s.MimeType
+}
+
+// GetModTime returns the value of ModTime.
+func (s *GuardedUploadSession) GetModTime() time.Time {
+	return s.ModTime
+}
+
+// GetEncryption returns the value of Encryption.
+func (s *GuardedUploadSession) GetEncryption() bool {
+	return s.Encryption
+}
+
+// GetConflictPolicy returns the value of ConflictPolicy.
+func (s *GuardedUploadSession) GetConflictPolicy() NameConflictPolicy {
+	return s.ConflictPolicy
+}
+
+// GetPartSize returns the value of PartSize.
+func (s *GuardedUploadSession) GetPartSize() int64 {
+	return s.PartSize
+}
+
+// GetRequiresCompletionManifest returns the value of RequiresCompletionManifest.
+func (s *GuardedUploadSession) GetRequiresCompletionManifest() GuardedUploadSessionRequiresCompletionManifest {
+	return s.RequiresCompletionManifest
+}
+
+// GetState returns the value of State.
+func (s *GuardedUploadSession) GetState() UploadState {
+	return s.State
+}
+
+// GetExpiresAt returns the value of ExpiresAt.
+func (s *GuardedUploadSession) GetExpiresAt() time.Time {
+	return s.ExpiresAt
+}
+
+// GetCreatedAt returns the value of CreatedAt.
+func (s *GuardedUploadSession) GetCreatedAt() time.Time {
+	return s.CreatedAt
+}
+
+// GetCompletedAt returns the value of CompletedAt.
+func (s *GuardedUploadSession) GetCompletedAt() OptDateTime {
+	return s.CompletedAt
+}
+
+// GetFileId returns the value of FileId.
+func (s *GuardedUploadSession) GetFileId() OptUUID {
+	return s.FileId
+}
+
+// GetCompletedReceipt returns the value of CompletedReceipt.
+func (s *GuardedUploadSession) GetCompletedReceipt() OptGuardedCompletedReceipt {
+	return s.CompletedReceipt
+}
+
+// SetID sets the value of ID.
+func (s *GuardedUploadSession) SetID(val UUID) {
+	s.ID = val
+}
+
+// SetParentId sets the value of ParentId.
+func (s *GuardedUploadSession) SetParentId(val OptUUID) {
+	s.ParentId = val
+}
+
+// SetName sets the value of Name.
+func (s *GuardedUploadSession) SetName(val string) {
+	s.Name = val
+}
+
+// SetExpectedSize sets the value of ExpectedSize.
+func (s *GuardedUploadSession) SetExpectedSize(val int64) {
+	s.ExpectedSize = val
+}
+
+// SetExpectedHash sets the value of ExpectedHash.
+func (s *GuardedUploadSession) SetExpectedHash(val OptFileHash) {
+	s.ExpectedHash = val
+}
+
+// SetMimeType sets the value of MimeType.
+func (s *GuardedUploadSession) SetMimeType(val OptString) {
+	s.MimeType = val
+}
+
+// SetModTime sets the value of ModTime.
+func (s *GuardedUploadSession) SetModTime(val time.Time) {
+	s.ModTime = val
+}
+
+// SetEncryption sets the value of Encryption.
+func (s *GuardedUploadSession) SetEncryption(val bool) {
+	s.Encryption = val
+}
+
+// SetConflictPolicy sets the value of ConflictPolicy.
+func (s *GuardedUploadSession) SetConflictPolicy(val NameConflictPolicy) {
+	s.ConflictPolicy = val
+}
+
+// SetPartSize sets the value of PartSize.
+func (s *GuardedUploadSession) SetPartSize(val int64) {
+	s.PartSize = val
+}
+
+// SetRequiresCompletionManifest sets the value of RequiresCompletionManifest.
+func (s *GuardedUploadSession) SetRequiresCompletionManifest(val GuardedUploadSessionRequiresCompletionManifest) {
+	s.RequiresCompletionManifest = val
+}
+
+// SetState sets the value of State.
+func (s *GuardedUploadSession) SetState(val UploadState) {
+	s.State = val
+}
+
+// SetExpiresAt sets the value of ExpiresAt.
+func (s *GuardedUploadSession) SetExpiresAt(val time.Time) {
+	s.ExpiresAt = val
+}
+
+// SetCreatedAt sets the value of CreatedAt.
+func (s *GuardedUploadSession) SetCreatedAt(val time.Time) {
+	s.CreatedAt = val
+}
+
+// SetCompletedAt sets the value of CompletedAt.
+func (s *GuardedUploadSession) SetCompletedAt(val OptDateTime) {
+	s.CompletedAt = val
+}
+
+// SetFileId sets the value of FileId.
+func (s *GuardedUploadSession) SetFileId(val OptUUID) {
+	s.FileId = val
+}
+
+// SetCompletedReceipt sets the value of CompletedReceipt.
+func (s *GuardedUploadSession) SetCompletedReceipt(val OptGuardedCompletedReceipt) {
+	s.CompletedReceipt = val
+}
+
+// GuardedUploadSessionHeaders wraps GuardedUploadSession with response headers.
+type GuardedUploadSessionHeaders struct {
+	XTelDriveRecoveryIncarnation UUID
+	XTelDriveUploadGuard         GetGuardedUploadOKXTelDriveUploadGuard
+	Response                     GuardedUploadSession
+}
+
+// GetXTelDriveRecoveryIncarnation returns the value of XTelDriveRecoveryIncarnation.
+func (s *GuardedUploadSessionHeaders) GetXTelDriveRecoveryIncarnation() UUID {
+	return s.XTelDriveRecoveryIncarnation
+}
+
+// GetXTelDriveUploadGuard returns the value of XTelDriveUploadGuard.
+func (s *GuardedUploadSessionHeaders) GetXTelDriveUploadGuard() GetGuardedUploadOKXTelDriveUploadGuard {
+	return s.XTelDriveUploadGuard
+}
+
+// GetResponse returns the value of Response.
+func (s *GuardedUploadSessionHeaders) GetResponse() GuardedUploadSession {
+	return s.Response
+}
+
+// SetXTelDriveRecoveryIncarnation sets the value of XTelDriveRecoveryIncarnation.
+func (s *GuardedUploadSessionHeaders) SetXTelDriveRecoveryIncarnation(val UUID) {
+	s.XTelDriveRecoveryIncarnation = val
+}
+
+// SetXTelDriveUploadGuard sets the value of XTelDriveUploadGuard.
+func (s *GuardedUploadSessionHeaders) SetXTelDriveUploadGuard(val GetGuardedUploadOKXTelDriveUploadGuard) {
+	s.XTelDriveUploadGuard = val
+}
+
+// SetResponse sets the value of Response.
+func (s *GuardedUploadSessionHeaders) SetResponse(val GuardedUploadSession) {
+	s.Response = val
+}
+
+func (*GuardedUploadSessionHeaders) getGuardedUploadRes() {}
+
+// Requires current-attempt completion proof and exact-body part replay.
+type GuardedUploadSessionRequiresCompletionManifest bool
+
+const (
+	GuardedUploadSessionRequiresCompletionManifestTrue GuardedUploadSessionRequiresCompletionManifest = true
+)
+
+// AllValues returns all GuardedUploadSessionRequiresCompletionManifest values.
+func (GuardedUploadSessionRequiresCompletionManifest) AllValues() []GuardedUploadSessionRequiresCompletionManifest {
+	return []GuardedUploadSessionRequiresCompletionManifest{
+		GuardedUploadSessionRequiresCompletionManifestTrue,
+	}
+}
 
 // Ref: #/components/schemas/HashAlgorithm
 type HashAlgorithm string
@@ -7724,6 +8833,14 @@ type ListSharedWithMeOKApplicationJSON []SharedWithMeEntry
 
 func (*ListSharedWithMeOKApplicationJSON) listSharedWithMeRes() {}
 
+type ListUploadPartsConflict ErrorEnvelope
+
+func (*ListUploadPartsConflict) listUploadPartsRes() {}
+
+type ListUploadPartsForbidden ErrorEnvelope
+
+func (*ListUploadPartsForbidden) listUploadPartsRes() {}
+
 type ListUploadPartsGone ErrorEnvelope
 
 func (*ListUploadPartsGone) listUploadPartsRes() {}
@@ -7762,6 +8879,10 @@ func (*ListUploadPartsOK) listUploadPartsRes() {}
 type ListUploadPartsUnauthorized ErrorEnvelope
 
 func (*ListUploadPartsUnauthorized) listUploadPartsRes() {}
+
+type ListUploadPartsUnprocessableEntity ErrorEnvelope
+
+func (*ListUploadPartsUnprocessableEntity) listUploadPartsRes() {}
 
 type ListUploadsOK struct {
 	Items      []UploadSession `json:"items"`
@@ -7887,6 +9008,51 @@ func (s *NameConflictPolicy) UnmarshalText(data []byte) error {
 	default:
 		return errors.Errorf("invalid value: %q", data)
 	}
+}
+
+// NewNilUUID returns new NilUUID with value set to v.
+func NewNilUUID(v UUID) NilUUID {
+	return NilUUID{
+		Value: v,
+	}
+}
+
+// NilUUID is nullable UUID.
+type NilUUID struct {
+	Value UUID
+	Null  bool
+}
+
+// SetTo sets value to v.
+func (o *NilUUID) SetTo(v UUID) {
+	o.Null = false
+	o.Value = v
+}
+
+// IsNull returns true if value is Null.
+func (o NilUUID) IsNull() bool { return o.Null }
+
+// SetToNull sets value to null.
+func (o *NilUUID) SetToNull() {
+	o.Null = true
+	var v UUID
+	o.Value = v
+}
+
+// Get returns value and boolean that denotes whether value was set.
+func (o NilUUID) Get() (v UUID, ok bool) {
+	if o.Null {
+		return v, false
+	}
+	return o.Value, true
+}
+
+// Or returns value if set, or given parameter if does not.
+func (o NilUUID) Or(d UUID) UUID {
+	if v, ok := o.Get(); ok {
+		return v
+	}
+	return d
 }
 
 // NewOptAppearancePreferencesUpdate returns new OptAppearancePreferencesUpdate with value set to v.
@@ -9223,6 +10389,52 @@ func (o OptFolderCreateRequestConflictPolicy) Or(d FolderCreateRequestConflictPo
 	return d
 }
 
+// NewOptGuardedCompletedReceipt returns new OptGuardedCompletedReceipt with value set to v.
+func NewOptGuardedCompletedReceipt(v GuardedCompletedReceipt) OptGuardedCompletedReceipt {
+	return OptGuardedCompletedReceipt{
+		Value: v,
+		Set:   true,
+	}
+}
+
+// OptGuardedCompletedReceipt is optional GuardedCompletedReceipt.
+type OptGuardedCompletedReceipt struct {
+	Value GuardedCompletedReceipt
+	Set   bool
+}
+
+// IsSet returns true if OptGuardedCompletedReceipt was set.
+func (o OptGuardedCompletedReceipt) IsSet() bool { return o.Set }
+
+// Reset unsets value.
+func (o *OptGuardedCompletedReceipt) Reset() {
+	var v GuardedCompletedReceipt
+	o.Value = v
+	o.Set = false
+}
+
+// SetTo sets value to v.
+func (o *OptGuardedCompletedReceipt) SetTo(v GuardedCompletedReceipt) {
+	o.Set = true
+	o.Value = v
+}
+
+// Get returns value and boolean that denotes whether value was set.
+func (o OptGuardedCompletedReceipt) Get() (v GuardedCompletedReceipt, ok bool) {
+	if !o.Set {
+		return v, false
+	}
+	return o.Value, true
+}
+
+// Or returns value if set, or given parameter if does not.
+func (o OptGuardedCompletedReceipt) Or(d GuardedCompletedReceipt) GuardedCompletedReceipt {
+	if v, ok := o.Get(); ok {
+		return v
+	}
+	return d
+}
+
 // NewOptInt32 returns new OptInt32 with value set to v.
 func NewOptInt32(v int32) OptInt32 {
 	return OptInt32{
@@ -9631,6 +10843,52 @@ func (o OptSortOrder) Get() (v SortOrder, ok bool) {
 
 // Or returns value if set, or given parameter if does not.
 func (o OptSortOrder) Or(d SortOrder) SortOrder {
+	if v, ok := o.Get(); ok {
+		return v
+	}
+	return d
+}
+
+// NewOptStreamEventsOKXTelDriveEvents returns new OptStreamEventsOKXTelDriveEvents with value set to v.
+func NewOptStreamEventsOKXTelDriveEvents(v StreamEventsOKXTelDriveEvents) OptStreamEventsOKXTelDriveEvents {
+	return OptStreamEventsOKXTelDriveEvents{
+		Value: v,
+		Set:   true,
+	}
+}
+
+// OptStreamEventsOKXTelDriveEvents is optional StreamEventsOKXTelDriveEvents.
+type OptStreamEventsOKXTelDriveEvents struct {
+	Value StreamEventsOKXTelDriveEvents
+	Set   bool
+}
+
+// IsSet returns true if OptStreamEventsOKXTelDriveEvents was set.
+func (o OptStreamEventsOKXTelDriveEvents) IsSet() bool { return o.Set }
+
+// Reset unsets value.
+func (o *OptStreamEventsOKXTelDriveEvents) Reset() {
+	var v StreamEventsOKXTelDriveEvents
+	o.Value = v
+	o.Set = false
+}
+
+// SetTo sets value to v.
+func (o *OptStreamEventsOKXTelDriveEvents) SetTo(v StreamEventsOKXTelDriveEvents) {
+	o.Set = true
+	o.Value = v
+}
+
+// Get returns value and boolean that denotes whether value was set.
+func (o OptStreamEventsOKXTelDriveEvents) Get() (v StreamEventsOKXTelDriveEvents, ok bool) {
+	if !o.Set {
+		return v, false
+	}
+	return o.Value, true
+}
+
+// Or returns value if set, or given parameter if does not.
+func (o OptStreamEventsOKXTelDriveEvents) Or(d StreamEventsOKXTelDriveEvents) StreamEventsOKXTelDriveEvents {
 	if v, ok := o.Get(); ok {
 		return v
 	}
@@ -10109,6 +11367,14 @@ func (*PauseJobQueueNotFound) pauseJobQueueRes() {}
 type PauseJobQueueUnauthorized ErrorEnvelope
 
 func (*PauseJobQueueUnauthorized) pauseJobQueueRes() {}
+
+type PausePeriodicJobConflict ErrorEnvelope
+
+func (*PausePeriodicJobConflict) pausePeriodicJobRes() {}
+
+type PausePeriodicJobForbidden ErrorEnvelope
+
+func (*PausePeriodicJobForbidden) pausePeriodicJobRes() {}
 
 type PausePeriodicJobNotFound ErrorEnvelope
 
@@ -10797,6 +12063,72 @@ type PutFileViewStateUnprocessableEntity ErrorEnvelope
 
 func (*PutFileViewStateUnprocessableEntity) putFileViewStateRes() {}
 
+type PutGuardedUploadPartBadRequest ErrorEnvelope
+
+func (*PutGuardedUploadPartBadRequest) putGuardedUploadPartRes() {}
+
+type PutGuardedUploadPartConflict ErrorEnvelope
+
+func (*PutGuardedUploadPartConflict) putGuardedUploadPartRes() {}
+
+type PutGuardedUploadPartCreated UploadPart
+
+func (*PutGuardedUploadPartCreated) putGuardedUploadPartRes() {}
+
+type PutGuardedUploadPartForbidden ErrorEnvelope
+
+func (*PutGuardedUploadPartForbidden) putGuardedUploadPartRes() {}
+
+type PutGuardedUploadPartGone ErrorEnvelope
+
+func (*PutGuardedUploadPartGone) putGuardedUploadPartRes() {}
+
+type PutGuardedUploadPartNotFound ErrorEnvelope
+
+func (*PutGuardedUploadPartNotFound) putGuardedUploadPartRes() {}
+
+type PutGuardedUploadPartOK UploadPart
+
+func (*PutGuardedUploadPartOK) putGuardedUploadPartRes() {}
+
+type PutGuardedUploadPartPreconditionFailed ErrorEnvelope
+
+func (*PutGuardedUploadPartPreconditionFailed) putGuardedUploadPartRes() {}
+
+type PutGuardedUploadPartReq struct {
+	Data io.Reader
+}
+
+// Read reads data from the Data reader.
+//
+// Kept to satisfy the io.Reader interface.
+func (s PutGuardedUploadPartReq) Read(p []byte) (n int, err error) {
+	if s.Data == nil {
+		return 0, io.EOF
+	}
+	return s.Data.Read(p)
+}
+
+type PutGuardedUploadPartRequestEntityTooLarge ErrorEnvelope
+
+func (*PutGuardedUploadPartRequestEntityTooLarge) putGuardedUploadPartRes() {}
+
+type PutGuardedUploadPartServiceUnavailable ErrorEnvelope
+
+func (*PutGuardedUploadPartServiceUnavailable) putGuardedUploadPartRes() {}
+
+type PutGuardedUploadPartTooManyRequests ErrorEnvelope
+
+func (*PutGuardedUploadPartTooManyRequests) putGuardedUploadPartRes() {}
+
+type PutGuardedUploadPartUnauthorized ErrorEnvelope
+
+func (*PutGuardedUploadPartUnauthorized) putGuardedUploadPartRes() {}
+
+type PutGuardedUploadPartUnprocessableEntity ErrorEnvelope
+
+func (*PutGuardedUploadPartUnprocessableEntity) putGuardedUploadPartRes() {}
+
 type PutPublicShareUploadPartBadRequest ErrorEnvelope
 
 func (*PutPublicShareUploadPartBadRequest) putPublicShareUploadPartRes() {}
@@ -10862,6 +12194,10 @@ func (*PutUploadPartConflict) putUploadPartRes() {}
 type PutUploadPartCreated UploadPart
 
 func (*PutUploadPartCreated) putUploadPartRes() {}
+
+type PutUploadPartForbidden ErrorEnvelope
+
+func (*PutUploadPartForbidden) putUploadPartRes() {}
 
 type PutUploadPartGone ErrorEnvelope
 
@@ -10945,6 +12281,14 @@ type RemoveFileBookmarksNoContent struct{}
 
 func (*RemoveFileBookmarksNoContent) removeFileBookmarksRes() {}
 
+type ResetPeriodicJobsForbidden ErrorEnvelope
+
+func (*ResetPeriodicJobsForbidden) resetPeriodicJobsRes() {}
+
+type ResetPeriodicJobsUnauthorized ErrorEnvelope
+
+func (*ResetPeriodicJobsUnauthorized) resetPeriodicJobsRes() {}
+
 type RestoreFileConflict ErrorEnvelope
 
 func (*RestoreFileConflict) restoreFileRes() {}
@@ -10969,6 +12313,14 @@ func (*ResumeJobQueueNotFound) resumeJobQueueRes() {}
 type ResumeJobQueueUnauthorized ErrorEnvelope
 
 func (*ResumeJobQueueUnauthorized) resumeJobQueueRes() {}
+
+type ResumePeriodicJobConflict ErrorEnvelope
+
+func (*ResumePeriodicJobConflict) resumePeriodicJobRes() {}
+
+type ResumePeriodicJobForbidden ErrorEnvelope
+
+func (*ResumePeriodicJobForbidden) resumePeriodicJobRes() {}
 
 type ResumePeriodicJobNotFound ErrorEnvelope
 
@@ -12063,13 +13415,25 @@ func (s *StreamEventsOKCacheControl) UnmarshalText(data []byte) error {
 
 // StreamEventsOKHeaders wraps StreamEventsOK with response headers.
 type StreamEventsOKHeaders struct {
-	CacheControl StreamEventsOKCacheControl
-	Response     StreamEventsOK
+	CacheControl         StreamEventsOKCacheControl
+	XTelDriveEvents      OptStreamEventsOKXTelDriveEvents
+	XTelDriveHeartbeatMs OptInt32
+	Response             StreamEventsOK
 }
 
 // GetCacheControl returns the value of CacheControl.
 func (s *StreamEventsOKHeaders) GetCacheControl() StreamEventsOKCacheControl {
 	return s.CacheControl
+}
+
+// GetXTelDriveEvents returns the value of XTelDriveEvents.
+func (s *StreamEventsOKHeaders) GetXTelDriveEvents() OptStreamEventsOKXTelDriveEvents {
+	return s.XTelDriveEvents
+}
+
+// GetXTelDriveHeartbeatMs returns the value of XTelDriveHeartbeatMs.
+func (s *StreamEventsOKHeaders) GetXTelDriveHeartbeatMs() OptInt32 {
+	return s.XTelDriveHeartbeatMs
 }
 
 // GetResponse returns the value of Response.
@@ -12080,6 +13444,16 @@ func (s *StreamEventsOKHeaders) GetResponse() StreamEventsOK {
 // SetCacheControl sets the value of CacheControl.
 func (s *StreamEventsOKHeaders) SetCacheControl(val StreamEventsOKCacheControl) {
 	s.CacheControl = val
+}
+
+// SetXTelDriveEvents sets the value of XTelDriveEvents.
+func (s *StreamEventsOKHeaders) SetXTelDriveEvents(val OptStreamEventsOKXTelDriveEvents) {
+	s.XTelDriveEvents = val
+}
+
+// SetXTelDriveHeartbeatMs sets the value of XTelDriveHeartbeatMs.
+func (s *StreamEventsOKHeaders) SetXTelDriveHeartbeatMs(val OptInt32) {
+	s.XTelDriveHeartbeatMs = val
 }
 
 // SetResponse sets the value of Response.
@@ -12104,6 +13478,40 @@ func (s *StreamEventsOKRawTextEventStream) SetResponse(val *http.Response) {
 
 func (*StreamEventsOKRawTextEventStream) streamEventsRes() {}
 
+type StreamEventsOKXTelDriveEvents string
+
+const (
+	StreamEventsOKXTelDriveEventsOrdered StreamEventsOKXTelDriveEvents = "ordered"
+)
+
+// AllValues returns all StreamEventsOKXTelDriveEvents values.
+func (StreamEventsOKXTelDriveEvents) AllValues() []StreamEventsOKXTelDriveEvents {
+	return []StreamEventsOKXTelDriveEvents{
+		StreamEventsOKXTelDriveEventsOrdered,
+	}
+}
+
+// MarshalText implements encoding.TextMarshaler.
+func (s StreamEventsOKXTelDriveEvents) MarshalText() ([]byte, error) {
+	switch s {
+	case StreamEventsOKXTelDriveEventsOrdered:
+		return []byte(s), nil
+	default:
+		return nil, errors.Errorf("invalid value: %q", s)
+	}
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler.
+func (s *StreamEventsOKXTelDriveEvents) UnmarshalText(data []byte) error {
+	switch StreamEventsOKXTelDriveEvents(data) {
+	case StreamEventsOKXTelDriveEventsOrdered:
+		*s = StreamEventsOKXTelDriveEventsOrdered
+		return nil
+	default:
+		return errors.Errorf("invalid value: %q", data)
+	}
+}
+
 type StreamEventsServiceUnavailable ErrorEnvelope
 
 func (*StreamEventsServiceUnavailable) streamEventsRes() {}
@@ -12119,6 +13527,10 @@ func (*StreamEventsUnauthorized) streamEventsRes() {}
 type StreamEventsUnprocessableEntity ErrorEnvelope
 
 func (*StreamEventsUnprocessableEntity) streamEventsRes() {}
+
+type SyncChannelsConflict ErrorEnvelope
+
+func (*SyncChannelsConflict) syncChannelsRes() {}
 
 type SyncChannelsNotFound ErrorEnvelope
 
@@ -12614,6 +14026,10 @@ type TrashFileUnauthorized ErrorEnvelope
 
 func (*TrashFileUnauthorized) trashFileRes() {}
 
+type TrashPublicShareFileConflict ErrorEnvelope
+
+func (*TrashPublicShareFileConflict) trashPublicShareFileRes() {}
+
 type TrashPublicShareFileForbidden ErrorEnvelope
 
 func (*TrashPublicShareFileForbidden) trashPublicShareFileRes() {}
@@ -12691,6 +14107,14 @@ type UpdatePeriodicJobBadRequest ErrorEnvelope
 
 func (*UpdatePeriodicJobBadRequest) updatePeriodicJobRes() {}
 
+type UpdatePeriodicJobConflict ErrorEnvelope
+
+func (*UpdatePeriodicJobConflict) updatePeriodicJobRes() {}
+
+type UpdatePeriodicJobForbidden ErrorEnvelope
+
+func (*UpdatePeriodicJobForbidden) updatePeriodicJobRes() {}
+
 type UpdatePeriodicJobNotFound ErrorEnvelope
 
 func (*UpdatePeriodicJobNotFound) updatePeriodicJobRes() {}
@@ -12743,6 +14167,33 @@ type UpdateUserPreferencesUnprocessableEntity ErrorEnvelope
 
 func (*UpdateUserPreferencesUnprocessableEntity) updateUserPreferencesRes() {}
 
+// Current-attempt plaintext EOF and optional whole-source tree hash.
+// Ref: #/components/schemas/UploadCompleteRequest
+type UploadCompleteRequest struct {
+	Size int64       `json:"size"`
+	Hash OptFileHash `json:"hash"`
+}
+
+// GetSize returns the value of Size.
+func (s *UploadCompleteRequest) GetSize() int64 {
+	return s.Size
+}
+
+// GetHash returns the value of Hash.
+func (s *UploadCompleteRequest) GetHash() OptFileHash {
+	return s.Hash
+}
+
+// SetSize sets the value of Size.
+func (s *UploadCompleteRequest) SetSize(val int64) {
+	s.Size = val
+}
+
+// SetHash sets the value of Hash.
+func (s *UploadCompleteRequest) SetHash(val OptFileHash) {
+	s.Hash = val
+}
+
 // Ref: #/components/schemas/UploadCreateRequest
 type UploadCreateRequest struct {
 	ParentId OptUUID `json:"parentId"`
@@ -12754,7 +14205,7 @@ type UploadCreateRequest struct {
 	Hash           OptFileHash                          `json:"hash"`
 	Encryption     OptBool                              `json:"encryption"`
 	ConflictPolicy OptUploadCreateRequestConflictPolicy `json:"conflictPolicy"`
-	// Optional preferred part size. The server may choose a different value.
+	// Optional preferred part size, rounded upward to a 16 MiB multiple.
 	PreferredPartSize OptInt64 `json:"preferredPartSize"`
 }
 
@@ -13433,11 +14884,13 @@ type UploadSession struct {
 	Encryption     bool               `json:"encryption"`
 	ConflictPolicy NameConflictPolicy `json:"conflictPolicy"`
 	PartSize       int64              `json:"partSize"`
-	State          UploadState        `json:"state"`
-	ExpiresAt      time.Time          `json:"expiresAt"`
-	CreatedAt      time.Time          `json:"createdAt"`
-	CompletedAt    OptDateTime        `json:"completedAt"`
-	FileId         OptUUID            `json:"fileId"`
+	// Requires current-attempt completion proof and exact-body part replay.
+	RequiresCompletionManifest UploadSessionRequiresCompletionManifest `json:"requiresCompletionManifest"`
+	State                      UploadState                             `json:"state"`
+	ExpiresAt                  time.Time                               `json:"expiresAt"`
+	CreatedAt                  time.Time                               `json:"createdAt"`
+	CompletedAt                OptDateTime                             `json:"completedAt"`
+	FileId                     OptUUID                                 `json:"fileId"`
 }
 
 // GetID returns the value of ID.
@@ -13488,6 +14941,11 @@ func (s *UploadSession) GetConflictPolicy() NameConflictPolicy {
 // GetPartSize returns the value of PartSize.
 func (s *UploadSession) GetPartSize() int64 {
 	return s.PartSize
+}
+
+// GetRequiresCompletionManifest returns the value of RequiresCompletionManifest.
+func (s *UploadSession) GetRequiresCompletionManifest() UploadSessionRequiresCompletionManifest {
+	return s.RequiresCompletionManifest
 }
 
 // GetState returns the value of State.
@@ -13565,6 +15023,11 @@ func (s *UploadSession) SetPartSize(val int64) {
 	s.PartSize = val
 }
 
+// SetRequiresCompletionManifest sets the value of RequiresCompletionManifest.
+func (s *UploadSession) SetRequiresCompletionManifest(val UploadSessionRequiresCompletionManifest) {
+	s.RequiresCompletionManifest = val
+}
+
 // SetState sets the value of State.
 func (s *UploadSession) SetState(val UploadState) {
 	s.State = val
@@ -13590,9 +15053,24 @@ func (s *UploadSession) SetFileId(val OptUUID) {
 	s.FileId = val
 }
 
+func (*UploadSession) createGuardedUploadRes()     {}
 func (*UploadSession) createPublicShareUploadRes() {}
 func (*UploadSession) createUploadRes()            {}
 func (*UploadSession) getUploadRes()               {}
+
+// Requires current-attempt completion proof and exact-body part replay.
+type UploadSessionRequiresCompletionManifest bool
+
+const (
+	UploadSessionRequiresCompletionManifestTrue UploadSessionRequiresCompletionManifest = true
+)
+
+// AllValues returns all UploadSessionRequiresCompletionManifest values.
+func (UploadSessionRequiresCompletionManifest) AllValues() []UploadSessionRequiresCompletionManifest {
+	return []UploadSessionRequiresCompletionManifest{
+		UploadSessionRequiresCompletionManifestTrue,
+	}
+}
 
 // Ref: #/components/schemas/UploadState
 type UploadState string

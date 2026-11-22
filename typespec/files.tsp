@@ -401,7 +401,15 @@ namespace Files {
     | ErrorResponse<412>
     | ErrorResponse<422>;
 
-  /** Copy a file or folder to another destination. */
+  /**
+   * Copy a file or folder with actor-scoped stable request admission.
+   * The same Idempotency-Key and original request return the current authorized
+   * result with the existing 201/FileEntry/ETag/Location response, without another copy.
+   * Changed requests or inflight operations return ordinary 409/conflict after authorization.
+   * Destination loss returns 409/upload_parent_unavailable with message
+   * "upload destination folder is unavailable"; restore cannot revive that attempt.
+   * Current result access, not former source or destination access, governs completed replay.
+   */
   @post
   @route("/{fileId}/copy")
   @operationId("copyFile")
@@ -413,6 +421,7 @@ namespace Files {
     | FileCreatedResponse
     | ErrorResponse<401>
     | ErrorResponse<404>
+    | ErrorResponse<403>
     | ErrorResponse<409>
     | ErrorResponse<422>;
 
@@ -436,7 +445,7 @@ namespace Files {
     | ErrorResponse<404>
     | ErrorResponse<409>;
 
-  /** Permanently delete a trashed file or folder from the catalog. */
+  /** Queue permanent deletion of a trashed file or folder. Physical completion requires proven ownership and confirmed cleanup. */
   @delete
   @route("/{fileId}/purge")
   @operationId("purgeFile")

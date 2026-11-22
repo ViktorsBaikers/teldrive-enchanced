@@ -456,8 +456,16 @@ namespace PublicShares {
     | ErrorResponse<401>
     | ErrorResponse<403>
     | ErrorResponse<404>
+    | ErrorResponse<409>
     | ErrorResponse<410>;
 
+  /**
+   * Create using the immutable public-share scope and Idempotency-Key.
+   * Replay always rechecks password, permission and the original destination or
+   * actual current completed result before exposing an outcome or mismatch.
+   * Authorized terminal loss returns 409/upload_parent_unavailable with message
+   * "upload destination folder is unavailable"; restore never reopens the attempt.
+   */
   @post
   @route("/{token}/uploads")
   @operationId("createPublicShareUpload")
@@ -468,6 +476,7 @@ namespace PublicShares {
     @body body: UploadCreateRequest,
   ):
     | JsonResponse<201, UploadSession>
+    | ErrorResponse<400>
     | ErrorResponse<401>
     | ErrorResponse<403>
     | ErrorResponse<404>
@@ -475,6 +484,7 @@ namespace PublicShares {
     | ErrorResponse<410>
     | ErrorResponse<422>;
 
+  /** Exact-body replay rechecks current result access after verification; terminal destination loss returns 409/upload_parent_unavailable. */
   @put
   @route("/{token}/uploads/{uploadId}/parts/{partNo}")
   @operationId("putPublicShareUploadPart")
@@ -496,6 +506,7 @@ namespace PublicShares {
     | ErrorResponse<422>
     | ErrorResponse<503>;
 
+  /** Publish with the required size/optional hash manifest. Current result access remains required on replay; terminal loss returns 409/upload_parent_unavailable. */
   @post
   @route("/{token}/uploads/{uploadId}/complete")
   @operationId("completePublicShareUpload")
@@ -504,8 +515,10 @@ namespace PublicShares {
     ...IdempotencyHeader,
     @path token: string,
     @path uploadId: Uuid,
+    @body body: UploadCompleteRequest,
   ):
     | UploadCompletedResponse
+    | ErrorResponse<400>
     | ErrorResponse<401>
     | ErrorResponse<403>
     | ErrorResponse<404>
@@ -525,5 +538,6 @@ namespace PublicShares {
     | ErrorResponse<401>
     | ErrorResponse<403>
     | ErrorResponse<404>
+    | ErrorResponse<409>
     | ErrorResponse<410>;
 }

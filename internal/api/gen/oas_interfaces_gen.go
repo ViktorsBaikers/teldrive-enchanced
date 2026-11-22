@@ -33,6 +33,10 @@ type CleanTrashRes interface {
 	cleanTrashRes()
 }
 
+type CompleteGuardedUploadRes interface {
+	completeGuardedUploadRes()
+}
+
 type CompletePublicShareUploadRes interface {
 	completePublicShareUploadRes()
 }
@@ -79,6 +83,10 @@ type CreateFileAccessGrantRes interface {
 
 type CreateFolderRes interface {
 	createFolderRes()
+}
+
+type CreateGuardedUploadRes interface {
+	createGuardedUploadRes()
 }
 
 type CreateJobRes interface {
@@ -133,6 +141,10 @@ type DiscoverChannelsRes interface {
 	discoverChannelsRes()
 }
 
+type DiscoverGuardedUploadRes interface {
+	discoverGuardedUploadRes()
+}
+
 type DownloadFileLegacyRes interface {
 	downloadFileLegacyRes()
 }
@@ -175,6 +187,10 @@ type GetFileRes interface {
 
 type GetFileViewStateRes interface {
 	getFileViewStateRes()
+}
+
+type GetGuardedUploadRes interface {
+	getGuardedUploadRes()
 }
 
 type GetJobRes interface {
@@ -343,6 +359,10 @@ type PurgeJobsRes interface {
 
 type PutFileViewStateRes interface {
 	putFileViewStateRes()
+}
+
+type PutGuardedUploadPartRes interface {
+	putGuardedUploadPartRes()
 }
 
 type PutPublicShareUploadPartRes interface {
