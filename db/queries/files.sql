@@ -195,10 +195,13 @@ WHERE id = sqlc.arg(file_id)
 RETURNING *;
 
 -- name: DeleteFileCatalogRowsByIDs :execrows
-DELETE FROM /* TEMPLATE: schema */files
-WHERE id = ANY(sqlc.arg(file_ids)::uuid[])
-  AND user_id = sqlc.arg(user_id)
-  AND status = 'deletion_pending';
+DELETE FROM /* TEMPLATE: schema */files AS target
+WHERE target.id = ANY(sqlc.arg(file_ids)::uuid[])
+  AND target.user_id = sqlc.arg(user_id)
+  AND target.status = 'deletion_pending'
+  AND NOT EXISTS (SELECT 1 FROM /* TEMPLATE: schema */file_parts p WHERE p.file_id=target.id)
+  AND NOT EXISTS (SELECT 1 FROM /* TEMPLATE: schema */files child WHERE child.parent_id=target.id)
+  AND NOT EXISTS (SELECT 1 FROM /* TEMPLATE: schema */upload_sessions s WHERE s.parent_id=target.id);
 
 -- Recursive move-cycle validation will be implemented as a hand-reviewed query in the file service.
 
@@ -666,8 +669,23 @@ SELECT input.file_id, input.part_no, input.channel_id, input.message_id,
 FROM jsonb_to_recordset(sqlc.arg(parts)::jsonb) AS input(
     file_id uuid, part_no integer, channel_id bigint, message_id bigint,
     plain_size bigint, stored_size bigint, checksum text, salt text,
-    block_hashes text
-);
+    block_hashes text, receipt_id uuid
+)
+JOIN /* TEMPLATE: schema */remote_write_receipts receipt
+  ON receipt.id=input.receipt_id AND receipt.row_kind='message_attempt'
+ AND receipt.origin_kind='copy' AND receipt.result_file_id=input.file_id
+ AND receipt.part_no=input.part_no AND receipt.channel_id=input.channel_id
+ AND receipt.message_id=input.message_id AND receipt.state='bound'
+JOIN /* TEMPLATE: schema */files result ON result.id=input.file_id AND result.user_id=receipt.user_id
+JOIN /* TEMPLATE: schema */remote_write_receipts operation
+  ON operation.id=receipt.operation_id AND operation.row_kind='copy_operation'
+ AND operation.user_id=receipt.user_id AND operation.lease_token=receipt.lease_token
+ AND operation.state='reserved' AND operation.terminal_at IS NULL AND operation.published_at IS NULL
+ AND operation.lease_expires_at>clock_timestamp()
+WHERE NOT EXISTS (SELECT 1 FROM /* TEMPLATE: schema */channel_deletion_intents gate WHERE gate.channel_id=input.channel_id)
+ AND NOT EXISTS (SELECT 1 FROM /* TEMPLATE: schema */remote_write_receipts fence
+ WHERE fence.channel_id=input.channel_id AND fence.message_id=input.message_id
+ AND fence.state IN ('cleanup_pending','deleting','deleted','exhausted','unresolved'));
 
 -- name: MarkFileIDsDeletionPending :exec
 UPDATE /* TEMPLATE: schema */files
@@ -675,28 +693,9 @@ SET status = 'deletion_pending',
     deleted_at = COALESCE(deleted_at, now()),
     updated_at = now()
 WHERE user_id = sqlc.arg(user_id)
-  AND id = ANY(sqlc.arg(file_ids)::uuid[]);
+  AND id = ANY(sqlc.arg(file_ids)::uuid[])
+  AND (status <> 'deletion_pending' OR deleted_at IS NULL);
 
--- name: QueueFileSubtreePurge :many
-WITH RECURSIVE target AS (
-  SELECT root.id
-  FROM /* TEMPLATE: schema */files root
-  WHERE root.id = sqlc.arg(file_id)
-    AND root.user_id = sqlc.arg(user_id)
-    AND root.status = 'trashed'
-  UNION ALL
-  SELECT child.id
-  FROM /* TEMPLATE: schema */files child
-  JOIN target parent ON child.parent_id = parent.id
-  WHERE child.user_id = sqlc.arg(user_id)
-)
-UPDATE /* TEMPLATE: schema */files AS target_file
-SET status = 'deletion_pending',
-    deleted_at = COALESCE(target_file.deleted_at, now()),
-    updated_at = now()
-WHERE target_file.user_id = sqlc.arg(user_id)
-  AND target_file.id IN (SELECT target.id FROM target)
-RETURNING target_file.*;
 
 
 -- name: MarkAllTrashedDeletionPending :execrows
@@ -707,22 +706,56 @@ SET status = 'deletion_pending',
 WHERE user_id = sqlc.arg(user_id)
   AND status = 'trashed';
 
--- name: ListFilePartMessageRefs :many
-SELECT channel_id, message_id
-FROM /* TEMPLATE: schema */file_parts
-WHERE file_id = ANY(sqlc.arg(file_ids)::uuid[])
-ORDER BY channel_id, message_id;
+-- name: ListTrashedFileIDs :many
+SELECT id FROM /* TEMPLATE: schema */files
+WHERE user_id=sqlc.arg(user_id)::bigint AND status='trashed' ORDER BY id;
 
--- name: DeleteFilePartsByFileIDs :exec
-DELETE FROM /* TEMPLATE: schema */file_parts
-WHERE file_id = ANY(sqlc.arg(file_ids)::uuid[]);
+-- name: ListFilePurgeRoots :many
+SELECT * FROM /* TEMPLATE: schema */files
+WHERE user_id=sqlc.arg(user_id)::bigint AND id=ANY(sqlc.arg(file_ids)::uuid[])
+ORDER BY id;
+
+-- name: ListPurgeReceiptIDs :many
+SELECT DISTINCT r.id FROM /* TEMPLATE: schema */remote_write_receipts r
+JOIN /* TEMPLATE: schema */file_parts p
+ ON p.file_id=r.result_file_id AND p.part_no=r.part_no
+ AND p.channel_id=r.channel_id AND p.message_id=r.message_id
+JOIN /* TEMPLATE: schema */files f ON f.id=p.file_id AND f.user_id=r.user_id
+WHERE r.user_id=sqlc.arg(user_id)::bigint AND f.status='deletion_pending'
+ AND f.id=ANY(sqlc.arg(file_ids)::uuid[]) AND r.row_kind='message_attempt'
+ORDER BY r.id;
+
+-- name: DeleteAcknowledgedFileParts :exec
+DELETE FROM /* TEMPLATE: schema */file_parts p
+USING /* TEMPLATE: schema */files f, /* TEMPLATE: schema */remote_write_receipts r
+WHERE p.file_id=f.id AND f.user_id=sqlc.arg(user_id)::bigint
+ AND f.id=ANY(sqlc.arg(file_ids)::uuid[]) AND f.status='deletion_pending'
+ AND r.row_kind='message_attempt' AND r.user_id=f.user_id AND r.result_file_id=f.id
+ AND r.part_no=p.part_no AND r.channel_id=p.channel_id AND r.message_id=p.message_id AND r.state='deleted'
+ AND NOT EXISTS (SELECT 1 FROM /* TEMPLATE: schema */lifecycle_receipt_status status
+ WHERE status.id=r.id AND status.has_references);
+
+-- name: GetPurgeRetentionSummary :one
+SELECT count(*) FILTER (WHERE r.id IS NULL)::bigint AS legacy_unknown,
+ count(*) FILTER (WHERE status.has_references)::bigint AS protected,
+ count(*) FILTER (WHERE r.state NOT IN ('deleted','exhausted'))::bigint AS pending,
+ count(*) FILTER (WHERE r.state='exhausted')::bigint AS exhausted
+FROM /* TEMPLATE: schema */file_parts p
+JOIN /* TEMPLATE: schema */files f ON f.id=p.file_id
+LEFT JOIN /* TEMPLATE: schema */remote_write_receipts r
+ ON r.row_kind='message_attempt' AND r.user_id=f.user_id AND r.result_file_id=f.id
+ AND r.part_no=p.part_no AND r.channel_id=p.channel_id AND r.message_id=p.message_id
+LEFT JOIN /* TEMPLATE: schema */lifecycle_receipt_status status ON status.id=r.id
+WHERE f.user_id=sqlc.arg(user_id)::bigint AND f.id=ANY(sqlc.arg(file_ids)::uuid[]);
 
 -- name: ClearUploadSessionParentsByFileIDs :exec
 UPDATE /* TEMPLATE: schema */upload_sessions
 SET parent_id = NULL,
     updated_at = now()
 WHERE user_id = sqlc.arg(user_id)
-  AND parent_id = ANY(sqlc.arg(file_ids)::uuid[]);
+  AND parent_id = ANY(sqlc.arg(file_ids)::uuid[])
+  AND (state IN ('completed','aborted','expired') OR terminal_failure_code='upload_parent_unavailable')
+  AND terminal_failure_code IS DISTINCT FROM 'upload_destination_unknown';
 
 -- name: UpdateFilePartSizes :execrows
 UPDATE /* TEMPLATE: schema */file_parts
@@ -773,3 +806,142 @@ FROM (
 ) AS desired
 WHERE folder.id = desired.id
   AND (folder.size IS NULL OR folder.size <> desired.total);
+
+-- name: ListLifecycleSubtreeIDs :many
+WITH RECURSIVE tree AS (
+ SELECT id FROM /* TEMPLATE: schema */files
+ WHERE user_id=sqlc.arg(user_id)::bigint AND id=ANY(sqlc.arg(root_ids)::uuid[])
+ UNION
+ SELECT f.id FROM /* TEMPLATE: schema */files f JOIN tree t ON f.parent_id=t.id
+ WHERE f.user_id=sqlc.arg(user_id)::bigint
+)
+SELECT id FROM tree ORDER BY id;
+
+-- name: ListImportBatchesAnchoredInSubtree :many
+SELECT b.batch_id,b.origin_job_id FROM /* TEMPLATE: schema */import_batches b
+WHERE b.user_id=sqlc.arg(user_id)::bigint AND NOT b.dispatched
+ AND EXISTS (SELECT 1 FROM /* TEMPLATE: schema */import_destination_pins p
+ WHERE p.user_id=b.user_id AND p.batch_id=b.batch_id AND NOT p.anchor_is_root
+ AND p.anchor_id=ANY(sqlc.arg(subtree_ids)::uuid[]))
+ORDER BY b.batch_id;
+
+-- name: ListHierarchyImportBatches :many
+SELECT b.batch_id FROM /* TEMPLATE: schema */import_batches b
+WHERE b.user_id=sqlc.arg(user_id)::bigint AND (
+ b.parent_id=ANY(sqlc.arg(subtree_ids)::uuid[])
+ OR EXISTS (SELECT 1 FROM /* TEMPLATE: schema */import_job_attempts a
+ WHERE a.user_id=b.user_id AND a.batch_id=b.batch_id
+ AND (a.parent_id=ANY(sqlc.arg(subtree_ids)::uuid[]) OR a.upload_id=ANY(sqlc.arg(upload_ids)::uuid[]))))
+ORDER BY b.batch_id;
+
+-- name: LockHierarchyAdmissions :exec
+SELECT id FROM /* TEMPLATE: schema */request_admissions
+WHERE user_id=sqlc.arg(user_id)::bigint AND (upload_id=ANY(sqlc.arg(upload_ids)::uuid[])
+ OR EXISTS (SELECT 1 FROM /* TEMPLATE: schema */remote_write_receipts op
+ WHERE op.id=/* TEMPLATE: schema */request_admissions.copy_operation_id AND op.user_id=sqlc.arg(user_id)::bigint
+ AND op.row_kind='copy_operation' AND (op.destination_parent_id=ANY(sqlc.arg(subtree_ids)::uuid[])
+ OR op.result_file_id=ANY(sqlc.arg(subtree_ids)::uuid[])
+ OR EXISTS (SELECT 1 FROM /* TEMPLATE: schema */remote_write_receipts r
+ WHERE r.operation_id=op.id AND r.user_id=op.user_id AND r.result_file_id=ANY(sqlc.arg(subtree_ids)::uuid[])))))
+ORDER BY user_id,actor_user_id,public_share_id,request_kind,request_key FOR UPDATE;
+
+-- name: LockImportBatchesForLifecycle :exec
+SELECT batch_id FROM /* TEMPLATE: schema */import_batches
+WHERE user_id=sqlc.arg(user_id)::bigint AND batch_id=ANY(sqlc.arg(batch_ids)::uuid[])
+ORDER BY user_id,batch_id FOR UPDATE;
+
+-- name: LockImportDestinationPinsForLifecycle :exec
+SELECT batch_id FROM /* TEMPLATE: schema */import_destination_pins
+WHERE user_id=sqlc.arg(user_id)::bigint AND batch_id=ANY(sqlc.arg(batch_ids)::uuid[])
+ORDER BY user_id,batch_id,destination_ordinal FOR UPDATE;
+
+-- name: LockImportAttemptsForLifecycle :exec
+SELECT attempt_id FROM /* TEMPLATE: schema */import_job_attempts
+WHERE user_id=sqlc.arg(user_id)::bigint AND batch_id=ANY(sqlc.arg(batch_ids)::uuid[])
+ORDER BY attempt_id FOR UPDATE;
+
+-- name: ListHierarchyUploadIDs :many
+SELECT s.id FROM /* TEMPLATE: schema */upload_sessions s
+WHERE s.user_id=sqlc.arg(user_id)::bigint AND
+ (s.parent_id=ANY(sqlc.arg(subtree_ids)::uuid[]) OR s.id=ANY(sqlc.arg(upload_ids)::uuid[])
+ OR s.file_id=ANY(sqlc.arg(subtree_ids)::uuid[])
+ OR EXISTS (SELECT 1 FROM /* TEMPLATE: schema */remote_write_receipts r
+ WHERE r.user_id=s.user_id AND r.upload_id=s.id AND r.result_file_id=ANY(sqlc.arg(subtree_ids)::uuid[])))
+ORDER BY s.id;
+
+-- name: ListHierarchyReceiptHints :many
+SELECT r.* FROM /* TEMPLATE: schema */remote_write_receipts r
+WHERE r.user_id=sqlc.arg(user_id)::bigint AND (
+ r.upload_id=ANY(sqlc.arg(upload_ids)::uuid[]) OR r.result_file_id=ANY(sqlc.arg(subtree_ids)::uuid[])
+ OR (r.row_kind='copy_operation' AND r.destination_parent_id=ANY(sqlc.arg(subtree_ids)::uuid[]))
+ OR EXISTS (SELECT 1 FROM /* TEMPLATE: schema */remote_write_receipts op
+ WHERE op.id=r.operation_id AND op.user_id=r.user_id AND op.row_kind='copy_operation'
+ AND (op.destination_parent_id=ANY(sqlc.arg(subtree_ids)::uuid[])
+ OR op.result_file_id=ANY(sqlc.arg(subtree_ids)::uuid[])
+ OR EXISTS (SELECT 1 FROM /* TEMPLATE: schema */remote_write_receipts sibling
+ WHERE sibling.operation_id=op.id AND sibling.user_id=op.user_id AND sibling.result_file_id=ANY(sqlc.arg(subtree_ids)::uuid[])))))
+ORDER BY r.channel_id,r.message_id,r.id;
+
+-- name: LockHierarchyCopyOperations :exec
+SELECT op.id FROM /* TEMPLATE: schema */remote_write_receipts op
+WHERE op.user_id=sqlc.arg(user_id)::bigint AND op.row_kind='copy_operation'
+ AND (op.destination_parent_id=ANY(sqlc.arg(subtree_ids)::uuid[])
+ OR op.result_file_id=ANY(sqlc.arg(subtree_ids)::uuid[])
+ OR EXISTS (SELECT 1 FROM /* TEMPLATE: schema */remote_write_receipts r
+ WHERE r.operation_id=op.id AND r.row_kind='message_attempt'
+ AND r.user_id=op.user_id AND r.result_file_id=ANY(sqlc.arg(subtree_ids)::uuid[])))
+ORDER BY op.id FOR UPDATE;
+
+-- name: LockHierarchyUploadSessions :exec
+SELECT id FROM /* TEMPLATE: schema */upload_sessions
+WHERE user_id=sqlc.arg(user_id)::bigint AND id=ANY(sqlc.arg(upload_ids)::uuid[])
+ORDER BY id FOR UPDATE;
+
+-- name: TerminalizeUndispatchedImportBatches :many
+UPDATE /* TEMPLATE: schema */import_batches b
+SET terminal_failure_code='upload_parent_unavailable'
+WHERE b.user_id=sqlc.arg(user_id)::bigint AND NOT b.dispatched AND b.terminal_failure_code IS NULL
+ AND EXISTS (SELECT 1 FROM /* TEMPLATE: schema */import_destination_pins p
+ WHERE p.user_id=b.user_id AND p.batch_id=b.batch_id AND NOT p.anchor_is_root
+ AND p.anchor_id=ANY(sqlc.arg(subtree_ids)::uuid[]))
+RETURNING b.batch_id,b.origin_job_id;
+
+-- name: TerminalizeImportDestinations :execrows
+UPDATE /* TEMPLATE: schema */import_job_attempts a
+SET terminal_failure_code='upload_parent_unavailable'
+WHERE a.user_id=sqlc.arg(user_id)::bigint AND a.parent_id=ANY(sqlc.arg(subtree_ids)::uuid[])
+ AND a.terminal_failure_code IS NULL AND a.result_file_id IS NULL
+ AND NOT EXISTS (SELECT 1 FROM /* TEMPLATE: schema */upload_sessions s
+ WHERE s.id=a.upload_id AND s.user_id=a.user_id AND s.state='completed');
+
+-- name: TerminalizeDispatchedImportBatches :execrows
+UPDATE /* TEMPLATE: schema */import_batches b
+SET terminal_failure_code='upload_parent_unavailable'
+WHERE b.user_id=sqlc.arg(user_id)::bigint AND b.dispatched
+ AND b.parent_id=ANY(sqlc.arg(subtree_ids)::uuid[]) AND b.terminal_failure_code IS NULL
+ AND (b.source_count=0 OR EXISTS (SELECT 1 FROM /* TEMPLATE: schema */import_job_attempts a
+ WHERE a.user_id=b.user_id AND a.batch_id=b.batch_id AND a.result_file_id IS NULL
+ AND NOT EXISTS (SELECT 1 FROM /* TEMPLATE: schema */upload_sessions s
+ WHERE s.id=a.upload_id AND s.user_id=a.user_id AND s.state='completed')));
+
+-- name: TerminalizeUploadDestinations :execrows
+UPDATE /* TEMPLATE: schema */upload_sessions
+SET state='aborted',terminal_failure_code='upload_parent_unavailable',updated_at=now()
+WHERE user_id=sqlc.arg(user_id)::bigint AND parent_id=ANY(sqlc.arg(subtree_ids)::uuid[])
+ AND state IN ('open','completing') AND terminal_failure_code IS NULL;
+
+-- name: ListActiveFilesForLifecycle :many
+SELECT * FROM /* TEMPLATE: schema */files
+WHERE user_id=sqlc.arg(user_id)::bigint AND id=ANY(sqlc.arg(file_ids)::uuid[]) AND status='active'
+ORDER BY id;
+
+-- name: ListActiveDestinationEntries :many
+SELECT id,name FROM /* TEMPLATE: schema */files
+WHERE user_id=sqlc.arg(user_id)::bigint
+ AND parent_id IS NOT DISTINCT FROM sqlc.narg(parent_id)::uuid AND status='active'
+ORDER BY id;
+
+-- name: LockCatalogRowsForLifecycle :exec
+SELECT id FROM /* TEMPLATE: schema */files
+WHERE user_id=sqlc.arg(user_id)::bigint AND id=ANY(sqlc.arg(file_ids)::uuid[])
+ORDER BY id FOR UPDATE;

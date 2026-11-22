@@ -43,7 +43,51 @@ RETURNING id, user_id, event_type, resource_type, resource_id, generation, paylo
 
 -- name: DeleteUserEventsBefore :execrows
 DELETE FROM /* TEMPLATE: schema */user_events
-WHERE occurred_at < sqlc.arg(cutoff);
+WHERE id IN (
+    SELECT expired.id
+    FROM /* TEMPLATE: schema */user_events AS expired
+    WHERE expired.occurred_at < sqlc.arg(cutoff)
+    ORDER BY expired.occurred_at, expired.id
+    LIMIT sqlc.arg(event_limit)
+);
+
+-- name: GetEventOwnerIncarnation :one
+SELECT incarnation
+FROM /* TEMPLATE: schema */event_owner_incarnations
+WHERE user_id = sqlc.arg(user_id);
+
+-- name: GetOrderedEventState :one
+SELECT
+    allocator.stream_epoch,
+    owner.incarnation AS owner_incarnation,
+    COALESCE(state.high, 0)::bigint AS high,
+    COALESCE(state.floor, 0)::bigint AS floor
+FROM /* TEMPLATE: schema */event_stream_allocator AS allocator
+JOIN /* TEMPLATE: schema */event_owner_incarnations AS owner
+    ON owner.user_id = sqlc.arg(user_id)
+LEFT JOIN /* TEMPLATE: schema */event_owner_stream_state AS state
+    ON state.owner_incarnation = owner.incarnation
+WHERE allocator.id = 1;
+
+-- name: ListOrderedUserEvents :many
+SELECT
+    id, strict_position, event_type, resource_type, resource_id,
+    generation, payload, location, occurred_at
+FROM /* TEMPLATE: schema */user_events
+WHERE owner_incarnation = sqlc.arg(owner_incarnation)
+  AND strict_position > sqlc.arg(after_position)
+  AND strict_position <= sqlc.arg(high)
+  AND (
+    COALESCE(cardinality(sqlc.arg(event_types)::text[]), 0) = 0
+    OR event_type = ANY(sqlc.arg(event_types)::text[])
+  )
+ORDER BY strict_position
+LIMIT sqlc.arg(event_limit);
+
+-- name: GetOrderedEventTicket :one
+SELECT user_id, expires_at, expires_at > now() AS active
+FROM /* TEMPLATE: schema */event_stream_tickets
+WHERE token_hash = sqlc.arg(token_hash);
 
 -- name: CreateEventStreamTicket :exec
 INSERT INTO /* TEMPLATE: schema */event_stream_tickets (token_hash, user_id, expires_at)

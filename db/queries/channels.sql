@@ -22,7 +22,11 @@ WHERE user_id = sqlc.arg(user_id)
 SELECT *
 FROM /* TEMPLATE: schema */channels
 WHERE user_id = sqlc.arg(user_id)
-  AND selected;
+  AND selected
+  AND NOT EXISTS (
+    SELECT 1 FROM /* TEMPLATE: schema */channel_deletion_intents gate
+    WHERE gate.channel_id = channels.channel_id
+  );
 
 -- name: CreateChannel :one
 INSERT INTO /* TEMPLATE: schema */channels (
@@ -30,11 +34,14 @@ INSERT INTO /* TEMPLATE: schema */channels (
     user_id,
     name,
     selected
-) VALUES (
+) SELECT
     sqlc.arg(channel_id),
     sqlc.arg(user_id),
     sqlc.arg(name),
     FALSE
+WHERE NOT EXISTS (
+    SELECT 1 FROM /* TEMPLATE: schema */channel_deletion_intents
+    WHERE channel_id = sqlc.arg(channel_id)
 )
 RETURNING *;
 
@@ -49,8 +56,12 @@ WHERE user_id = sqlc.arg(user_id)
 UPDATE /* TEMPLATE: schema */channels
 SET selected = TRUE,
     updated_at = now()
-WHERE user_id = sqlc.arg(user_id)
-  AND channel_id = sqlc.arg(channel_id)
+WHERE channels.user_id = sqlc.arg(user_id)
+  AND channels.channel_id = sqlc.arg(channel_id)
+  AND NOT EXISTS (
+    SELECT 1 FROM /* TEMPLATE: schema */channel_deletion_intents gate
+    WHERE gate.channel_id = channels.channel_id
+  )
 RETURNING *;
 
 -- name: UpdateChannelHealth :one
@@ -62,11 +73,28 @@ WHERE user_id = sqlc.arg(user_id)
   AND channel_id = sqlc.arg(channel_id)
 RETURNING *;
 
--- name: DeleteChannel :execrows
+-- name: DeleteChannelRegistrationsForIntent :execrows
 DELETE FROM /* TEMPLATE: schema */channels
-WHERE user_id = sqlc.arg(user_id)
-  AND channel_id = sqlc.arg(channel_id)
-  AND NOT selected;
+WHERE channel_id = sqlc.arg(channel_id)::bigint
+  AND EXISTS (
+    SELECT 1 FROM /* TEMPLATE: schema */channel_deletion_intents gate
+    WHERE gate.channel_id = sqlc.arg(channel_id)::bigint
+      AND gate.intent_id = sqlc.arg(intent_id)::uuid AND gate.state = 'deleted'
+  );
+
+-- name: HasChannelDeletionProtection :one
+SELECT (
+    EXISTS (SELECT 1 FROM /* TEMPLATE: schema */channels
+            WHERE channel_id = sqlc.arg(channel_id)::bigint AND selected)
+    OR EXISTS (SELECT 1 FROM /* TEMPLATE: schema */file_parts
+               WHERE channel_id = sqlc.arg(channel_id)::bigint)
+    OR EXISTS (SELECT 1 FROM /* TEMPLATE: schema */upload_parts
+               WHERE channel_id = sqlc.arg(channel_id)::bigint)
+    OR EXISTS (SELECT 1 FROM /* TEMPLATE: schema */remote_write_receipts
+               WHERE channel_id = sqlc.arg(channel_id)::bigint
+                 AND row_kind = 'message_attempt' AND state <> 'deleted')
+)::boolean AS protected;
+
 -- name: ListBots :many
 SELECT *
 FROM /* TEMPLATE: schema */bots
@@ -233,6 +261,11 @@ INSERT INTO /* TEMPLATE: schema */channels AS channel (
 SELECT input.channel_id, sqlc.arg(user_id), input.name, false, 'unknown'
 FROM jsonb_to_recordset(sqlc.arg(channels)::jsonb) AS input(
     channel_id bigint, name text
+)
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM jsonb_to_recordset(sqlc.arg(channels)::jsonb) AS requested(channel_id bigint, name text)
+    JOIN /* TEMPLATE: schema */channel_deletion_intents gate ON gate.channel_id = requested.channel_id
 )
 ON CONFLICT (user_id, channel_id) DO UPDATE
 SET name = EXCLUDED.name,
