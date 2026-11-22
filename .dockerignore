@@ -1,5 +1,10 @@
 .git
 bin
 node_modules
+ui/node_modules
+ui/dist
+baseline
+vfs/vfs
+vfs/vfsMeta
 *.local
 .env

@@ -157,7 +157,7 @@ dev:
     exit "$status"
 
 image:
-    podman build --build-arg VERSION={{version}} --build-arg COMMIT={{commit}} --build-arg BUILD_DATE={{build_date}} -t teldrive-backend:{{version}} .
+    podman build --build-arg VERSION={{version}} --build-arg COMMIT={{commit}} --build-arg BUILD_DATE={{build_date}} --build-arg SNAPSHOT={{snapshot}} --build-arg DIRTY={{dirty}} --build-arg SOURCE_DATE_EPOCH={{env_var_or_default("SOURCE_DATE_EPOCH", "0")}} --build-arg DISTROLESS_DIGEST={{env_var_or_default("DISTROLESS_DIGEST", "unknown")}} -t teldrive-backend:{{version}} .
 
 test-unit:
     go test ./...
