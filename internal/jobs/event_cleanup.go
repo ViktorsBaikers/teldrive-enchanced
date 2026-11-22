@@ -13,7 +13,13 @@ import (
 	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
 )
 
-const EventCleanupKind = "teldrive_cleanup_user_events"
+const (
+	EventCleanupKind = "teldrive_cleanup_user_events"
+
+	// eventRetentionBatch bounds assignable rows, floor-bearing deletes and
+	// owner retirements in each retention transaction.
+	eventRetentionBatch = 512
+)
 
 var ErrEventCleanupNotConfigured = errors.New("event cleanup worker is not configured")
 
@@ -50,9 +56,22 @@ func (w *EventCleanupWorker) Work(ctx context.Context, job *river.Job[EventClean
 		return fmt.Errorf("invalid event retention %q", job.Args.Retention)
 	}
 	cutoff := w.now().UTC().Add(-retention)
-	deleted, err := w.queries.DeleteUserEventsBefore(ctx, pgtype.Timestamptz{Time: cutoff, Valid: true})
-	if err != nil {
-		return fmt.Errorf("delete expired user events: %w", err)
+	var deleted int64
+	for {
+		batch, err := w.queries.DeleteUserEventsBefore(ctx, sqlcgen.DeleteUserEventsBeforeParams{
+			Cutoff:     pgtype.Timestamptz{Time: cutoff, Valid: true},
+			EventLimit: eventRetentionBatch,
+		})
+		if err != nil {
+			return fmt.Errorf("delete expired user events: %w", err)
+		}
+		deleted += batch
+		if batch < eventRetentionBatch {
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("delete expired user events: %w", err)
+		}
 	}
 	if job.JobRow != nil {
 		return river.RecordOutput(ctx, struct {
