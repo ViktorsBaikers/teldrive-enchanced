@@ -220,9 +220,11 @@ func withOrderedProof(ctx context.Context, proof principal.OrderedProof) (contex
 	}
 	identity := principal.Identity{UserID: proof.UserID, Source: proof.CredentialKind}
 	if proof.CredentialKind == "bearer" {
-		if sessionID, err := uuid.Parse(proof.CredentialID); err == nil {
-			identity.SessionID = sessionID
+		sessionID, err := uuid.Parse(proof.CredentialID)
+		if err != nil {
+			return ctx, ErrInvalidIdentity
 		}
+		identity.SessionID = sessionID
 	}
 	return principal.WithOrderedProof(principal.WithIdentity(ctx, identity), proof), nil
 }

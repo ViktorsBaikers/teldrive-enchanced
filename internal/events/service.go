@@ -394,27 +394,6 @@ func (s *Service) AuthenticateTicket(ctx context.Context, value string) (int64, 
 	return userID, nil
 }
 
-// AuthenticateOrderedTicket resolves an ordered-stream ticket together with its
-// persisted expiry. The expiry is returned for valid tickets so the caller can
-// bound stream authority; expired or unknown tickets stay invalid.
-func (s *Service) AuthenticateOrderedTicket(ctx context.Context, value string) (TicketIdentity, error) {
-	if s == nil || s.queries == nil || strings.TrimSpace(value) == "" {
-		return TicketIdentity{}, ErrInvalidTicket
-	}
-	hash := sha256.Sum256([]byte(value))
-	row, err := s.queries.GetOrderedEventTicket(ctx, hash[:])
-	if errors.Is(err, pgx.ErrNoRows) {
-		return TicketIdentity{}, ErrInvalidTicket
-	}
-	if err != nil {
-		return TicketIdentity{}, fmt.Errorf("authenticate ordered event stream ticket: %w", err)
-	}
-	if row == nil || row.UserID <= 0 || !row.Active || !row.ExpiresAt.Valid {
-		return TicketIdentity{}, ErrInvalidTicket
-	}
-	return TicketIdentity{UserID: row.UserID, ExpiresAt: row.ExpiresAt.Time.UTC()}, nil
-}
-
 // AuthenticateOrderedTicketSnapshot validates the ticket and reads its owner
 // incarnation in one bounded read-only Repeatable Read snapshot.
 func (s *Service) AuthenticateOrderedTicketSnapshot(ctx context.Context, value string) (TicketIdentity, error) {
