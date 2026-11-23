@@ -7,12 +7,15 @@ TD_BIN=""
 RC_BIN=""
 IMAGE=""
 RECEIPT=""
+SELF_TEST=false
+SELF="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
 
 usage() {
   cat >&2 <<'EOF'
-usage: verify-metadata.sh [--teldrive-binary PATH] [--rclone-binary PATH] [--image TAG] [--receipt PATH]
+usage: verify-metadata.sh [--teldrive-binary PATH] [--rclone-binary PATH] [--image TAG] [--receipt PATH] [--self-test]
 Asserts non-empty, non-placeholder provenance and receipt agreement.
 Receipt defaults to the newest private work receipt when omitted.
+  --self-test  prove receipt-bound rclone metadata against temp fixtures
 EOF
   exit 2
 }
@@ -23,12 +26,11 @@ while [[ $# -gt 0 ]]; do
     --rclone-binary) [[ $# -ge 2 ]] || usage; RC_BIN="$2"; shift 2 ;;
     --image) [[ $# -ge 2 ]] || usage; IMAGE="$2"; shift 2 ;;
     --receipt) [[ $# -ge 2 ]] || usage; RECEIPT="$2"; shift 2 ;;
+    --self-test) SELF_TEST=true; shift ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
 done
-
-[[ -n "$TD_BIN$RC_BIN$IMAGE" ]] || usage
 
 status=0
 fail() { printf 'FAIL %s expected=%s actual=%s\n' "$1" "$2" "$3" >&2; status=1; }
@@ -44,6 +46,85 @@ check_eq() {
   local field="$1" expected="$2" actual="$3"
   [[ "$expected" == "$actual" ]] || fail "$field" "$expected" "$actual"
 }
+
+self_test() {
+  local tmp failures=0
+  tmp="$(mktemp -d)"
+  trap "rm -rf -- '$tmp'" EXIT INT TERM
+
+  local commit full date snap bad_snap
+  commit="abcdef123456"
+  full="${commit}$(printf '%028d' 0)"
+  date="2026-11-20T00:00:00Z"
+  snap="$(printf 'a%063d' 0)"
+  bad_snap="$(printf 'b%063d' 0)"
+
+  cat > "$tmp/rclone" <<EOF
+#!/usr/bin/env bash
+cat <<'VERSION'
+rclone v1.76.0-enchanced
+- os/version: fixture
+- build/commit: $commit
+- build/date: $date
+- build/snapshot: $snap
+- build/dirty: false
+VERSION
+EOF
+  chmod +x "$tmp/rclone"
+
+  jq -n --arg v v1.76.0-enchanced --arg snap "$snap" --arg c "$commit" \
+    --arg f "$full" --arg d "$date" \
+    '{metadata:{version:$v, snapshot_sha256:$snap,
+      teldrive:{commit:$c, commit_full:$f, build_date:$d, dirty:false},
+      rclone:{commit:$c, commit_full:$f, build_date:$d, dirty:false}}}' \
+    > "$tmp/receipt.json"
+
+  if "$SELF" --rclone-binary "$tmp/rclone" --receipt "$tmp/receipt.json" \
+      >"$tmp/ok.log" 2>&1 && grep -q 'METADATA PASS' "$tmp/ok.log"; then
+    printf 'self-test: PASS matching rclone receipt\n'
+  else
+    printf 'self-test: FAIL matching rclone receipt rejected\n' >&2
+    failures=$((failures + 1))
+  fi
+
+  jq '.metadata.rclone.commit="deadbeef0000"' "$tmp/receipt.json" > "$tmp/bad-commit.json"
+  if "$SELF" --rclone-binary "$tmp/rclone" --receipt "$tmp/bad-commit.json" \
+      >"$tmp/bad-commit.log" 2>&1; then
+    printf 'self-test: FAIL rclone commit mismatch accepted\n' >&2
+    failures=$((failures + 1))
+  elif ! grep -q 'FAIL rclone.commit' "$tmp/bad-commit.log"; then
+    printf 'self-test: FAIL rclone commit mismatch rejected without its label\n' >&2
+    failures=$((failures + 1))
+  else
+    printf 'self-test: PASS rclone commit mismatch rejected\n'
+  fi
+
+  jq --arg s "$bad_snap" '.metadata.snapshot_sha256=$s' "$tmp/receipt.json" > "$tmp/bad-snap.json"
+  if "$SELF" --rclone-binary "$tmp/rclone" --receipt "$tmp/bad-snap.json" \
+      >"$tmp/bad-snap.log" 2>&1; then
+    printf 'self-test: FAIL rclone snapshot mismatch accepted\n' >&2
+    failures=$((failures + 1))
+  elif ! grep -q 'FAIL rclone.snapshot' "$tmp/bad-snap.log"; then
+    printf 'self-test: FAIL rclone snapshot mismatch rejected without its label\n' >&2
+    failures=$((failures + 1))
+  else
+    printf 'self-test: PASS rclone snapshot mismatch rejected\n'
+  fi
+
+  if ((failures == 0)); then
+    printf 'self-test: PASS\n'
+    return 0
+  fi
+  printf 'self-test: FAIL (%d)\n' "$failures" >&2
+  return 1
+}
+
+if [[ "$SELF_TEST" == true ]]; then
+  self_test
+  exit $?
+fi
+
+[[ -n "$TD_BIN$RC_BIN$IMAGE" ]] || usage
 
 if [[ -n "$TD_BIN" ]]; then
   out="$("$TD_BIN" version)"
@@ -88,7 +169,7 @@ if [[ -z "$RECEIPT" ]]; then
   RECEIPT="$(ls -t "${B6_PRIVATE_DIR:-$HOME/.local/state/teldrive-b6}"/work-*/receipt.json 2>/dev/null | head -n 1 || true)"
 fi
 if [[ -z "$RECEIPT" || ! -f "$RECEIPT" ]]; then
-  fail receipt "readable receipt JSON" "${RECEIPT:-<none>}"
+  fail receipt "readable receipt JSON" "$(basename -- "${RECEIPT:-<none>}")"
 else
   meta_version="$(jq -r '.metadata.version // empty' "$RECEIPT")"
   meta_snap="$(jq -r '.metadata.snapshot_sha256 // empty' "$RECEIPT")"
@@ -106,6 +187,22 @@ else
       fail teldrive.commit "$meta_commit (or its short form)" "$td_commit"
     check_eq teldrive.built "$meta_date" "$td_built"
     check_eq teldrive.dirty "$meta_dirty" "$td_dirty"
+  fi
+  if [[ -n "$RC_BIN" ]]; then
+    meta_rc_commit="$(jq -r '.metadata.rclone.commit // empty' "$RECEIPT")"
+    meta_rc_full="$(jq -r '.metadata.rclone.commit_full // empty' "$RECEIPT")"
+    meta_rc_date="$(jq -r '.metadata.rclone.build_date // empty' "$RECEIPT")"
+    meta_rc_dirty="$(jq -r '.metadata.rclone.dirty | if . == null then "" else tostring end' "$RECEIPT")"
+    require_value receipt.rclone.commit "$meta_rc_commit"
+    require_value receipt.rclone.commit_full "$meta_rc_full"
+    require_value receipt.rclone.build_date "$meta_rc_date"
+    if [[ "$commit" != "$meta_rc_commit"* && "$meta_rc_commit" != "$commit"* ]] ||
+       [[ "$commit" != "$meta_rc_full"* && "$meta_rc_full" != "$commit"* ]]; then
+      fail rclone.commit "$meta_rc_commit (or its short form)" "$commit"
+    fi
+    check_eq rclone.built "$meta_rc_date" "$built"
+    check_eq rclone.dirty "$meta_rc_dirty" "$dirty"
+    check_eq rclone.snapshot "$meta_snap" "$snap"
   fi
 fi
 
