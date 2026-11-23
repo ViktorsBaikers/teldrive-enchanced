@@ -5,12 +5,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
+SELF="$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
 
 OUT="${B6_PRIVATE_DIR:-$HOME/.local/state/teldrive-b6}"
 TELDRIVE="$PROJECT_DIR/teldrive-enchanced"
 RCLONE="$PROJECT_DIR/rclone-enchanced"
 DOCKERFILE=""
 DIRTY_FLAG=""
+SELF_TEST=false
 
 declare -A TOOLS=(
   [go]="1.27.4"
@@ -34,6 +36,7 @@ usage: seal-snapshot.sh [options]
   --base-image NAME=DIGEST         repeatable; golang, bun, distroless
   --base-image-from-dockerfile P   parse FROM references for base-image names (default: <teldrive>/Dockerfile)
   --dirty true|false               fail unless the measured dirty state matches
+  --self-test                      prove the exclusion and base-image gates on temp fixtures
 EOF
   exit 2
 }
@@ -53,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --dirty)
       [[ $# -ge 2 && ( "$2" == true || "$2" == false ) ]] || usage
       DIRTY_FLAG="$2"; shift 2 ;;
+    --self-test) SELF_TEST=true; shift ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
@@ -65,6 +69,68 @@ DOCKERFILE="${DOCKERFILE:-$TELDRIVE/Dockerfile}"
 fail() { printf 'seal-snapshot: %s\n' "$*" >&2; exit 1; }
 log() { printf 'seal-snapshot: %s\n' "$*" >&2; }
 
+self_test() {
+  local tmp failures=0
+  tmp="$(mktemp -d)"
+  trap "rm -rf -- '$tmp'" EXIT INT TERM
+
+  mkdir -p "$tmp/teldrive/internal/cache" "$tmp/teldrive/scripts/baseline" "$tmp/rclone"
+  printf 'fixture\n' > "$tmp/teldrive/README.md"
+  printf 'fixture\n' > "$tmp/rclone/README.md"
+  printf 'package cache\n' > "$tmp/teldrive/internal/cache/probe.go"
+  printf '#!/bin/sh\n' > "$tmp/teldrive/scripts/baseline/probe.sh"
+  cat > "$tmp/teldrive/Dockerfile" <<'EOF'
+FROM golang:1.27.4-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS build
+FROM oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f AS ui
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+EOF
+
+  for repo in teldrive rclone; do
+    git -C "$tmp/$repo" init -q
+    git -C "$tmp/$repo" add README.md
+    git -C "$tmp/$repo" -c user.name=fixture -c user.email=fixture@example.invalid \
+      commit -q -m init
+  done
+  printf 'scripts/baseline/\n' >> "$tmp/teldrive/.git/info/exclude"
+
+  run_seal() {
+    local out="$1"; shift
+    "$SELF" --out "$out" --teldrive "$tmp/teldrive" --rclone "$tmp/rclone" "$@"
+  }
+
+  if ! run_seal "$tmp/out-ok" >"$tmp/ok.log" 2>&1; then
+    printf 'self-test: FAIL fixture seal exited non-zero\n' >&2
+    failures=$((failures + 1))
+  else
+    local snap
+    snap="$(find "$tmp/out-ok" -maxdepth 1 -type d -name 'snapshot-*' -print -quit)"
+    if ! cut -f1 "$snap/teldrive-enchanced/untracked.txt" | grep -qxF 'internal/cache/probe.go'; then
+      printf 'self-test: FAIL untracked source under a cache path was hidden\n' >&2
+      failures=$((failures + 1))
+    elif ! tar -tzf "$snap/teldrive-enchanced/untracked.tar.gz" | grep -qxF 'internal/cache/probe.go'; then
+      printf 'self-test: FAIL cache-path source is missing from the archive\n' >&2
+      failures=$((failures + 1))
+    elif ! grep -qxF 'private-harness-omitted:scripts/baseline files=1' "$snap/manifest.txt"; then
+      printf 'self-test: FAIL private harness omission is not recorded\n' >&2
+      failures=$((failures + 1))
+    else
+      printf 'self-test: PASS untracked cache-path source archived\n'
+    fi
+  fi
+
+  if ((failures == 0)); then
+    printf 'self-test: PASS\n'
+    return 0
+  fi
+  printf 'self-test: FAIL (%d)\n' "$failures" >&2
+  return 1
+}
+
+if [[ "$SELF_TEST" == true ]]; then
+  self_test
+  exit $?
+fi
+
 # Git must never refresh the index or take optional locks during a read-only seal.
 export GIT_OPTIONAL_LOCKS=0
 export LC_ALL=C
@@ -76,11 +142,6 @@ cleanup() {
   fi
 }
 trap cleanup EXIT INT TERM
-
-install -d -m 0700 "$OUT"
-SNAP="$OUT/snapshot-$(date -u +%Y%m%dT%H%M%SZ)"
-[[ ! -e "$SNAP" ]] || fail "snapshot already exists: $(basename "$SNAP")"
-mkdir -m 0700 "$SNAP"
 
 # Resolve base-image names referenced by the Dockerfile; only passed/known digests are recorded.
 if [[ -f "$DOCKERFILE" ]]; then
@@ -99,6 +160,11 @@ if [[ -f "$DOCKERFILE" ]]; then
   done < <(awk 'toupper($1)=="FROM" {print $2}' "$DOCKERFILE")
 fi
 
+install -d -m 0700 "$OUT"
+SNAP="$OUT/snapshot-$(date -u +%Y%m%dT%H%M%SZ)"
+[[ ! -e "$SNAP" ]] || fail "snapshot already exists: $(basename "$SNAP")"
+mkdir -m 0700 "$SNAP"
+
 REPOS=(teldrive-enchanced rclone-enchanced)
 declare -A REPO_PATH=([teldrive-enchanced]="$TELDRIVE" [rclone-enchanced]="$RCLONE")
 
@@ -115,8 +181,8 @@ is_excluded() {
     ui/src/routeTree.gen.ts|*/ui/src/routeTree.gen.ts) return 0 ;;
   esac
   case "/$p/" in
-    */baseline/*|*/vfs/vfs/*|*/vfs/vfsMeta/*) return 0 ;;
-    */.cache/*|*/.config/*|*/session/*|*/sessions/*|*/cache/*) return 0 ;;
+    */vfs/vfs/*|*/vfs/vfsMeta/*) return 0 ;;
+    */.cache/*|*/.config/*|*/session/*|*/sessions/*) return 0 ;;
   esac
   case "$base" in
     .env|.env.*|rclone.conf|teldrive.conf) return 0 ;;
@@ -192,6 +258,12 @@ for repo in "${REPOS[@]}"; do
   } | LC_ALL=C sort > "$out/manifest.txt"
   manifest_lines+=("repo:$repo head=$head_sha tree=$tree_sha dirty=$([[ -s "$out/tracked.patch" || "$untracked_count" -gt 0 ]] && echo true || echo false) patch=$(cat "$out/diff.sha256") untracked=$untracked_count")
 done
+
+# The private measurement harness lives outside Git; record the omission, not a broad exclusion.
+if [[ -d "$TELDRIVE/scripts/baseline" ]]; then
+  harness_files="$(find "$TELDRIVE/scripts/baseline" -type f | wc -l | tr -d ' ')"
+  manifest_lines+=("private-harness-omitted:scripts/baseline files=$harness_files")
+fi
 
 if [[ -n "$DIRTY_FLAG" && "$DIRTY_FLAG" != "$dirty_measured" ]]; then
   fail "measured dirty=$dirty_measured does not match --dirty $DIRTY_FLAG"
