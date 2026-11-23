@@ -113,3 +113,35 @@ b7_track_network() {
 b7_cleanup() {
   b6_cleanup "$@"
 }
+
+# Synthetic key set for the encrypted canary. Values live only in this 0600
+# file; the caller appends database and Telegram settings before use.
+b7_synthetic_keys() {
+  local path="$1"
+  b6_write_env_file "$path" \
+    "TELDRIVE_SECURITY_DATA_KEY=$(b6_data_key)" \
+    "TELDRIVE_SECURITY_SIGNING_KEY=$(b6_hex32 | cut -c1-48)" \
+    "TELDRIVE_ENCRYPTION_KEYS=1:$(b6_hex32)" \
+    "TELDRIVE_ENCRYPTION_ACTIVE_KEY_VERSION=1"
+  [[ "$(stat -c '%a' "$path")" == "600" ]] ||
+    { printf 'b7: synthetic key file mode is not 0600\n' >&2; return 1; }
+}
+
+# Start the candidate against the filesystem Telegram root with workers
+# disabled, wait for readiness, and print the published host port.
+b7_start_canary_teldrive() {
+  local runtime="$1" name="$2" image="$3" network="$4" envfile="$5" local_root="$6"
+  b6_start_teldrive "$runtime" "$name" "$image" "$network" "$envfile" "$local_root"
+  b7_track_container "$name"
+  local port
+  port="$(b6_published_port "$runtime" "$name" 8080)"
+  [[ "$port" =~ ^[0-9]+$ ]] || { printf 'b7: published port is not numeric\n' >&2; return 1; }
+  b6_wait_health "http://127.0.0.1:$port/health/ready" 120 || return 1
+  printf '%s\n' "$port"
+}
+
+# Insert the test user, its owner incarnation, and one API key row.
+b7_bootstrap_canary_user() {
+  local runtime="$1" name="$2" user="$3" db="$4" schema="$5" secret="$6" key_name="$7"
+  b6_bootstrap_api_key "$runtime" "$name" "$user" "$db" "$schema" "$secret" "$key_name"
+}
