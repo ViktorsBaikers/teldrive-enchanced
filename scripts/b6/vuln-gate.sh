@@ -18,17 +18,52 @@ SOURCE="both"
 OUT=""
 IMAGE=""
 WANT_SBOM=false
+SELF_TEST=false
 declare -a BINARIES=()
+
+# Shared by the summary loop and --self-test. Returns 0 when the finding may be
+# recorded, 1 when the accepted build must fail. Unknown severity fails closed.
+severity_decision() {
+  case "$1" in
+    critical|high) printf 'block'; return 1 ;;
+    medium|low) printf 'record'; return 0 ;;
+    *) printf 'block (unknown severity)'; return 1 ;;
+  esac
+}
+
+self_test() {
+  local failures=0 sev decision outcome want
+  for sev in critical high medium low unknown; do
+    if decision="$(severity_decision "$sev")"; then outcome=PASS; else outcome=FAIL; fi
+    case "$sev" in
+      critical|high|unknown) want=FAIL ;;
+      *) want=PASS ;;
+    esac
+    if [[ "$outcome" != "$want" ]]; then
+      printf 'self-test: FAIL %s -> %s (want %s)\n' "$sev" "$outcome" "$want" >&2
+      failures=$((failures + 1))
+      continue
+    fi
+    printf 'self-test: PASS %s -> %s (%s)\n' "$sev" "$outcome" "$decision"
+  done
+  if ((failures == 0)); then
+    printf 'self-test: PASS\n'
+    return 0
+  fi
+  printf 'self-test: FAIL (%d)\n' "$failures" >&2
+  return 1
+}
 
 usage() {
   cat >&2 <<'EOF'
-usage: vuln-gate.sh [--source teldrive|rclone|both] [--binary PATH]... [--image IMAGE] [--sbom] --out DIR
-  --source   module roots to scan in govulncheck source mode (default both)
-  --binary   repeatable; scan a built Linux artifact in binary mode
-             (symbol presence, never reachability)
-  --image    local runtime image to scan with grype
-  --sbom     write a CycloneDX SBOM for --image (requires --image)
-  --out      private output directory for JSON, SBOM, and summary.txt
+usage: vuln-gate.sh [--source teldrive|rclone|both] [--binary PATH]... [--image IMAGE] [--sbom] [--self-test] --out DIR
+  --source     module roots to scan in govulncheck source mode (default both)
+  --binary     repeatable; scan a built Linux artifact in binary mode
+               (symbol presence, never reachability)
+  --image      local runtime image to scan with grype
+  --sbom       write a CycloneDX SBOM for --image (requires --image)
+  --out        private output directory for JSON, SBOM, and summary.txt
+  --self-test  prove the severity decision fail-closed paths without scanning
 EOF
   exit 2
 }
@@ -39,11 +74,17 @@ while [[ $# -gt 0 ]]; do
     --binary) [[ $# -ge 2 ]] || usage; BINARIES+=("$2"); shift 2 ;;
     --image) [[ $# -ge 2 ]] || usage; IMAGE="$2"; shift 2 ;;
     --sbom) WANT_SBOM=true; shift ;;
+    --self-test) SELF_TEST=true; shift ;;
     --out) [[ $# -ge 2 ]] || usage; OUT="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
 done
+
+if [[ "$SELF_TEST" == true ]]; then
+  self_test
+  exit $?
+fi
 
 [[ -n "$OUT" ]] || usage
 case "$SOURCE" in teldrive|rclone|both) ;; *) usage ;; esac
@@ -228,12 +269,13 @@ else
   note '|----|--------|-------|-------------------|-----------|----------|'
   while IFS=$'\t' read -r id module fixed path; do
     sev="$(severity_for "$id")"
-    decision="block"
     case "$sev" in
-      critical|high) status=FAIL ;;
-      medium|low) decision="record" ;;
-      *) sev="unknown"; decision="block (unknown severity)" ;;
+      critical|high|medium|low) ;;
+      *) sev="unknown" ;;
     esac
+    if ! decision="$(severity_decision "$sev")"; then
+      status=FAIL
+    fi
     note "| $id | $module | $fixed | $sev | $path | $decision |"
   done <"$REACHABLE_ROWS"
   note ""
