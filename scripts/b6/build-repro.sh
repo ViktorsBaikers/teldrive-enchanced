@@ -58,6 +58,15 @@ export GOTOOLCHAIN=local
 SNAP_DIGEST="$(cat "$SNAPSHOT/snapshot.sha256")"
 [[ "$(sha256sum "$SNAPSHOT/manifest.txt" | cut -d' ' -f1)" == "$SNAP_DIGEST" ]] ||
   fail "snapshot digest mismatch; snapshot was modified after sealing"
+# The manifest top-level digest only binds manifest.txt itself. Re-hash every
+# listed payload before extraction so a swapped or truncated artifact cannot
+# be built while the receipt still claims the sealed source.
+sealed_entries() { awk '/^sha256:/ { print substr($0, 8) }' "$SNAPSHOT/manifest.txt"; }
+grep -q '^sha256:' "$SNAPSHOT/manifest.txt" || fail "snapshot manifest lists no sealed files"
+if ! mismatch="$(cd -- "$SNAPSHOT" &&
+  sealed_entries | sed 's/^\([0-9a-f]\{64\}\) /\1  /' | sha256sum -c --quiet - 2>&1)"; then
+  fail "snapshot file digest mismatch: $mismatch"
+fi
 
 go_version="$(go version)"
 printf '%s\n' "$go_version" | grep -Eq "(^| )$GO_REQUIRED( |$)" ||
