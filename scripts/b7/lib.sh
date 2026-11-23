@@ -128,7 +128,10 @@ b7_synthetic_keys() {
 }
 
 # Start the candidate against the filesystem Telegram root with workers
-# disabled, wait for readiness, and print the published host port.
+# disabled, wait for readiness, and set B7_CANARY_PORT. Never print the port:
+# callers must not run this in a command substitution, or the cleanup trackers
+# would be lost in the subshell.
+B7_CANARY_PORT=""
 b7_start_canary_teldrive() {
   local runtime="$1" name="$2" image="$3" network="$4" envfile="$5" local_root="$6"
   b6_start_teldrive "$runtime" "$name" "$image" "$network" "$envfile" "$local_root"
@@ -137,7 +140,7 @@ b7_start_canary_teldrive() {
   port="$(b6_published_port "$runtime" "$name" 8080)"
   [[ "$port" =~ ^[0-9]+$ ]] || { printf 'b7: published port is not numeric\n' >&2; return 1; }
   b6_wait_health "http://127.0.0.1:$port/health/ready" 120 || return 1
-  printf '%s\n' "$port"
+  B7_CANARY_PORT="$port"
 }
 
 # Insert the test user, its owner incarnation, and one API key row.

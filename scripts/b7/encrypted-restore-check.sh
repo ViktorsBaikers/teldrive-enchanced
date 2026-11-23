@@ -331,6 +331,7 @@ start_app() {
   local envfile="$1"
   TD_NAME="$(b7_name teldrive)"
   b7_start_canary_teldrive "$RUNTIME" "$TD_NAME" "$IMAGE_DIGEST" "$NETWORK" "$envfile" "$LOCAL_ROOT"
+  PORT="$B7_CANARY_PORT"
 }
 
 parts_json() {
@@ -396,8 +397,8 @@ create_run() {
   ENV_SOURCE="$OUT/keys.env"
   b7_synthetic_keys "$ENV_SOURCE"
   write_app_env "$OUT/env" "postgres://$APP_ROLE:$APP_PW@postgres:5432/$APP_DB?sslmode=disable" "/data/local-telegram"
-  local port
-  port="$(start_app "$OUT/env")" || fail "TelDrive did not become ready"
+  start_app "$OUT/env" || fail "TelDrive did not become ready"
+  local port="$PORT"
 
   PHASE="credential"
   local api_secret api_conf
@@ -626,7 +627,7 @@ restore_prepare() {
   API_CONF="$OUT/curl.conf"
   ( umask 077; printf 'header = "X-Api-Key: %s"\n' "$(cat "$CREATE_OUT/api-key")" > "$API_CONF" )
   chmod 600 "$API_CONF"
-  PORT="$(start_app "$OUT/env")" || fail "restored TelDrive did not become ready"
+  start_app "$OUT/env" || fail "restored TelDrive did not become ready"
 }
 
 download_status() {
@@ -674,7 +675,7 @@ restore_run() {
   stop_app
   TD_NAME=""
   write_wrong_key_env "$OUT/env-wrong" "postgres://$APP_ROLE:$APP_PW@postgres:5432/$APP_DB?sslmode=disable" "/data/local-telegram"
-  PORT="$(start_app "$OUT/env-wrong")" || fail "wrong-key TelDrive did not become ready"
+  start_app "$OUT/env-wrong" || fail "wrong-key TelDrive did not become ready"
   NEG_STATUS="$(download_status "$OUT/negative.bin")" || NEG_STATUS=0
   NEG_CODE="$(jq -r '.error.code // empty' "$OUT/negative.bin" 2>/dev/null || true)"
   [[ -n "$NEG_CODE" ]] || NEG_CODE="no-error-body"
@@ -684,7 +685,7 @@ restore_run() {
   PHASE="recovery"
   stop_app
   TD_NAME=""
-  PORT="$(start_app "$OUT/env")" || fail "recovered TelDrive did not become ready"
+  start_app "$OUT/env" || fail "recovered TelDrive did not become ready"
   code="$(download_status "$OUT/recovered.bin")" || fail "recovered download request failed"
   RECOVERED_STATUS="$code"
   RECOVERED_SHA="$(sha256sum "$OUT/recovered.bin" | cut -d' ' -f1)"
@@ -752,7 +753,7 @@ negative_run() {
   stop_app
   TD_NAME=""
   write_wrong_key_env "$OUT/env-wrong" "postgres://$APP_ROLE:$APP_PW@postgres:5432/$APP_DB?sslmode=disable" "/data/local-telegram"
-  PORT="$(start_app "$OUT/env-wrong")" || fail "wrong-key TelDrive did not become ready"
+  start_app "$OUT/env-wrong" || fail "wrong-key TelDrive did not become ready"
   NEG_STATUS="$(download_status "$OUT/negative.bin")" || NEG_STATUS=0
   NEG_CODE="$(jq -r '.error.code // empty' "$OUT/negative.bin" 2>/dev/null || true)"
   [[ -n "$NEG_CODE" ]] || NEG_CODE="no-error-body"
