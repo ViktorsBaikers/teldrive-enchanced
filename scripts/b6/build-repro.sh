@@ -394,28 +394,35 @@ done
 
 FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RECEIPT="$WORK/receipt.json"
+# Contract: snapshot_sha256 is the seal content digest; snapshot_file_sha256 is
+# the digest of the snapshot.sha256 file itself (WR-09).
+SNAP_FILE_SHA="$(sha256sum "$SNAPSHOT/snapshot.sha256" | cut -d' ' -f1)"
 metadata="$(jq -n \
   --arg version "$VERSION_STRING" --arg snap "$SNAP_DIGEST" \
+  --arg snap_file "$SNAP_FILE_SHA" \
   --arg upstream "$RCLONE_UPSTREAM_BASE" \
   --arg td_short "$TD_SHORT" --arg td_head "$TD_HEAD" --arg td_date "$TD_DATE" \
   --arg td_epoch "$TD_EPOCH" --argjson td_dirty "$TD_DIRTY" \
   --arg rc_short "$RC_SHORT" --arg rc_head "$RC_HEAD" --arg rc_date "$RC_DATE" \
   --arg rc_epoch "$RC_EPOCH" --argjson rc_dirty "$RC_DIRTY" \
-  '{version:$version, snapshot_sha256:$snap, upstream_base:$upstream,
+  '{version:$version, snapshot_sha256:$snap, snapshot_file_sha256:$snap_file,
+    upstream_base:$upstream,
     teldrive:{commit:$td_short, commit_full:$td_head, build_date:$td_date,
       build_epoch:($td_epoch|tonumber), dirty:$td_dirty},
     rclone:{commit:$rc_short, commit_full:$rc_head, build_date:$rc_date,
       build_epoch:($rc_epoch|tonumber), dirty:$rc_dirty}}')"
-jq -n --arg snap "$SNAP_DIGEST" --arg go "$GO_VERSION" --arg version "$VERSION_STRING" \
+jq -n --arg snap "$SNAP_DIGEST" --arg snap_file "$SNAP_FILE_SHA" \
+  --arg go "$GO_VERSION" --arg version "$VERSION_STRING" \
   --argjson artifacts "$artifacts" --argjson metadata "$metadata" \
   --argjson ui "$UI_JSON" --argjson image "$IMAGE_JSON" \
   --arg started "$STARTED_AT" --arg finished "$FINISHED_AT" --arg outcome "$OVERALL" \
-  '{snapshot_sha256:$snap, version:$version, go_version:$go, started_at:$started,
+  '{snapshot_sha256:$snap, snapshot_file_sha256:$snap_file, version:$version,
+    go_version:$go, started_at:$started,
     finished_at:$finished, outcome:$outcome, metadata:$metadata, ui:$ui, image:$image,
     artifacts:$artifacts}' > "$RECEIPT"
 chmod 600 "$RECEIPT"
 
-printf 'BUILD %s snapshot_sha256=%s receipt=%s/work-%s/receipt.json\n' \
-  "$OVERALL" "$SNAP_DIGEST" "$(basename -- "$PRIVATE_ROOT")" "$SNAP_NAME"
+printf 'BUILD %s snapshot_sha256=%s snapshot_file_sha256=%s receipt=%s/work-%s/receipt.json\n' \
+  "$OVERALL" "$SNAP_DIGEST" "$SNAP_FILE_SHA" "$(basename -- "$PRIVATE_ROOT")" "$SNAP_NAME"
 
 [[ "$OVERALL" == PASS ]] || exit 1

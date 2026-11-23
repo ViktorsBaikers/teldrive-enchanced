@@ -26,6 +26,24 @@ b6_private_root() {
   printf '%s\n' "${B6_PRIVATE_DIR:-$HOME/.local/state/teldrive-b6}"
 }
 
+# Create DIR as 0700, or accept an existing directory only when it is already
+# private. A caller-owned directory is never chmodded (IN-04).
+b6_ensure_private_dir() {
+  local dir="$1" mode
+  if [[ -L "$dir" ]]; then
+    printf 'b6: refusing symlinked directory: %s\n' "$dir" >&2
+    return 1
+  fi
+  if [[ -e "$dir" ]]; then
+    [[ -d "$dir" ]] || { printf 'b6: not a directory: %s\n' "$dir" >&2; return 1; }
+    mode="$(stat -c %a -- "$dir")"
+    [[ "$mode" == 700 ]] ||
+      { printf 'b6: out-dir-permissions: %s has mode %s, want 700\n' "$dir" "$mode" >&2; return 1; }
+    return 0
+  fi
+  mkdir -p -m 700 -- "$dir"
+}
+
 b6_runtime() {
   local candidate
   for candidate in ${B6_CONTAINER_RUNTIME:-} docker podman; do
