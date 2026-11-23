@@ -5,6 +5,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "$SCRIPT_DIR/lib.sh"
 PROJECT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 RCLONE_DIR="$(cd -- "$PROJECT_DIR/../rclone-enchanced" 2>/dev/null && pwd || true)"
 
@@ -16,10 +18,32 @@ GRYPE_REPO="anchore/grype"
 
 SOURCE="both"
 OUT=""
+RECEIPT=""
+TD_ROOT=""
+RC_ROOT=""
 IMAGE=""
 WANT_SBOM=false
 SELF_TEST=false
 declare -a BINARIES=()
+
+# A scan may only claim the sealed candidate: the receipt must bind this
+# checkout by full commit, the receipt must record dirty=false, and the
+# worktree must be clean. Prints a failure label, or nothing on success.
+vuln_bind_source() {
+  local label="$1" root="$2" receipt="$3" want dirty actual
+  [[ -d "$root" ]] || { printf 'vuln-source-unbound\n'; return 1; }
+  want="$(jq -er --arg l "$label" '.metadata[$l].commit_full' "$receipt" 2>/dev/null)" ||
+    { printf 'vuln-source-unbound\n'; return 1; }
+  dirty="$(jq -r --arg l "$label" '.metadata[$l].dirty' "$receipt" 2>/dev/null)"
+  [[ "$dirty" == true || "$dirty" == false ]] || { printf 'vuln-source-unbound\n'; return 1; }
+  [[ "$dirty" == false ]] || { printf 'vuln-source-dirty\n'; return 1; }
+  [[ -z "$(git -C "$root" status --porcelain 2>/dev/null)" ]] ||
+    { printf 'vuln-source-dirty\n'; return 1; }
+  actual="$(git -C "$root" rev-parse HEAD 2>/dev/null)" ||
+    { printf 'vuln-source-unbound\n'; return 1; }
+  [[ "$actual" == "$want" ]] || { printf 'vuln-source-unbound\n'; return 1; }
+  return 0
+}
 
 # Shared by the summary loop and --self-test. Returns 0 when the finding may be
 # recorded, 1 when the accepted build must fail. Unknown severity fails closed.
@@ -32,7 +56,7 @@ severity_decision() {
 }
 
 self_test() {
-  local failures=0 sev decision outcome want
+  local failures=0 sev decision outcome want tmp head
   for sev in critical high medium low unknown; do
     if decision="$(severity_decision "$sev")"; then outcome=PASS; else outcome=FAIL; fi
     case "$sev" in
@@ -46,6 +70,58 @@ self_test() {
     fi
     printf 'self-test: PASS %s -> %s (%s)\n' "$sev" "$outcome" "$decision"
   done
+
+  command -v git >/dev/null 2>&1 || {
+    printf 'self-test: FAIL git is required for source-binding fixtures\n' >&2
+    return 1
+  }
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/b6-vuln-selftest.XXXXXX")"
+  mkdir -p "$tmp/repo"
+  git -C "$tmp/repo" init -q
+  printf 'fixture\n' > "$tmp/repo/file.txt"
+  git -C "$tmp/repo" add file.txt
+  git -C "$tmp/repo" -c user.email=b6@example.invalid -c user.name=b6 commit -qm fixture
+  head="$(git -C "$tmp/repo" rev-parse HEAD)"
+
+  expect() {
+    local name="$1" want_rc="$2" want_out="$3"
+    shift 3
+    local got_rc got_out
+    got_out="$("$@")" && got_rc=0 || got_rc=$?
+    if [[ "$got_rc" -ne "$want_rc" || "$got_out" != "$want_out" ]]; then
+      printf 'self-test: FAIL %s -> rc=%s out=%s (want rc=%s out=%s)\n' \
+        "$name" "$got_rc" "$got_out" "$want_rc" "$want_out" >&2
+      failures=$((failures + 1))
+      return 0
+    fi
+    printf 'self-test: PASS %s\n' "$name"
+  }
+
+  jq -n --arg h "$head" \
+    '{metadata:{teldrive:{commit_full:$h,dirty:false}}}' > "$tmp/clean.json"
+  expect "clean matching source accepted" 0 "" \
+    vuln_bind_source teldrive "$tmp/repo" "$tmp/clean.json"
+
+  printf 'dirty\n' >> "$tmp/repo/file.txt"
+  expect "dirty worktree rejected" 1 vuln-source-dirty \
+    vuln_bind_source teldrive "$tmp/repo" "$tmp/clean.json"
+  git -C "$tmp/repo" checkout -- file.txt
+
+  jq -n '{metadata:{teldrive:{commit_full:"0000000000000000000000000000000000000000",dirty:false}}}' \
+    > "$tmp/mismatch.json"
+  expect "HEAD mismatch rejected" 1 vuln-source-unbound \
+    vuln_bind_source teldrive "$tmp/repo" "$tmp/mismatch.json"
+
+  jq -n --arg h "$head" \
+    '{metadata:{teldrive:{commit_full:$h,dirty:true}}}' > "$tmp/dirty.json"
+  expect "receipt dirty=true rejected" 1 vuln-source-dirty \
+    vuln_bind_source teldrive "$tmp/repo" "$tmp/dirty.json"
+
+  jq -n '{metadata:{}}' > "$tmp/unbound.json"
+  expect "receipt without commit rejected" 1 vuln-source-unbound \
+    vuln_bind_source teldrive "$tmp/repo" "$tmp/unbound.json"
+
+  rm -rf -- "$tmp"
   if ((failures == 0)); then
     printf 'self-test: PASS\n'
     return 0
@@ -58,12 +134,17 @@ usage() {
   cat >&2 <<'EOF'
 usage: vuln-gate.sh [--source teldrive|rclone|both] [--binary PATH]... [--image IMAGE] [--sbom] [--self-test] --out DIR
   --source     module roots to scan in govulncheck source mode (default both)
+  --receipt    build receipt that binds the scanned source
+               (default: newest work-*/receipt.json under the private root)
+  --teldrive-root DIR  teldrive checkout to scan (default: this module root)
+  --rclone-root DIR    rclone checkout to scan (default: sibling rclone-enchanced)
   --binary     repeatable; scan a built Linux artifact in binary mode
                (symbol presence, never reachability)
   --image      local runtime image to scan with grype
   --sbom       write a CycloneDX SBOM for --image (requires --image)
   --out        private output directory for JSON, SBOM, and summary.txt
-  --self-test  prove the severity decision fail-closed paths without scanning
+  --self-test  prove the severity and source-binding fail-closed paths without
+               scanning
 EOF
   exit 2
 }
@@ -71,6 +152,9 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --source) [[ $# -ge 2 ]] || usage; SOURCE="$2"; shift 2 ;;
+    --receipt) [[ $# -ge 2 ]] || usage; RECEIPT="$2"; shift 2 ;;
+    --teldrive-root) [[ $# -ge 2 ]] || usage; TD_ROOT="$2"; shift 2 ;;
+    --rclone-root) [[ $# -ge 2 ]] || usage; RC_ROOT="$2"; shift 2 ;;
     --binary) [[ $# -ge 2 ]] || usage; BINARIES+=("$2"); shift 2 ;;
     --image) [[ $# -ge 2 ]] || usage; IMAGE="$2"; shift 2 ;;
     --sbom) WANT_SBOM=true; shift ;;
@@ -115,6 +199,29 @@ note ""
 note "- started_at: $STARTED_AT"
 note "- pinned: govulncheck@$GOVULNCHECK_VERSION, syft $SYFT_VERSION, grype $GRYPE_VERSION"
 note "- scan output stays in this private directory; this file is the sanitized report"
+note ""
+
+# --- Source binding: the scan must cover the sealed candidate ----------------
+if [[ -z "$RECEIPT" ]]; then
+  RECEIPT="$(find "$(b6_private_root)" -mindepth 2 -maxdepth 2 \
+    -path '*/work-*/receipt.json' -printf '%T@ %p\n' 2>/dev/null |
+    sort -nr | head -n 1 | cut -d' ' -f2- || true)"
+fi
+[[ -s "$RECEIPT" ]] || fail_close "vuln-source-unbound: no build receipt found"
+SNAP_DIGEST="$(jq -er '.snapshot_sha256' "$RECEIPT" 2>/dev/null)" ||
+  fail_close "vuln-source-unbound: receipt has no snapshot_sha256"
+[[ -n "$TD_ROOT" ]] || TD_ROOT="$PROJECT_DIR"
+[[ -n "$RC_ROOT" ]] || RC_ROOT="$RCLONE_DIR"
+binding="$(vuln_bind_source teldrive "$TD_ROOT" "$RECEIPT")" || fail_close "$binding"
+TD_REV="$(git -C "$TD_ROOT" rev-parse HEAD)"
+binding="$(vuln_bind_source rclone "$RC_ROOT" "$RECEIPT")" || fail_close "$binding"
+RC_REV="$(git -C "$RC_ROOT" rev-parse HEAD)"
+note "## Source binding"
+note ""
+note "- receipt: $(basename -- "$RECEIPT")"
+note "- snapshot_sha256: $SNAP_DIGEST"
+note "- teldrive source_revision: $TD_REV (clean, receipt-bound)"
+note "- rclone source_revision: $RC_REV (clean, receipt-bound)"
 note ""
 
 # --- Pinned tool -------------------------------------------------------------
@@ -235,8 +342,8 @@ if [[ "$WANT_SBOM" == true ]]; then
 fi
 
 # --- Source-mode reachability (authority) ------------------------------------
-[[ "$SOURCE" == rclone ]] || scan_source teldrive "$PROJECT_DIR"
-[[ "$SOURCE" == teldrive ]] || scan_source rclone "$RCLONE_DIR"
+[[ "$SOURCE" == rclone ]] || scan_source teldrive "$TD_ROOT"
+[[ "$SOURCE" == teldrive ]] || scan_source rclone "$RC_ROOT"
 
 note "## Source-mode reachability (authority)"
 note ""
