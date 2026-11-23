@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Replay one operator-captured production pg_dumpall into a fresh disposable
-# PostgreSQL cluster, prove cluster objects and catalog/upload invariants, and
-# write a private receipt. Never touches production.
+# PostgreSQL cluster, prove cluster objects and catalog/upload invariants, write
+# a private receipt, and delete the production dump only after a PASS restore
+# plus a verified second-generation dump. Never touches production.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,7 +48,23 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# --- self-test: refusal paths and private modes, no Docker ------------------
+# Refuse a rerun against a PASS receipt or a lock held by another run. The lock
+# is a directory so creation is atomic; the caller removes it on exit.
+prepare_out() {
+  local out="$1"
+  local receipt="$out/receipt.json"
+  if [[ -f "$receipt" ]] && [[ "$(jq -r '.outcome // empty' "$receipt" 2>/dev/null)" == "PASS" ]]; then
+    printf 'b7: run-exists: %s already holds a PASS receipt\n' "$out" >&2
+    return 3
+  fi
+  if ! mkdir "$out/.lock" 2>/dev/null; then
+    printf 'b7: run-exists: another run holds %s/.lock\n' "$out" >&2
+    return 3
+  fi
+  return 0
+}
+
+# --- self-test: refusal paths, lock, rerun and private modes, no Docker -----
 expect_refusal() {
   local token="$1" path="$2" rc=0 err
   err="$(b7_require_dump "$path" 2>&1)" || rc=$?
@@ -61,8 +78,21 @@ expect_refusal() {
   fi
 }
 
+expect_run_exists() {
+  local label="$1" dir="$2" rc=0 err
+  err="$(prepare_out "$dir" 2>&1)" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    printf 'self-test: FAIL: %s was not refused\n' "$label" >&2
+    return 1
+  fi
+  if [[ "$err" != *"run-exists"* ]]; then
+    printf 'self-test: FAIL: %s refused without run-exists: %s\n' "$label" "$err" >&2
+    return 1
+  fi
+}
+
 self_test() {
-  local root dir good bad open fixture rc=0
+  local root dir good bad open fixture rc=0 fresh locked passed
   root="$(mktemp -d)"
   chmod 700 "$root"
   trap "rm -rf -- '$root'" EXIT
@@ -97,6 +127,26 @@ self_test() {
   : > "$dir/empty.sql"
   chmod 600 "$dir/empty.sql"
   expect_refusal dump-empty "$dir/empty.sql" || rc=1
+
+  # A fresh output directory takes the lock; the caller releases it.
+  fresh="$root/fresh"
+  mkdir -m 700 "$fresh"
+  prepare_out "$fresh" || { printf 'self-test: FAIL: fresh output refused\n' >&2; return 1; }
+  [[ -d "$fresh/.lock" ]] || { printf 'self-test: FAIL: lock not created\n' >&2; return 1; }
+  rmdir "$fresh/.lock"
+
+  # A second run against a PASS receipt must be refused.
+  passed="$root/passed"
+  mkdir -m 700 "$passed"
+  printf '{"outcome":"PASS"}\n' | b7_write_receipt "$passed/receipt.json"
+  expect_run_exists "rerun against PASS" "$passed" || rc=1
+
+  # A pre-existing lock must be refused.
+  locked="$root/locked"
+  mkdir -m 700 "$locked"
+  mkdir "$locked/.lock"
+  expect_run_exists "pre-existing lock" "$locked" || rc=1
+  rmdir "$locked/.lock"
 
   printf '{"outcome":"PASS"}\n' | b7_write_receipt "$root/receipt.json" ||
     { printf 'self-test: FAIL: receipt write\n' >&2; return 1; }
@@ -143,6 +193,7 @@ STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 PHASE="validate"
 FAIL_REASON=""
 RECEIPT_WRITTEN=false
+LOCKED=false
 DUMP_SHA=""
 DUMP_BYTES=0
 DUMP_MTIME=""
@@ -285,6 +336,9 @@ write_receipt() {
 
 on_exit() {
   local status=$?
+  if [[ "$LOCKED" == true && -n "$OUT" ]]; then
+    rmdir -- "$OUT/.lock" 2>/dev/null || true
+  fi
   if [[ "$RECEIPT_WRITTEN" != true && -n "$RECEIPT" ]]; then
     [[ -n "$FAIL_REASON" ]] || FAIL_REASON="unexpected exit $status"
     write_receipt FAIL || true
@@ -298,6 +352,8 @@ trap 'exit 130' INT TERM
 
 install -d -m 0700 "$OUT"
 RECEIPT="$OUT/receipt.json"
+prepare_out "$OUT" || exit 3
+LOCKED=true
 
 DUMP_SHA="$(sha256sum "$DUMP" | cut -d' ' -f1)"
 DUMP_BYTES="$(stat -c '%s' "$DUMP")"
@@ -397,13 +453,12 @@ grep -qx 'pg_trgm' <<<"$EXTENSIONS" && PGTRGM=true || PGTRGM=false
 
 ROLES_COUNT="$(psql_db "$APP_DB" \
   "SELECT count(*) FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%' AND rolname <> 'postgres'")"
-ROLE_ROW="$(psql_db "$APP_DB" "SELECT r.rolname || '|' || r.rolsuper || '|' || r.rolcanlogin
+ROLE_ROW="$(psql_db "$APP_DB" "SELECT r.rolname, r.rolsuper, r.rolcanlogin
   FROM pg_roles r JOIN pg_namespace n ON n.nspowner = r.oid
   WHERE n.nspname = '$SCHEMA' LIMIT 1")"
-APP_ROLE="${ROLE_ROW%%|*}"
-ROLE_REST="${ROLE_ROW#*|}"
-APP_ROLE_SUPER="${ROLE_REST%%|*}"
-APP_ROLE_LOGIN="${ROLE_REST#*|}"
+# Separate columns keep psql's t/f boolean rendering; concatenation would cast
+# booleans to the text 'true'/'false' and silently break the comparison.
+IFS='|' read -r APP_ROLE APP_ROLE_SUPER APP_ROLE_LOGIN <<<"$ROLE_ROW"
 [[ "$APP_ROLE_SUPER" == "t" ]] && APP_ROLE_SUPER=true || APP_ROLE_SUPER=false
 [[ "$APP_ROLE_LOGIN" == "t" ]] && APP_ROLE_LOGIN=true || APP_ROLE_LOGIN=false
 APP_ROLE="${APP_ROLE:-unknown}"
@@ -489,8 +544,30 @@ if [[ -n "$RESTORED_DUMP_OUT" ]]; then
   [[ -n "$RESTORED_SHA" ]] || fail "second-generation dump has no digest"
 fi
 
-# --- receipt ---------------------------------------------------------------
+# --- receipt, then dump deletion only after PASS and a verified dump ------
 PHASE="receipt"
 write_receipt PASS
+
+if [[ -n "$RESTORED_DUMP_OUT" ]]; then
+  # From here a failure must leave FAIL, never the PASS just written.
+  PHASE="delete_dump"
+  RECEIPT_WRITTEN=false
+  FAIL_REASON=""
+  [[ -s "$RESTORED_DUMP_OUT" ]] || fail "restored dump missing; refusing to delete the production dump"
+  ACTUAL_RESTORED_SHA="$(sha256sum "$RESTORED_DUMP_OUT" | cut -d' ' -f1)"
+  [[ "$ACTUAL_RESTORED_SHA" == "$RESTORED_SHA" ]] ||
+    fail "restored dump digest changed; refusing to delete the production dump"
+  DELETED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # Marker first so a crash between delete and receipt leaves evidence.
+  jq -n --arg sha "$DUMP_SHA" --arg at "$DELETED_AT" --arg restored "$RESTORED_SHA" \
+    '{dump_sha256: $sha, restored_dump_sha256: $restored, deleted_at: $at}' |
+    b7_write_receipt "$OUT/dump-deletion.json"
+  rm -f -- "$DUMP"
+  [[ ! -e "$DUMP" ]] || fail "production dump still present after delete"
+  DUMP_DELETED=true
+  DUMP_ABSENT=true
+  PHASE="receipt"
+  write_receipt PASS
+fi
 
 printf 'b7: restore PASS; receipt %s\n' "$RECEIPT"
