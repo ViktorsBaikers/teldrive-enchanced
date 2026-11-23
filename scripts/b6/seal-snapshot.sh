@@ -74,16 +74,23 @@ self_test() {
   tmp="$(mktemp -d)"
   trap "rm -rf -- '$tmp'" EXIT INT TERM
 
+  local golang_digest="${BASE_IMAGES[golang]}"
+  local bun_digest="${BASE_IMAGES[bun]}"
+  local distroless_digest="${BASE_IMAGES[distroless]}"
+
   mkdir -p "$tmp/teldrive/internal/cache" "$tmp/teldrive/scripts/baseline" "$tmp/rclone"
   printf 'fixture\n' > "$tmp/teldrive/README.md"
   printf 'fixture\n' > "$tmp/rclone/README.md"
   printf 'package cache\n' > "$tmp/teldrive/internal/cache/probe.go"
   printf '#!/bin/sh\n' > "$tmp/teldrive/scripts/baseline/probe.sh"
-  cat > "$tmp/teldrive/Dockerfile" <<'EOF'
-FROM golang:1.27.4-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS build
-FROM oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f AS ui
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+  cat > "$tmp/teldrive/Dockerfile" <<EOF
+FROM golang:1.27.4-alpine@$golang_digest AS build
+FROM oven/bun:1.4.2-alpine@$bun_digest AS ui
+FROM gcr.io/distroless/static-debian12:nonroot@$distroless_digest
 EOF
+  printf 'FROM golang:1.27.4-alpine@sha256:%064d\n' 0 > "$tmp/Dockerfile.mismatch"
+  printf 'FROM golang:1.27.4-alpine\n' > "$tmp/Dockerfile.missing"
+  printf 'FROM example.invalid/unknown@%s\n' "$golang_digest" > "$tmp/Dockerfile.unresolved"
 
   for repo in teldrive rclone; do
     git -C "$tmp/$repo" init -q
@@ -118,6 +125,55 @@ EOF
     fi
   fi
 
+  if run_seal "$tmp/out-override" --base-image "golang=$golang_digest" >"$tmp/override.log" 2>&1; then
+    printf 'self-test: PASS matching base-image override accepted\n'
+  else
+    printf 'self-test: FAIL matching base-image override rejected\n' >&2
+    failures=$((failures + 1))
+  fi
+
+  if [[ -f "$PROJECT_DIR/teldrive-enchanced/Dockerfile" ]] &&
+     run_seal "$tmp/out-real" --base-image-from-dockerfile "$PROJECT_DIR/teldrive-enchanced/Dockerfile" \
+       >"$tmp/real.log" 2>&1; then
+    printf 'self-test: PASS real Dockerfile digests match\n'
+  else
+    printf 'self-test: FAIL real Dockerfile digests do not match\n' >&2
+    failures=$((failures + 1))
+  fi
+
+  if run_seal "$tmp/out-mismatch" --base-image-from-dockerfile "$tmp/Dockerfile.mismatch" \
+      >"$tmp/mismatch.log" 2>&1; then
+    printf 'self-test: FAIL digest mismatch accepted\n' >&2
+    failures=$((failures + 1))
+  elif ! grep -q 'base-image-digest-mismatch' "$tmp/mismatch.log"; then
+    printf 'self-test: FAIL digest mismatch rejected without its label\n' >&2
+    failures=$((failures + 1))
+  else
+    printf 'self-test: PASS digest mismatch rejected\n'
+  fi
+
+  if run_seal "$tmp/out-missing" --base-image-from-dockerfile "$tmp/Dockerfile.missing" \
+      >"$tmp/missing.log" 2>&1; then
+    printf 'self-test: FAIL digest-less reference accepted\n' >&2
+    failures=$((failures + 1))
+  elif ! grep -q 'base-image-digest-missing' "$tmp/missing.log"; then
+    printf 'self-test: FAIL digest-less reference rejected without its label\n' >&2
+    failures=$((failures + 1))
+  else
+    printf 'self-test: PASS digest-less reference rejected\n'
+  fi
+
+  if run_seal "$tmp/out-unresolved" --base-image-from-dockerfile "$tmp/Dockerfile.unresolved" \
+      >"$tmp/unresolved.log" 2>&1; then
+    printf 'self-test: FAIL unresolved base image accepted\n' >&2
+    failures=$((failures + 1))
+  elif ! grep -q 'base-image-unresolved' "$tmp/unresolved.log"; then
+    printf 'self-test: FAIL unresolved base image rejected without its label\n' >&2
+    failures=$((failures + 1))
+  else
+    printf 'self-test: PASS unresolved base image rejected\n'
+  fi
+
   if ((failures == 0)); then
     printf 'self-test: PASS\n'
     return 0
@@ -143,20 +199,29 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Resolve base-image names referenced by the Dockerfile; only passed/known digests are recorded.
+# Bind every Dockerfile FROM reference to a configured digest; fail closed.
 if [[ -f "$DOCKERFILE" ]]; then
   while IFS= read -r ref; do
     [[ -n "$ref" ]] || continue
-    name=""
+    case "$ref" in
+      *@sha256:*) digest="${ref##*@}" ;;
+      *) fail "base-image-digest-missing: $ref" ;;
+    esac
+    [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+      fail "base-image-digest-mismatch: $ref (malformed digest)"
     case "$ref" in
       *oven/bun*) name=bun ;;
       golang*) name=golang ;;
       *distroless*) name=distroless ;;
       alpine*) name=alpine ;;
       *postgres*) name=postgres ;;
-      *) name="$(printf '%s' "${ref%%@*}" | tr '/:' '--')" ;;
+      *) name="" ;;
     esac
-    [[ -n "${BASE_IMAGES[$name]:-}" ]] || BASE_IMAGES[$name]="unresolved:$ref"
+    if [[ -z "$name" || -z "${BASE_IMAGES[$name]:-}" ]]; then
+      fail "base-image-unresolved: $ref"
+    fi
+    [[ "${BASE_IMAGES[$name]}" == "$digest" ]] ||
+      fail "base-image-digest-mismatch: $ref configured=${BASE_IMAGES[$name]} actual=$digest"
   done < <(awk 'toupper($1)=="FROM" {print $2}' "$DOCKERFILE")
 fi
 
