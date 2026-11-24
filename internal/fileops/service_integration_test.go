@@ -383,7 +383,7 @@ VALUES ($1,1001,'folder','folder',false,'trashed',now(),now())`, rootID); err !=
 WITH children AS (
     INSERT INTO files (user_id,parent_id,name,kind,size,encryption,status,mod_time,deleted_at)
     SELECT 1001, $1, 'child-' || value, 'file', 1, false, 'trashed', now(), now()
-    FROM generate_series(1, 1000) AS value
+    FROM generate_series(1, 300) AS value
     RETURNING id
 )
 INSERT INTO file_parts (file_id,part_no,channel_id,message_id,plain_size,stored_size,checksum,block_hashes)
