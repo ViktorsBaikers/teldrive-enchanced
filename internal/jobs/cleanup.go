@@ -255,18 +255,17 @@ func (w *UploadCleanupWorker) cleanupUploads(ctx context.Context, sessions []*sq
 	})
 	var failures []error
 	for _, channel := range channels {
-		// Keep each Telegram delete RPC inside the five-second compensation budget.
 		channelParts := byChannel[channel]
-		for start := 0; start < len(channelParts); start += 200 {
+		for start := 0; start < len(channelParts); start += 1000 {
 			if err := ctx.Err(); err != nil {
 				return errors.Join(errors.Join(failures...), err)
 			}
-			group := channelParts[start:min(start+200, len(channelParts))]
+			group := channelParts[start:min(start+1000, len(channelParts))]
 			messages := make([]int64, len(group))
 			for i, p := range group {
 				messages[i] = p.MessageID.Int64
 			}
-			budget, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			budget, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
 			result, cleanupErr := w.policy.CleanupMessagesWithinBudget(budget, channel.userID, channel.channelID, messages)
 			addCleanupCounts(&output.CleanupMessageResult, result)
 			acknowledged := make(map[int64]bool, len(result.DeletedMessageIDs))
