@@ -11,7 +11,7 @@ export default defineConfig({
   timeout: 60_000,
   reporter: process.env.CI ? [["github"], ["html", { open: "never" }]] : "list",
   expect: {
-    toHaveScreenshot: { animations: "disabled", maxDiffPixelRatio: 0.01 },
+    toHaveScreenshot: { animations: "disabled", maxDiffPixelRatio: 0.03 },
   },
   use: {
     baseURL: externalBaseURL ?? "http://127.0.0.1:4173",

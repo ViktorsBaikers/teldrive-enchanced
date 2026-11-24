@@ -817,6 +817,7 @@ test("document content cache follows settings despite HTTP no-store, revalidates
   expect(downloads).toBe(1);
   expect(conditionals).toEqual([undefined, '"v1"']);
   await dialog.getByRole("button", { name: "Close PDF reader", exact: true }).click();
+  await expect(dialog).toBeHidden();
   // The file list deliberately still has its old generation. Server validation wins.
   etag = '"v2"';
   body = Buffer.from(pdf.toString().replace("TelDrive PDF Reader", "NewDrive PDF Reader"));
@@ -873,6 +874,7 @@ test("document cache never serves cached bytes after access is revoked", async (
   await page.goto("/files?view=list");
   const dialog = await openPreparedPdf(page);
   await dialog.getByRole("button", { name: "Close PDF reader", exact: true }).click();
+  await expect(dialog).toBeHidden();
   denied = true;
   await openFile(page, "reader-sample.pdf");
   await expect(page.getByRole("alert")).toContainText("HTTP 403");
@@ -949,6 +951,7 @@ test("document cache settings clear stored content and disabling stops caching",
   await page.goto("/files?view=list");
   dialog = await openPreparedPdf(page);
   await dialog.getByRole("button", { name: "Close PDF reader", exact: true }).click();
+  await expect(dialog).toBeHidden();
   await openPreparedPdf(page);
   expect(downloads).toBe(3);
   expect(await cachedDocuments(page)).toHaveLength(0);
@@ -1042,6 +1045,7 @@ test("document content without an ETag is not persisted", async ({ page }) => {
   for (let i = 0; i < 2; i++) {
     const dialog = await openPreparedPdf(page);
     await dialog.getByRole("button", { name: "Close PDF reader", exact: true }).click();
+    await expect(dialog).toBeHidden();
   }
   expect(conditionals).toEqual([undefined, undefined]);
   expect(await cachedDocuments(page)).toHaveLength(0);
@@ -1123,6 +1127,7 @@ test("public-share PDF content never enters the signed-in document cache", async
       timeout: 45_000,
     });
     await dialog.getByRole("button", { name: "Close PDF reader", exact: true }).click();
+    await expect(dialog).toBeHidden();
   }
   expect(downloads).toBe(2);
   expect(await cachedDocuments(page)).toHaveLength(0);
