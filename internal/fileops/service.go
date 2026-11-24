@@ -755,11 +755,15 @@ func (s *Service) PurgeMany(ctx context.Context, userID int64, rootIDs []uuid.UU
 		return markErr
 	}
 	s.catalog.InvalidateFiles(ctx, userID, ids...)
-	budget, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	recoveryErr := s.lifecycle.RecoverWithinBudget(budget, userID, receipts)
+	recoveryBudget, cancelRecovery := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	recoveryErr := s.lifecycle.RecoverWithinBudget(recoveryBudget, userID, receipts)
+	cancelRecovery()
+	// Finalization is bounded separately: wide subtrees exceed the recovery
+	// budget even when each depth batch is a single statement.
+	finalizeBudget, cancelFinalize := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancelFinalize()
 	// Eligible siblings finalize even when another target is unknown, protected or failed.
-	finalErr := s.finalizePurge(budget, userID, ids)
+	finalErr := s.finalizePurge(finalizeBudget, userID, ids)
 	return errors.Join(markErr, recoveryErr, finalErr)
 }
 

@@ -294,6 +294,46 @@ func swapSchemas(ctx context.Context, tx pgx.Tx, cfg Config) error {
 	if _, err := tx.Exec(ctx, "ALTER SCHEMA "+staging+" RENAME TO "+final); err != nil {
 		return fmt.Errorf("promote staging schema: %w", err)
 	}
+	if err := rerenderPromotedFunctions(ctx, tx, cfg.Target.Schema, cfg.FinalSchema); err != nil {
+		return err
+	}
+	return nil
+}
+
+// rerenderPromotedFunctions rewrites schema-qualified references left in plpgsql
+// bodies by the staging-to-final rename. PostgreSQL renames catalog objects
+// but keeps the old schema name in the stored function source.
+func rerenderPromotedFunctions(ctx context.Context, tx pgx.Tx, oldSchema, newSchema string) error {
+	rows, err := tx.Query(ctx, `
+SELECT pg_get_functiondef(p.oid)
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = $1
+ORDER BY p.oid`, newSchema)
+	if err != nil {
+		return fmt.Errorf("list promoted functions: %w", err)
+	}
+	definitions := make([]string, 0, 16)
+	for rows.Next() {
+		var definition string
+		if err := rows.Scan(&definition); err != nil {
+			rows.Close()
+			return fmt.Errorf("read promoted function: %w", err)
+		}
+		definitions = append(definitions, definition)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read promoted functions: %w", err)
+	}
+	oldPrefix := pgx.Identifier{oldSchema}.Sanitize() + "."
+	newPrefix := pgx.Identifier{newSchema}.Sanitize() + "."
+	for _, definition := range definitions {
+		rewritten := strings.ReplaceAll(definition, oldPrefix, newPrefix)
+		if _, err := tx.Exec(ctx, rewritten); err != nil {
+			return fmt.Errorf("re-render promoted function: %w", err)
+		}
+	}
 	return nil
 }
 
