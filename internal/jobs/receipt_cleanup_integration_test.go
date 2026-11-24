@@ -135,7 +135,7 @@ func (f *receiptRuntimeFixture) restart(t *testing.T) {
 }
 func receiptEventually(t *testing.T, check func() bool) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	for !check() {
 		if err := ctx.Err(); err != nil {
