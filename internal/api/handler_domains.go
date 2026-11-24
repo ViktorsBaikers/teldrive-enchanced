@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/tgdrive/teldrive/v2/internal/api/gen"
 	"github.com/tgdrive/teldrive/v2/internal/authn"
@@ -18,6 +20,7 @@ import (
 	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
 	"github.com/tgdrive/teldrive/v2/internal/dbtypes"
 	"github.com/tgdrive/teldrive/v2/internal/fileops"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 	"github.com/tgdrive/teldrive/v2/internal/shares"
 	"github.com/tgdrive/teldrive/v2/internal/transfer"
 )
@@ -416,15 +419,23 @@ func (h *Handler) DiscoverChannels(ctx context.Context) (gen.DiscoverChannelsRes
 	if err != nil {
 		return nil, mapServiceError(err)
 	}
-	if h.TelegramAccount == nil {
+	if h.TelegramAccount == nil || h.Channels == nil {
 		return nil, mapServiceError(ErrOperationUnavailable)
 	}
 	remote, err := h.TelegramAccount.DiscoverChannels(ctx, userID)
 	if err != nil {
 		return nil, mapServiceError(err)
 	}
-	items := make([]gen.DiscoveredChannel, 0, len(remote))
-	for _, channel := range remote {
+	candidates := make([]channels.RemoteChannel, len(remote))
+	for i, channel := range remote {
+		candidates[i] = channels.RemoteChannel{ID: channel.ID, Name: channel.Name}
+	}
+	filtered, err := h.Channels.FilterDiscoverable(ctx, userID, candidates)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	items := make([]gen.DiscoveredChannel, 0, len(filtered))
+	for _, channel := range filtered {
 		items = append(items, gen.DiscoveredChannel{ID: channel.ID, Name: channel.Name})
 	}
 	response := gen.DiscoverChannelsOKApplicationJSON(items)
@@ -548,6 +559,28 @@ func (h *Handler) CopyFile(ctx context.Context, req *gen.FileCopyRequest, params
 	if h.FileOps == nil || req == nil {
 		return nil, mapServiceError(ErrOperationUnavailable)
 	}
+	actorID, err := UserIDFromContext(ctx)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	admission, err := copyRequestAdmission(lifecycle.RequestScope{ActorUserID: &actorID}, googleUUID(params.IdempotencyKey), params.FileId, req)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	binding, err := h.FileOps.GetRequestAdmission(ctx, admission.Scope, admission.RequestKey)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, mapServiceError(err)
+	}
+	var ownerID int64
+	if err == nil {
+		ownerID, err = h.authorizeCopyAdmission(ctx, binding)
+		if err != nil {
+			return nil, mapServiceError(err)
+		}
+		if !bytes.Equal(binding.RequestFingerprint, admission.RequestFingerprint[:]) {
+			return nil, mapServiceError(lifecycle.ErrRequestMismatch)
+		}
+	}
 	var name *string
 	if value, ok := req.Name.Get(); ok {
 		name = &value
@@ -556,29 +589,47 @@ func (h *Handler) CopyFile(ctx context.Context, req *gen.FileCopyRequest, params
 	if value, ok := req.ConflictPolicy.Get(); ok {
 		policy = sqlcgen.NameConflictPolicy(value)
 	}
-	sourceAccess, err := h.resolveAuthenticatedFileAccess(ctx, googleUUID(params.FileId), false)
-	if err != nil {
-		return nil, mapServiceError(err)
-	}
 	parentID := optionalGoogleUUID(req.ParentId)
-	if parentID == nil {
-		if !sourceAccess.Owned {
-			return nil, mapServiceError(shares.ErrForbidden)
-		}
-	} else {
-		destinationAccess, err := h.resolveAuthenticatedFileAccess(ctx, *parentID, true)
+	if binding == nil {
+		sourceAccess, err := h.resolveAuthenticatedFileAccess(ctx, googleUUID(params.FileId), false)
 		if err != nil {
 			return nil, mapServiceError(err)
 		}
-		if destinationAccess.OwnerID != sourceAccess.OwnerID {
-			return nil, mapServiceError(shares.ErrForbidden)
+		ownerID = sourceAccess.OwnerID
+		if parentID == nil {
+			if !sourceAccess.Owned {
+				return nil, mapServiceError(shares.ErrForbidden)
+			}
+		} else {
+			destinationAccess, err := h.resolveAuthenticatedFileAccess(ctx, *parentID, true)
+			if err != nil {
+				return nil, mapServiceError(err)
+			}
+			if destinationAccess.OwnerID != ownerID {
+				return nil, mapServiceError(shares.ErrForbidden)
+			}
 		}
 	}
 	file, err := h.FileOps.Copy(ctx, fileops.CopyInput{
-		UserID: sourceAccess.OwnerID, FileID: googleUUID(params.FileId), ParentID: parentID, Name: name,
-		ConflictPolicy: policy,
+		UserID: ownerID, FileID: googleUUID(params.FileId), ParentID: parentID, Name: name,
+		ConflictPolicy: policy, Admission: admission,
 	})
+	// Concurrent first requests may have installed the binding after our hint read.
+	current, lookupErr := h.FileOps.GetRequestAdmission(ctx, admission.Scope, admission.RequestKey)
+	if lookupErr == nil {
+		if _, accessErr := h.authorizeCopyAdmission(ctx, current); accessErr != nil {
+			return nil, mapServiceError(accessErr)
+		}
+		if !bytes.Equal(current.RequestFingerprint, admission.RequestFingerprint[:]) {
+			return nil, mapServiceError(lifecycle.ErrRequestMismatch)
+		}
+	} else if !errors.Is(lookupErr, pgx.ErrNoRows) {
+		return nil, mapServiceError(lookupErr)
+	}
 	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	if _, err := h.resolveAuthenticatedFileAccess(ctx, uuid.UUID(file.ID.Bytes), true); err != nil {
 		return nil, mapServiceError(err)
 	}
 	entry, err := fileEntry(file)
@@ -590,6 +641,47 @@ func (h *Handler) CopyFile(ctx context.Context, req *gen.FileCopyRequest, params
 		Etag: generationETag(file.Generation), Location: gen.URI(url.URL{Path: "/v1/files/" + fileID.String()}),
 		Response: entry,
 	}, nil
+}
+
+func (h *Handler) authorizeCopyAdmission(ctx context.Context, binding *sqlcgen.RequestAdmission) (int64, error) {
+	actorID, err := UserIDFromContext(ctx)
+	if err != nil {
+		return 0, err
+	}
+	operationID, ok := dbtypes.GoogleUUID(binding.CopyOperationID)
+	if !ok {
+		return 0, fileops.ErrNotFound
+	}
+	operation, err := h.FileOps.GetCopyOperation(ctx, binding.UserID, operationID)
+	if err != nil {
+		return 0, err
+	}
+	if operation.PublishedAt.Valid {
+		resultID, ok := dbtypes.GoogleUUID(operation.ResultFileID)
+		if !ok {
+			return 0, fileops.ErrNotFound
+		}
+		access, err := h.resolveAuthenticatedFileAccess(ctx, resultID, true)
+		if err != nil {
+			return 0, err
+		}
+		if access.OwnerID != binding.UserID {
+			return 0, shares.ErrForbidden
+		}
+	} else if actorID != binding.UserID {
+		parentID, ok := dbtypes.GoogleUUID(operation.DestinationParentID)
+		if !ok {
+			return 0, shares.ErrForbidden
+		}
+		access, err := h.resolveAuthenticatedFileAccess(ctx, parentID, true)
+		if err != nil {
+			return 0, err
+		}
+		if access.OwnerID != binding.UserID {
+			return 0, shares.ErrForbidden
+		}
+	}
+	return binding.UserID, nil
 }
 
 func (h *Handler) PurgeFile(ctx context.Context, params gen.PurgeFileParams) (gen.PurgeFileRes, error) {

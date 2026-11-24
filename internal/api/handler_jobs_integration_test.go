@@ -12,6 +12,7 @@ import (
 
 	"github.com/tgdrive/teldrive/v2/internal/api/gen"
 	"github.com/tgdrive/teldrive/v2/internal/jobs"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 	"github.com/tgdrive/teldrive/v2/internal/principal"
 	"github.com/tgdrive/teldrive/v2/internal/telegramstore"
 	testpostgres "github.com/tgdrive/teldrive/v2/internal/testutil/postgres"
@@ -19,9 +20,14 @@ import (
 
 func TestJobHandlersScopeUsersAndGiveAdminsGlobalAccess(t *testing.T) {
 	db := testpostgres.New(t)
-	runtime, err := jobs.NewRuntime(db.Pool, jobHandlerStorage{})
+	storage := jobHandlerStorage{}
+	policy := lifecycle.NewService(db.Pool, storage)
+	runtime, err := jobs.NewRuntime(db.Pool, storage, policy)
 	if err != nil {
 		t.Fatalf("NewRuntime() error = %v", err)
+	}
+	if err := policy.BindReceiptEnqueuer(runtime); err != nil {
+		t.Fatal(err)
 	}
 	handler := &Handler{Jobs: runtime}
 	ctx := context.Background()

@@ -84,7 +84,7 @@ func TestPendingDeletionCleanupPeriodicTemplate(t *testing.T) {
 
 func TestRuntimeRejectsMissingDependencies(t *testing.T) {
 	t.Parallel()
-	if _, err := NewRuntime(nil, nil); !errors.Is(err, ErrRuntimeNotConfigured) {
+	if _, err := NewRuntime(nil, nil, nil); !errors.Is(err, ErrRuntimeNotConfigured) {
 		t.Fatalf("NewRuntime() error = %v", err)
 	}
 	var runtime *Runtime

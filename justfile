@@ -9,7 +9,9 @@ default_commit := `git rev-parse --short HEAD 2>/dev/null || echo unknown`
 default_build_date := `date -u +%Y-%m-%dT%H:%M:%SZ`
 commit := env_var_or_default("COMMIT", default_commit)
 build_date := env_var_or_default("BUILD_DATE", default_build_date)
-ldflags := "-s -w -X main.version=" + version + " -X main.commit=" + commit + " -X main.date=" + build_date
+snapshot := env_var_or_default("SNAPSHOT", "unknown")
+dirty := env_var_or_default("DIRTY", "unknown")
+ldflags := "-s -w -X main.version=" + version + " -X main.commit=" + commit + " -X main.date=" + build_date + " -X main.snapshot=" + snapshot + " -X main.dirty=" + dirty
 
 _default:
     @just --list
@@ -35,7 +37,7 @@ generate-openapi:
 
 # Generate the complete Go server/client contract.
 generate-api: generate-openapi
-    go run github.com/ogen-go/ogen/cmd/ogen@latest \
+    go run github.com/ogen-go/ogen/cmd/ogen@v1.24.0 \
         --config ogen.yml \
         --target internal/api/gen \
         --package gen \
@@ -46,7 +48,7 @@ generate-api: generate-openapi
 
 # Generate the typed PostgreSQL query layer.
 generate-db:
-    sqlc generate
+    go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 generate
     go run ./internal/tools/patchsqlc
 
 generate-ui: generate-openapi
@@ -76,7 +78,7 @@ docs-build: docs-generate
 build: generate-ui
     VERSION="{{version}}" bun run --cwd {{ui_dir}} build
     mkdir -p bin
-    CGO_ENABLED=0 go build -trimpath -ldflags '{{ldflags}}' -o {{binary}} ./cmd/teldrive
+    CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags '{{ldflags}}' -o {{binary}} ./cmd/teldrive
 
 # Regenerate the Nix module options from the Go config structs.
 nix-generate:
@@ -155,7 +157,7 @@ dev:
     exit "$status"
 
 image:
-    podman build --build-arg VERSION={{version}} --build-arg COMMIT={{commit}} --build-arg BUILD_DATE={{build_date}} -t teldrive-backend:{{version}} .
+    podman build --build-arg VERSION={{version}} --build-arg COMMIT={{commit}} --build-arg BUILD_DATE={{build_date}} --build-arg SNAPSHOT={{snapshot}} --build-arg DIRTY={{dirty}} --build-arg SOURCE_DATE_EPOCH={{env_var_or_default("SOURCE_DATE_EPOCH", "0")}} --build-arg DISTROLESS_DIGEST={{env_var_or_default("DISTROLESS_DIGEST", "unknown")}} -t teldrive-backend:{{version}} .
 
 test-unit:
     go test ./...

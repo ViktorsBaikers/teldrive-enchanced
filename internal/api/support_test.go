@@ -2,11 +2,17 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/tgdrive/teldrive/v2/internal/api/gen"
 	"github.com/tgdrive/teldrive/v2/internal/authn"
@@ -102,5 +108,95 @@ func TestErrorHandlerIgnoresClientCancellation(t *testing.T) {
 	}
 	if response.Body.Len() != 0 {
 		t.Fatalf("body = %q, want empty", response.Body.String())
+	}
+}
+
+func TestErrorHandlerRedactsCause(t *testing.T) {
+	const (
+		secret = "PLANTED-QUERY-SECRET"
+		host   = "internal.planted.example"
+		dir    = "/home/planted/absolute/path"
+	)
+	capture := &captureRecords{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(capture))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	cause := fmt.Errorf("dial https://user:%s@%s%s?token=%s", secret, host, dir, secret)
+	request := httptest.NewRequest(http.MethodGet, "/v1/files", nil)
+	requestID := "req-5xx-planted"
+	ctx := context.WithValue(request.Context(), middleware.RequestIDKey, requestID)
+	response := httptest.NewRecorder()
+
+	ErrorHandler(ctx, response, request, &Problem{Status: http.StatusInternalServerError, Code: "internal_error", Message: "request failed", Cause: cause})
+
+	if len(capture.records) != 1 {
+		t.Fatalf("records = %d, want 1", len(capture.records))
+	}
+	attrs := map[string]any{}
+	capture.records[0].Attrs(func(attr slog.Attr) bool {
+		attrs[attr.Key] = attr.Value.Any()
+		return true
+	})
+	if attrs["status"] != int64(http.StatusInternalServerError) || attrs["code"] != "internal_error" || attrs["request_id"] != requestID {
+		t.Fatalf("attrs = %#v", attrs)
+	}
+	if attrs["error_kind"] != ErrorKindUpstream {
+		t.Fatalf("error_kind = %#v, want %q", attrs["error_kind"], ErrorKindUpstream)
+	}
+	for _, value := range attrs {
+		text, ok := value.(string)
+		if !ok {
+			continue
+		}
+		for _, planted := range []string{secret, host, dir} {
+			if strings.Contains(text, planted) {
+				t.Fatalf("planted literal %q leaked: %#v", planted, attrs)
+			}
+		}
+	}
+
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusInternalServerError)
+	}
+	var envelope struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if envelope.Error.Code != "internal_error" || envelope.Error.Message != "request failed" {
+		t.Fatalf("envelope = %#v", envelope)
+	}
+}
+
+func TestUploadSessionJSONPreservesSourceModTime(t *testing.T) {
+	for _, stamp := range []string{
+		"2026-11-16T23:48:18Z",
+		"2026-11-16T23:48:18.677975Z",
+		"2026-11-16T23:48:18.677975123+02:00",
+	} {
+		t.Run(stamp, func(t *testing.T) {
+			modTime, err := time.Parse(time.RFC3339Nano, stamp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := json.Marshal(&gen.UploadSession{ModTime: modTime})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var client struct {
+				ModTime time.Time `json:"modTime"`
+			}
+			if err := json.Unmarshal(body, &client); err != nil {
+				t.Fatal(err)
+			}
+			if !client.ModTime.Equal(modTime) {
+				t.Fatalf("client modTime = %s, want %s", client.ModTime.Format(time.RFC3339Nano), stamp)
+			}
+		})
 	}
 }

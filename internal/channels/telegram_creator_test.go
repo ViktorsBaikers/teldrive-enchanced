@@ -28,6 +28,17 @@ func TestTelegramCreator(t *testing.T) {
 	}
 }
 
+func TestTelegramCreatorRetainsKnownChannelOnFailure(t *testing.T) {
+	cause := errors.New("provision failed")
+	for _, id := range []int64{0, 99} {
+		storage := &creatorStorage{created: telegramstore.Channel{ID: id, Name: "retained"}, createErr: cause}
+		got, err := (TelegramCreator{Storage: storage}).Create(context.Background(), 1, "storage")
+		if got.ID != id || !errors.Is(err, cause) || storage.deleted != 0 {
+			t.Fatalf("Create() = %#v, %v; deleted = %d", got, err, storage.deleted)
+		}
+	}
+}
+
 func TestTelegramCreatorRejectsMissingStorage(t *testing.T) {
 	t.Parallel()
 	creator := TelegramCreator{}
@@ -40,8 +51,9 @@ func TestTelegramCreatorRejectsMissingStorage(t *testing.T) {
 }
 
 type creatorStorage struct {
-	created telegramstore.Channel
-	deleted int64
+	created   telegramstore.Channel
+	deleted   int64
+	createErr error
 }
 
 func (*creatorStorage) Upload(context.Context, telegramstore.UploadRequest) (telegramstore.StoredPart, error) {
@@ -55,7 +67,7 @@ func (s *creatorStorage) CopyPart(context.Context, int64, int64, int64, int64) (
 	return telegramstore.StoredPart{}, errors.New("not implemented")
 }
 func (s *creatorStorage) CreateChannel(context.Context, int64, string) (telegramstore.Channel, error) {
-	return s.created, nil
+	return s.created, s.createErr
 }
 func (s *creatorStorage) DeleteChannel(_ context.Context, _ int64, channelID int64) error {
 	s.deleted = channelID

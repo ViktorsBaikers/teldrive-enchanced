@@ -364,15 +364,12 @@ test("settings navigation separates appearance, reader and player controls", asy
 
   await navigate("Reader");
   await expect(page).toHaveURL(/\/settings\/reader$/);
-  const brightness = page.getByRole("slider", { name: "PDF page brightness", exact: true });
-  await expect(brightness).toBeVisible();
+  await expect(
+    page.getByRole("slider", { name: "PDF page brightness", exact: true }),
+  ).toHaveCount(0);
   await expect(
     page.getByRole("switch", { name: "Keep documents in this browser", exact: true }),
   ).toBeVisible();
-  await brightness.focus();
-  await brightness.press("Home");
-  await page.reload();
-  await expect(brightness).toHaveValue("50");
   await expect(
     page.getByRole("switch", { name: "Read tracks from the file", exact: true }),
   ).toHaveCount(0);
@@ -382,7 +379,6 @@ test("settings navigation separates appearance, reader and player controls", asy
   await expect(
     page.getByRole("switch", { name: "Read tracks from the file", exact: true }),
   ).toBeVisible();
-  await expect(brightness).toHaveCount(0);
   await navigate("Appearance");
   await expect(page).toHaveURL(/\/settings\/appearance$/);
   await expect(page.getByRole("button", { name: "Light", exact: true })).toBeVisible();

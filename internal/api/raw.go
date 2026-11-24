@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 
 	"github.com/tgdrive/teldrive/v2/internal/api/gen"
@@ -160,17 +161,27 @@ func (h *RawHandler) streamFile(ctx context.Context, w http.ResponseWriter, user
 	w.Header().Set("Last-Modified", file.ModTime.Time.UTC().Format(http.TimeFormat))
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(status)
-	_, err = io.CopyN(w, download.Reader, rangeSpec.Length)
-	if err != nil && !isExpectedStreamEnd(ctx, err) {
+	written, err := io.CopyN(w, download.Reader, rangeSpec.Length)
+	if err != nil {
 		// Headers are already committed, so a JSON error response cannot replace
 		// this stream. The Content-Length mismatch tells the client it was truncated.
-		slog.ErrorContext(ctx, "api.stream_failed", "file_id", fileID, "offset", rangeSpec.Offset, "length", rangeSpec.Length, "error", err)
+		completion := ClassifyStream(ctx, written, rangeSpec.Length, err)
+		level := slog.LevelError
+		if completion == CompletionClientCancel {
+			level = slog.LevelWarn
+		}
+		slog.LogAttrs(ctx, level, "api.stream_failed",
+			slog.String("stage", "stream"),
+			slog.String("request_id", middleware.GetReqID(ctx)),
+			slog.String("file_id", fileID.String()),
+			slog.Int64("offset", rangeSpec.Offset),
+			slog.Int64("bytes", written),
+			slog.Int64("expected_bytes", rangeSpec.Length),
+			slog.String("completion", completion),
+			slog.String("error_kind", ErrorKind(err)),
+		)
 	}
 	return nil
-}
-
-func isExpectedStreamEnd(ctx context.Context, err error) bool {
-	return ctx.Err() != nil || isClientDisconnect(err)
 }
 
 func isClientDisconnect(err error) bool {

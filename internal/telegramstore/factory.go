@@ -123,7 +123,7 @@ func newFactory(config FactoryConfig, newNTP func(...string) (clock.Clock, error
 	return &Factory{
 		config: config, resolver: resolver,
 		clock:      clientClock,
-		middleware: []telegram.Middleware{floodwait.NewSimpleWaiter(), retry},
+		middleware: []telegram.Middleware{receiptRetryBypass{floodwait.NewSimpleWaiter()}, receiptRetryBypass{retry}},
 		limiters:   make(map[int64]*ratelimit.RateLimiter),
 		transfers:  make(map[int64]*semaphore.Weighted),
 	}, nil

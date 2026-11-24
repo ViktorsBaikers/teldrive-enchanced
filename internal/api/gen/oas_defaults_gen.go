@@ -59,6 +59,14 @@ func (s *FolderCreateRequest) setDefaults() {
 }
 
 // setDefaults set default value of fields.
+func (s *GuardedUploadCreateRequest) setDefaults() {
+	{
+		val := bool(false)
+		s.Encryption.SetTo(val)
+	}
+}
+
+// setDefaults set default value of fields.
 func (s *ShareCreateRequest) setDefaults() {
 	{
 		val := ShareCreateRequestPermission("read")

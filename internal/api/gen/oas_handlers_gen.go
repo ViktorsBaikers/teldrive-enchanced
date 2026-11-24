@@ -1203,7 +1203,202 @@ func (s *Server) handleCleanTrashRequest(args [0]string, argsEscaped bool, w htt
 	}
 }
 
+// handleCompleteGuardedUploadRequest handles completeGuardedUpload operation.
+//
+// Atomically publish a guarded upload after validating the exact size and BLAKE3 plaintext tree digest
+// against every stored part. The required incarnation and frozen destination are rechecked under the
+// commit guard; a mismatch returns 412/upload_recovery_changed or 412/upload_destination_changed
+// without publication. A same-key changed request returns 409/conflict, terminal destination loss
+// returns 409/upload_parent_unavailable, and expiry returns 410. Success returns the extended
+// FileEntry with the current commit-time location.
+//
+// POST /v1/uploads/guarded/{uploadId}/complete
+func (s *Server) handleCompleteGuardedUploadRequest(args [1]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
+	statusWriter := &codeRecorder{ResponseWriter: w}
+	w = statusWriter
+	ctx := r.Context()
+
+	var (
+		err          error
+		opErrContext = ogenerrors.OperationContext{
+			Name: CompleteGuardedUploadOperation,
+			ID:   "completeGuardedUpload",
+		}
+	)
+	{
+		type bitset = [1]uint8
+		var satisfied bitset
+		{
+			sctx, ok, err := s.securityBearerAuth(ctx, CompleteGuardedUploadOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "BearerAuth",
+					Err:              err,
+				}
+				defer recordError("Security:BearerAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 0
+				ctx = sctx
+			}
+		}
+		{
+			sctx, ok, err := s.securityCookieAuth(ctx, CompleteGuardedUploadOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "CookieAuth",
+					Err:              err,
+				}
+				defer recordError("Security:CookieAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 1
+				ctx = sctx
+			}
+		}
+		{
+			sctx, ok, err := s.securityExternalApiKeyAuth(ctx, CompleteGuardedUploadOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "ExternalApiKeyAuth",
+					Err:              err,
+				}
+				defer recordError("Security:ExternalApiKeyAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 2
+				ctx = sctx
+			}
+		}
+
+		if ok := func() bool {
+		nextRequirement:
+			for _, requirement := range []bitset{
+				{0b00000001},
+				{0b00000010},
+				{0b00000100},
+			} {
+				for i, mask := range requirement {
+					if satisfied[i]&mask != mask {
+						continue nextRequirement
+					}
+				}
+				return true
+			}
+			return false
+		}(); !ok {
+			err = &ogenerrors.SecurityError{
+				OperationContext: opErrContext,
+				Err:              ogenerrors.ErrSecurityRequirementIsNotSatisfied,
+			}
+			defer recordError("Security", err)
+			s.cfg.ErrorHandler(ctx, w, r, err)
+			return
+		}
+	}
+	params, err := decodeCompleteGuardedUploadParams(args, argsEscaped, r)
+	if err != nil {
+		err = &ogenerrors.DecodeParamsError{
+			OperationContext: opErrContext,
+			Err:              err,
+		}
+		defer recordError("DecodeParams", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+
+	var rawBody []byte
+	request, rawBody, close, err := s.decodeCompleteGuardedUploadRequest(r)
+	if err != nil {
+		err = &ogenerrors.DecodeRequestError{
+			OperationContext: opErrContext,
+			Err:              err,
+		}
+		defer recordError("DecodeRequest", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+	defer func() {
+		if err := close(); err != nil {
+			recordError("CloseRequest", err)
+		}
+	}()
+
+	var response CompleteGuardedUploadRes
+	if m := s.cfg.Middleware; m != nil {
+		mreq := middleware.Request{
+			Context:          ctx,
+			OperationName:    CompleteGuardedUploadOperation,
+			OperationSummary: "",
+			OperationID:      "completeGuardedUpload",
+			Body:             request,
+			RawBody:          rawBody,
+			Params: middleware.Parameters{
+				{
+					Name: "Idempotency-Key",
+					In:   "header",
+				}: params.IdempotencyKey,
+				{
+					Name: "X-TelDrive-Recovery-Incarnation",
+					In:   "header",
+				}: params.XTelDriveRecoveryIncarnation,
+				{
+					Name: "uploadId",
+					In:   "path",
+				}: params.UploadId,
+			},
+			Raw: r,
+		}
+
+		type (
+			Request  = *GuardedUploadCompleteRequest
+			Params   = CompleteGuardedUploadParams
+			Response = CompleteGuardedUploadRes
+		)
+		response, err = middleware.HookMiddleware[
+			Request,
+			Params,
+			Response,
+		](
+			m,
+			mreq,
+			unpackCompleteGuardedUploadParams,
+			func(ctx context.Context, request Request, params Params) (response Response, err error) {
+				response, err = s.h.CompleteGuardedUpload(ctx, request, params)
+				return response, err
+			},
+		)
+	} else {
+		response, err = s.h.CompleteGuardedUpload(ctx, request, params)
+	}
+	if err != nil {
+		defer recordError("Internal", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+
+	if err := encodeCompleteGuardedUploadResponse(response, w); err != nil {
+		defer recordError("EncodeResponse", err)
+		if !errors.Is(err, ht.ErrInternalServerErrorResponse) {
+			s.cfg.ErrorHandler(ctx, w, r, err)
+		}
+		return
+	}
+}
+
 // handleCompletePublicShareUploadRequest handles completePublicShareUpload operation.
+//
+// Publish with the required size/optional hash manifest. Current result access remains required on
+// replay; terminal loss returns 409/upload_parent_unavailable.
 //
 // POST /v1/public/shares/{token}/uploads/{uploadId}/complete
 func (s *Server) handleCompletePublicShareUploadRequest(args [2]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
@@ -1230,6 +1425,21 @@ func (s *Server) handleCompletePublicShareUploadRequest(args [2]string, argsEsca
 	}
 
 	var rawBody []byte
+	request, rawBody, close, err := s.decodeCompletePublicShareUploadRequest(r)
+	if err != nil {
+		err = &ogenerrors.DecodeRequestError{
+			OperationContext: opErrContext,
+			Err:              err,
+		}
+		defer recordError("DecodeRequest", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+	defer func() {
+		if err := close(); err != nil {
+			recordError("CloseRequest", err)
+		}
+	}()
 
 	var response CompletePublicShareUploadRes
 	if m := s.cfg.Middleware; m != nil {
@@ -1238,7 +1448,7 @@ func (s *Server) handleCompletePublicShareUploadRequest(args [2]string, argsEsca
 			OperationName:    CompletePublicShareUploadOperation,
 			OperationSummary: "",
 			OperationID:      "completePublicShareUpload",
-			Body:             nil,
+			Body:             request,
 			RawBody:          rawBody,
 			Params: middleware.Parameters{
 				{
@@ -1262,7 +1472,7 @@ func (s *Server) handleCompletePublicShareUploadRequest(args [2]string, argsEsca
 		}
 
 		type (
-			Request  = struct{}
+			Request  = *UploadCompleteRequest
 			Params   = CompletePublicShareUploadParams
 			Response = CompletePublicShareUploadRes
 		)
@@ -1275,12 +1485,12 @@ func (s *Server) handleCompletePublicShareUploadRequest(args [2]string, argsEsca
 			mreq,
 			unpackCompletePublicShareUploadParams,
 			func(ctx context.Context, request Request, params Params) (response Response, err error) {
-				response, err = s.h.CompletePublicShareUpload(ctx, params)
+				response, err = s.h.CompletePublicShareUpload(ctx, request, params)
 				return response, err
 			},
 		)
 	} else {
-		response, err = s.h.CompletePublicShareUpload(ctx, params)
+		response, err = s.h.CompletePublicShareUpload(ctx, request, params)
 	}
 	if err != nil {
 		defer recordError("Internal", err)
@@ -1299,8 +1509,11 @@ func (s *Server) handleCompletePublicShareUploadRequest(args [2]string, argsEsca
 
 // handleCompleteUploadRequest handles completeUpload operation.
 //
-// Validate all parts and transactionally publish the file. A successful response guarantees immediate
-// read-after-write visibility.
+// Validate the current-attempt size/hash against every stored part and atomically publish.
+// Contradictory completed replays fail; agreeing replays return the original file. Current result
+// access remains required, including after moves, revocation, trash or purge. Terminal destination
+// loss returns 409/upload_parent_unavailable with message "upload destination folder is unavailable",
+// even after restore or restart. Secondary cleanup failure never changes that primary response.
 //
 // POST /v1/uploads/{uploadId}/complete
 func (s *Server) handleCompleteUploadRequest(args [1]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
@@ -1407,6 +1620,21 @@ func (s *Server) handleCompleteUploadRequest(args [1]string, argsEscaped bool, w
 	}
 
 	var rawBody []byte
+	request, rawBody, close, err := s.decodeCompleteUploadRequest(r)
+	if err != nil {
+		err = &ogenerrors.DecodeRequestError{
+			OperationContext: opErrContext,
+			Err:              err,
+		}
+		defer recordError("DecodeRequest", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+	defer func() {
+		if err := close(); err != nil {
+			recordError("CloseRequest", err)
+		}
+	}()
 
 	var response CompleteUploadRes
 	if m := s.cfg.Middleware; m != nil {
@@ -1415,7 +1643,7 @@ func (s *Server) handleCompleteUploadRequest(args [1]string, argsEscaped bool, w
 			OperationName:    CompleteUploadOperation,
 			OperationSummary: "",
 			OperationID:      "completeUpload",
-			Body:             nil,
+			Body:             request,
 			RawBody:          rawBody,
 			Params: middleware.Parameters{
 				{
@@ -1431,7 +1659,7 @@ func (s *Server) handleCompleteUploadRequest(args [1]string, argsEscaped bool, w
 		}
 
 		type (
-			Request  = struct{}
+			Request  = *UploadCompleteRequest
 			Params   = CompleteUploadParams
 			Response = CompleteUploadRes
 		)
@@ -1444,12 +1672,12 @@ func (s *Server) handleCompleteUploadRequest(args [1]string, argsEscaped bool, w
 			mreq,
 			unpackCompleteUploadParams,
 			func(ctx context.Context, request Request, params Params) (response Response, err error) {
-				response, err = s.h.CompleteUpload(ctx, params)
+				response, err = s.h.CompleteUpload(ctx, request, params)
 				return response, err
 			},
 		)
 	} else {
-		response, err = s.h.CompleteUpload(ctx, params)
+		response, err = s.h.CompleteUpload(ctx, request, params)
 	}
 	if err != nil {
 		defer recordError("Internal", err)
@@ -1765,7 +1993,12 @@ func (s *Server) handleCookieTelegramQRLoginPollRequest(args [0]string, argsEsca
 
 // handleCopyFileRequest handles copyFile operation.
 //
-// Copy a file or folder to another destination.
+// Copy a file or folder with actor-scoped stable request admission. The same Idempotency-Key and
+// original request return the current authorized result with the existing 201/FileEntry/ETag/Location
+// response, without another copy. Changed requests or inflight operations return ordinary 409/conflict
+// after authorization. Destination loss returns 409/upload_parent_unavailable with message "upload
+// destination folder is unavailable"; restore cannot revive that attempt. Current result access, not
+// former source or destination access, governs completed replay.
 //
 // POST /v1/files/{fileId}/copy
 func (s *Server) handleCopyFileRequest(args [1]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
@@ -2944,6 +3177,193 @@ func (s *Server) handleCreateFolderRequest(args [0]string, argsEscaped bool, w h
 	}
 }
 
+// handleCreateGuardedUploadRequest handles createGuardedUpload operation.
+//
+// Create an owner-only guarded upload from an immutable destination intent. The required incarnation
+// must match the current one; a mismatch returns 412/upload_recovery_changed before allocation. A slot
+// mismatch returns 412/upload_destination_changed. A same-key changed DTO returns 409/conflict, and
+// terminal destination loss returns 409/upload_parent_unavailable. Semantically malformed guards
+// return 422; undecodable JSON returns 400.
+//
+// POST /v1/uploads/guarded
+func (s *Server) handleCreateGuardedUploadRequest(args [0]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
+	statusWriter := &codeRecorder{ResponseWriter: w}
+	w = statusWriter
+	ctx := r.Context()
+
+	var (
+		err          error
+		opErrContext = ogenerrors.OperationContext{
+			Name: CreateGuardedUploadOperation,
+			ID:   "createGuardedUpload",
+		}
+	)
+	{
+		type bitset = [1]uint8
+		var satisfied bitset
+		{
+			sctx, ok, err := s.securityBearerAuth(ctx, CreateGuardedUploadOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "BearerAuth",
+					Err:              err,
+				}
+				defer recordError("Security:BearerAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 0
+				ctx = sctx
+			}
+		}
+		{
+			sctx, ok, err := s.securityCookieAuth(ctx, CreateGuardedUploadOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "CookieAuth",
+					Err:              err,
+				}
+				defer recordError("Security:CookieAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 1
+				ctx = sctx
+			}
+		}
+		{
+			sctx, ok, err := s.securityExternalApiKeyAuth(ctx, CreateGuardedUploadOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "ExternalApiKeyAuth",
+					Err:              err,
+				}
+				defer recordError("Security:ExternalApiKeyAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 2
+				ctx = sctx
+			}
+		}
+
+		if ok := func() bool {
+		nextRequirement:
+			for _, requirement := range []bitset{
+				{0b00000001},
+				{0b00000010},
+				{0b00000100},
+			} {
+				for i, mask := range requirement {
+					if satisfied[i]&mask != mask {
+						continue nextRequirement
+					}
+				}
+				return true
+			}
+			return false
+		}(); !ok {
+			err = &ogenerrors.SecurityError{
+				OperationContext: opErrContext,
+				Err:              ogenerrors.ErrSecurityRequirementIsNotSatisfied,
+			}
+			defer recordError("Security", err)
+			s.cfg.ErrorHandler(ctx, w, r, err)
+			return
+		}
+	}
+	params, err := decodeCreateGuardedUploadParams(args, argsEscaped, r)
+	if err != nil {
+		err = &ogenerrors.DecodeParamsError{
+			OperationContext: opErrContext,
+			Err:              err,
+		}
+		defer recordError("DecodeParams", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+
+	var rawBody []byte
+	request, rawBody, close, err := s.decodeCreateGuardedUploadRequest(r)
+	if err != nil {
+		err = &ogenerrors.DecodeRequestError{
+			OperationContext: opErrContext,
+			Err:              err,
+		}
+		defer recordError("DecodeRequest", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+	defer func() {
+		if err := close(); err != nil {
+			recordError("CloseRequest", err)
+		}
+	}()
+
+	var response CreateGuardedUploadRes
+	if m := s.cfg.Middleware; m != nil {
+		mreq := middleware.Request{
+			Context:          ctx,
+			OperationName:    CreateGuardedUploadOperation,
+			OperationSummary: "",
+			OperationID:      "createGuardedUpload",
+			Body:             request,
+			RawBody:          rawBody,
+			Params: middleware.Parameters{
+				{
+					Name: "Idempotency-Key",
+					In:   "header",
+				}: params.IdempotencyKey,
+				{
+					Name: "X-TelDrive-Recovery-Incarnation",
+					In:   "header",
+				}: params.XTelDriveRecoveryIncarnation,
+			},
+			Raw: r,
+		}
+
+		type (
+			Request  = *GuardedUploadCreateRequest
+			Params   = CreateGuardedUploadParams
+			Response = CreateGuardedUploadRes
+		)
+		response, err = middleware.HookMiddleware[
+			Request,
+			Params,
+			Response,
+		](
+			m,
+			mreq,
+			unpackCreateGuardedUploadParams,
+			func(ctx context.Context, request Request, params Params) (response Response, err error) {
+				response, err = s.h.CreateGuardedUpload(ctx, request, params)
+				return response, err
+			},
+		)
+	} else {
+		response, err = s.h.CreateGuardedUpload(ctx, request, params)
+	}
+	if err != nil {
+		defer recordError("Internal", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+
+	if err := encodeCreateGuardedUploadResponse(response, w); err != nil {
+		defer recordError("EncodeResponse", err)
+		if !errors.Is(err, ht.ErrInternalServerErrorResponse) {
+			s.cfg.ErrorHandler(ctx, w, r, err)
+		}
+		return
+	}
+}
+
 // handleCreateJobRequest handles createJob operation.
 //
 // POST /v1/jobs
@@ -3371,6 +3791,11 @@ func (s *Server) handleCreatePublicShareFolderRequest(args [1]string, argsEscape
 
 // handleCreatePublicShareUploadRequest handles createPublicShareUpload operation.
 //
+// Create using the immutable public-share scope and Idempotency-Key. Replay always rechecks password,
+// permission and the original destination or actual current completed result before exposing an
+// outcome or mismatch. Authorized terminal loss returns 409/upload_parent_unavailable with message
+// "upload destination folder is unavailable"; restore never reopens the attempt.
+//
 // POST /v1/public/shares/{token}/uploads
 func (s *Server) handleCreatePublicShareUploadRequest(args [1]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
 	statusWriter := &codeRecorder{ResponseWriter: w}
@@ -3657,7 +4082,12 @@ func (s *Server) handleCreateShareRequest(args [1]string, argsEscaped bool, w ht
 
 // handleCreateUploadRequest handles createUpload operation.
 //
-// Create a durable upload session.
+// Create a durable upload session scoped by the current actor and Idempotency-Key. Matching requests
+// return the same session; changed requests return 409/conflict only after current authorization. A
+// key never grants access. Authorized terminal attempts return 409/upload_parent_unavailable with
+// message "upload destination folder is unavailable"; restoring a folder cannot reopen them.
+// Unpublished legacy sessions whose original destination cannot be established also refuse resume and
+// require a genuinely new attempt, without deleting bytes.
 //
 // POST /v1/uploads
 func (s *Server) handleCreateUploadRequest(args [0]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
@@ -3836,7 +4266,10 @@ func (s *Server) handleCreateUploadRequest(args [0]string, argsEscaped bool, w h
 
 // handleCreateUploadImportRequest handles createUploadImport operation.
 //
-// Queue local paths, recursive folders, and HTTP URLs for server-side upload.
+// Queue server-side imports only after durable destination admission. Concrete existing ancestor
+// identities are pinned before source access; destination loss permanently fences that admitted batch,
+// even after restore. Authorized parent loss returns 409/upload_parent_unavailable with message
+// "upload destination folder is unavailable". Generic jobs cannot bypass admission.
 //
 // POST /v1/uploads/imports
 func (s *Server) handleCreateUploadImportRequest(args [0]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
@@ -4143,6 +4576,11 @@ func (s *Server) handleDeleteBotRequest(args [1]string, argsEscaped bool, w http
 }
 
 // handleDeleteChannelRequest handles deleteChannel operation.
+//
+// Explicitly delete an owned channel only when all owners' selections, references and nondeleted
+// remote-write receipts, including inflight reservations, permit it. Failed or ambiguous deletion
+// leaves the physical channel closed to new writes. Admission/selection/deletion refusal uses ordinary
+// 409/conflict, not parent loss.
 //
 // DELETE /v1/channels/{channelId}
 func (s *Server) handleDeleteChannelRequest(args [1]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
@@ -4794,7 +5232,8 @@ func (s *Server) handleDeletePeriodicJobRequest(args [1]string, argsEscaped bool
 
 // handleDiscoverChannelsRequest handles discoverChannels operation.
 //
-// List broadcast channels where the authenticated user can add administrators. Groups are excluded.
+// List manageable broadcast channels, excluding known closing/deleted physical channels. Discovery is
+// only a hint.
 //
 // GET /v1/channels/discover
 func (s *Server) handleDiscoverChannelsRequest(args [0]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
@@ -4933,6 +5372,156 @@ func (s *Server) handleDiscoverChannelsRequest(args [0]string, argsEscaped bool,
 	}
 
 	if err := encodeDiscoverChannelsResponse(response, w); err != nil {
+		defer recordError("EncodeResponse", err)
+		if !errors.Is(err, ht.ErrInternalServerErrorResponse) {
+			s.cfg.ErrorHandler(ctx, w, r, err)
+		}
+		return
+	}
+}
+
+// handleDiscoverGuardedUploadRequest handles discoverGuardedUpload operation.
+//
+// Return the current recovery incarnation to authorized guarded clients. The empty object proves only
+// discovery; it grants no upload capability.
+//
+// GET /v1/uploads/guarded
+func (s *Server) handleDiscoverGuardedUploadRequest(args [0]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
+	statusWriter := &codeRecorder{ResponseWriter: w}
+	w = statusWriter
+	ctx := r.Context()
+
+	var (
+		err          error
+		opErrContext = ogenerrors.OperationContext{
+			Name: DiscoverGuardedUploadOperation,
+			ID:   "discoverGuardedUpload",
+		}
+	)
+	{
+		type bitset = [1]uint8
+		var satisfied bitset
+		{
+			sctx, ok, err := s.securityBearerAuth(ctx, DiscoverGuardedUploadOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "BearerAuth",
+					Err:              err,
+				}
+				defer recordError("Security:BearerAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 0
+				ctx = sctx
+			}
+		}
+		{
+			sctx, ok, err := s.securityCookieAuth(ctx, DiscoverGuardedUploadOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "CookieAuth",
+					Err:              err,
+				}
+				defer recordError("Security:CookieAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 1
+				ctx = sctx
+			}
+		}
+		{
+			sctx, ok, err := s.securityExternalApiKeyAuth(ctx, DiscoverGuardedUploadOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "ExternalApiKeyAuth",
+					Err:              err,
+				}
+				defer recordError("Security:ExternalApiKeyAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 2
+				ctx = sctx
+			}
+		}
+
+		if ok := func() bool {
+		nextRequirement:
+			for _, requirement := range []bitset{
+				{0b00000001},
+				{0b00000010},
+				{0b00000100},
+			} {
+				for i, mask := range requirement {
+					if satisfied[i]&mask != mask {
+						continue nextRequirement
+					}
+				}
+				return true
+			}
+			return false
+		}(); !ok {
+			err = &ogenerrors.SecurityError{
+				OperationContext: opErrContext,
+				Err:              ogenerrors.ErrSecurityRequirementIsNotSatisfied,
+			}
+			defer recordError("Security", err)
+			s.cfg.ErrorHandler(ctx, w, r, err)
+			return
+		}
+	}
+
+	var rawBody []byte
+
+	var response DiscoverGuardedUploadRes
+	if m := s.cfg.Middleware; m != nil {
+		mreq := middleware.Request{
+			Context:          ctx,
+			OperationName:    DiscoverGuardedUploadOperation,
+			OperationSummary: "",
+			OperationID:      "discoverGuardedUpload",
+			Body:             nil,
+			RawBody:          rawBody,
+			Params:           middleware.Parameters{},
+			Raw:              r,
+		}
+
+		type (
+			Request  = struct{}
+			Params   = struct{}
+			Response = DiscoverGuardedUploadRes
+		)
+		response, err = middleware.HookMiddleware[
+			Request,
+			Params,
+			Response,
+		](
+			m,
+			mreq,
+			nil,
+			func(ctx context.Context, request Request, params Params) (response Response, err error) {
+				response, err = s.h.DiscoverGuardedUpload(ctx)
+				return response, err
+			},
+		)
+	} else {
+		response, err = s.h.DiscoverGuardedUpload(ctx)
+	}
+	if err != nil {
+		defer recordError("Internal", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+
+	if err := encodeDiscoverGuardedUploadResponse(response, w); err != nil {
 		defer recordError("EncodeResponse", err)
 		if !errors.Is(err, ht.ErrInternalServerErrorResponse) {
 			s.cfg.ErrorHandler(ctx, w, r, err)
@@ -6437,6 +7026,178 @@ func (s *Server) handleGetFileViewStateRequest(args [1]string, argsEscaped bool,
 	}
 }
 
+// handleGetGuardedUploadRequest handles getGuardedUpload operation.
+//
+// Inspect a guarded attempt under the current recovery incarnation. Returns the guarded-only session
+// extension and `X-TelDrive-Upload-Guard: 1` only after a current guard or exact result check
+// succeeds. An incarnation mismatch returns 412/upload_recovery_changed; a changed destination returns
+// 412/upload_destination_changed. Terminal destination loss returns 409/upload_parent_unavailable, and
+// expiry returns 410.
+//
+// GET /v1/uploads/guarded/{uploadId}
+func (s *Server) handleGetGuardedUploadRequest(args [1]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
+	statusWriter := &codeRecorder{ResponseWriter: w}
+	w = statusWriter
+	ctx := r.Context()
+
+	var (
+		err          error
+		opErrContext = ogenerrors.OperationContext{
+			Name: GetGuardedUploadOperation,
+			ID:   "getGuardedUpload",
+		}
+	)
+	{
+		type bitset = [1]uint8
+		var satisfied bitset
+		{
+			sctx, ok, err := s.securityBearerAuth(ctx, GetGuardedUploadOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "BearerAuth",
+					Err:              err,
+				}
+				defer recordError("Security:BearerAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 0
+				ctx = sctx
+			}
+		}
+		{
+			sctx, ok, err := s.securityCookieAuth(ctx, GetGuardedUploadOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "CookieAuth",
+					Err:              err,
+				}
+				defer recordError("Security:CookieAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 1
+				ctx = sctx
+			}
+		}
+		{
+			sctx, ok, err := s.securityExternalApiKeyAuth(ctx, GetGuardedUploadOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "ExternalApiKeyAuth",
+					Err:              err,
+				}
+				defer recordError("Security:ExternalApiKeyAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 2
+				ctx = sctx
+			}
+		}
+
+		if ok := func() bool {
+		nextRequirement:
+			for _, requirement := range []bitset{
+				{0b00000001},
+				{0b00000010},
+				{0b00000100},
+			} {
+				for i, mask := range requirement {
+					if satisfied[i]&mask != mask {
+						continue nextRequirement
+					}
+				}
+				return true
+			}
+			return false
+		}(); !ok {
+			err = &ogenerrors.SecurityError{
+				OperationContext: opErrContext,
+				Err:              ogenerrors.ErrSecurityRequirementIsNotSatisfied,
+			}
+			defer recordError("Security", err)
+			s.cfg.ErrorHandler(ctx, w, r, err)
+			return
+		}
+	}
+	params, err := decodeGetGuardedUploadParams(args, argsEscaped, r)
+	if err != nil {
+		err = &ogenerrors.DecodeParamsError{
+			OperationContext: opErrContext,
+			Err:              err,
+		}
+		defer recordError("DecodeParams", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+
+	var rawBody []byte
+
+	var response GetGuardedUploadRes
+	if m := s.cfg.Middleware; m != nil {
+		mreq := middleware.Request{
+			Context:          ctx,
+			OperationName:    GetGuardedUploadOperation,
+			OperationSummary: "",
+			OperationID:      "getGuardedUpload",
+			Body:             nil,
+			RawBody:          rawBody,
+			Params: middleware.Parameters{
+				{
+					Name: "X-TelDrive-Recovery-Incarnation",
+					In:   "header",
+				}: params.XTelDriveRecoveryIncarnation,
+				{
+					Name: "uploadId",
+					In:   "path",
+				}: params.UploadId,
+			},
+			Raw: r,
+		}
+
+		type (
+			Request  = struct{}
+			Params   = GetGuardedUploadParams
+			Response = GetGuardedUploadRes
+		)
+		response, err = middleware.HookMiddleware[
+			Request,
+			Params,
+			Response,
+		](
+			m,
+			mreq,
+			unpackGetGuardedUploadParams,
+			func(ctx context.Context, request Request, params Params) (response Response, err error) {
+				response, err = s.h.GetGuardedUpload(ctx, params)
+				return response, err
+			},
+		)
+	} else {
+		response, err = s.h.GetGuardedUpload(ctx, params)
+	}
+	if err != nil {
+		defer recordError("Internal", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+
+	if err := encodeGetGuardedUploadResponse(response, w); err != nil {
+		defer recordError("EncodeResponse", err)
+		if !errors.Is(err, ht.ErrInternalServerErrorResponse) {
+			s.cfg.ErrorHandler(ctx, w, r, err)
+		}
+		return
+	}
+}
+
 // handleGetJobRequest handles getJob operation.
 //
 // GET /v1/jobs/{jobId}
@@ -7279,7 +8040,7 @@ func (s *Server) handleGetStorageStatsRequest(args [0]string, argsEscaped bool, 
 
 // handleGetUploadRequest handles getUpload operation.
 //
-// Inspect an upload for resume and conflict handling.
+// Inspect an authorized attempt. Terminal destination loss returns 409/upload_parent_unavailable.
 //
 // GET /v1/uploads/{uploadId}
 func (s *Server) handleGetUploadRequest(args [1]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
@@ -12203,7 +12964,8 @@ func (s *Server) handleProvisionBotsRequest(args [0]string, argsEscaped bool, w 
 
 // handlePurgeFileRequest handles purgeFile operation.
 //
-// Permanently delete a trashed file or folder from the catalog.
+// Queue permanent deletion of a trashed file or folder. Physical completion requires proven ownership
+// and confirmed cleanup.
 //
 // DELETE /v1/files/{fileId}/purge
 func (s *Server) handlePurgeFileRequest(args [1]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
@@ -12706,7 +13468,214 @@ func (s *Server) handlePutFileViewStateRequest(args [1]string, argsEscaped bool,
 	}
 }
 
+// handlePutGuardedUploadPartRequest handles putGuardedUploadPart operation.
+//
+// Upload one guarded part. The `(uploadId, partNo)` pair is the idempotency key. The incarnation and
+// admitted destination are rechecked before any body is read; refusal consumes no part body, allocates
+// nothing and publishes nothing. Completed-part retries verify the exact body before returning stored
+// metadata. A mismatched incarnation returns 412/upload_recovery_changed and a changed slot returns
+// 412/upload_destination_changed. Terminal destination loss returns 409/upload_parent_unavailable
+// without relocation.
+//
+// PUT /v1/uploads/guarded/{uploadId}/parts/{partNo}
+func (s *Server) handlePutGuardedUploadPartRequest(args [2]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
+	statusWriter := &codeRecorder{ResponseWriter: w}
+	w = statusWriter
+	ctx := r.Context()
+
+	var (
+		err          error
+		opErrContext = ogenerrors.OperationContext{
+			Name: PutGuardedUploadPartOperation,
+			ID:   "putGuardedUploadPart",
+		}
+	)
+	{
+		type bitset = [1]uint8
+		var satisfied bitset
+		{
+			sctx, ok, err := s.securityBearerAuth(ctx, PutGuardedUploadPartOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "BearerAuth",
+					Err:              err,
+				}
+				defer recordError("Security:BearerAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 0
+				ctx = sctx
+			}
+		}
+		{
+			sctx, ok, err := s.securityCookieAuth(ctx, PutGuardedUploadPartOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "CookieAuth",
+					Err:              err,
+				}
+				defer recordError("Security:CookieAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 1
+				ctx = sctx
+			}
+		}
+		{
+			sctx, ok, err := s.securityExternalApiKeyAuth(ctx, PutGuardedUploadPartOperation, r)
+			if err != nil {
+				err = &ogenerrors.SecurityError{
+					OperationContext: opErrContext,
+					Security:         "ExternalApiKeyAuth",
+					Err:              err,
+				}
+				defer recordError("Security:ExternalApiKeyAuth", err)
+				s.cfg.ErrorHandler(ctx, w, r, err)
+				return
+			}
+			if ok {
+				satisfied[0] |= 1 << 2
+				ctx = sctx
+			}
+		}
+
+		if ok := func() bool {
+		nextRequirement:
+			for _, requirement := range []bitset{
+				{0b00000001},
+				{0b00000010},
+				{0b00000100},
+			} {
+				for i, mask := range requirement {
+					if satisfied[i]&mask != mask {
+						continue nextRequirement
+					}
+				}
+				return true
+			}
+			return false
+		}(); !ok {
+			err = &ogenerrors.SecurityError{
+				OperationContext: opErrContext,
+				Err:              ogenerrors.ErrSecurityRequirementIsNotSatisfied,
+			}
+			defer recordError("Security", err)
+			s.cfg.ErrorHandler(ctx, w, r, err)
+			return
+		}
+	}
+	params, err := decodePutGuardedUploadPartParams(args, argsEscaped, r)
+	if err != nil {
+		err = &ogenerrors.DecodeParamsError{
+			OperationContext: opErrContext,
+			Err:              err,
+		}
+		defer recordError("DecodeParams", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+
+	var rawBody []byte
+	request, rawBody, close, err := s.decodePutGuardedUploadPartRequest(r)
+	if err != nil {
+		err = &ogenerrors.DecodeRequestError{
+			OperationContext: opErrContext,
+			Err:              err,
+		}
+		defer recordError("DecodeRequest", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+	defer func() {
+		if err := close(); err != nil {
+			recordError("CloseRequest", err)
+		}
+	}()
+
+	var response PutGuardedUploadPartRes
+	if m := s.cfg.Middleware; m != nil {
+		mreq := middleware.Request{
+			Context:          ctx,
+			OperationName:    PutGuardedUploadPartOperation,
+			OperationSummary: "",
+			OperationID:      "putGuardedUploadPart",
+			Body:             request,
+			RawBody:          rawBody,
+			Params: middleware.Parameters{
+				{
+					Name: "Content-Length",
+					In:   "header",
+				}: params.ContentLength,
+				{
+					Name: "X-Part-Checksum",
+					In:   "header",
+				}: params.XPartChecksum,
+				{
+					Name: "X-TelDrive-Recovery-Incarnation",
+					In:   "header",
+				}: params.XTelDriveRecoveryIncarnation,
+				{
+					Name: "uploadId",
+					In:   "path",
+				}: params.UploadId,
+				{
+					Name: "partNo",
+					In:   "path",
+				}: params.PartNo,
+				{
+					Name: "channelId",
+					In:   "query",
+				}: params.ChannelId,
+			},
+			Raw: r,
+		}
+
+		type (
+			Request  = PutGuardedUploadPartReq
+			Params   = PutGuardedUploadPartParams
+			Response = PutGuardedUploadPartRes
+		)
+		response, err = middleware.HookMiddleware[
+			Request,
+			Params,
+			Response,
+		](
+			m,
+			mreq,
+			unpackPutGuardedUploadPartParams,
+			func(ctx context.Context, request Request, params Params) (response Response, err error) {
+				response, err = s.h.PutGuardedUploadPart(ctx, request, params)
+				return response, err
+			},
+		)
+	} else {
+		response, err = s.h.PutGuardedUploadPart(ctx, request, params)
+	}
+	if err != nil {
+		defer recordError("Internal", err)
+		s.cfg.ErrorHandler(ctx, w, r, err)
+		return
+	}
+
+	if err := encodePutGuardedUploadPartResponse(response, w); err != nil {
+		defer recordError("EncodeResponse", err)
+		if !errors.Is(err, ht.ErrInternalServerErrorResponse) {
+			s.cfg.ErrorHandler(ctx, w, r, err)
+		}
+		return
+	}
+}
+
 // handlePutPublicShareUploadPartRequest handles putPublicShareUploadPart operation.
+//
+// Exact-body replay rechecks current result access after verification; terminal destination loss
+// returns 409/upload_parent_unavailable.
 //
 // PUT /v1/public/shares/{token}/uploads/{uploadId}/parts/{partNo}
 func (s *Server) handlePutPublicShareUploadPartRequest(args [3]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
@@ -12825,8 +13794,12 @@ func (s *Server) handlePutPublicShareUploadPartRequest(args [3]string, argsEscap
 
 // handlePutUploadPartRequest handles putUploadPart operation.
 //
-// Upload one part. The `(uploadId, partNo)` pair is the idempotency key. An exact retry returns the
-// existing stored part; conflicting size/checksum returns 409.
+// Upload one part. The `(uploadId, partNo)` pair is the idempotency key. Every retry consumes the
+// exact body and verifies equality before returning stored metadata. Nonfinal parts use the negotiated
+// aligned size; only the final part may be shorter. Completed-part retries recheck access to the
+// actual current result after body verification. Closing/deleted storage channels return ordinary
+// 409/conflict, not parent loss. Terminal destination loss returns 409/upload_parent_unavailable
+// without relocation.
 //
 // PUT /v1/uploads/{uploadId}/parts/{partNo}
 func (s *Server) handlePutUploadPartRequest(args [2]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {
@@ -15382,6 +16355,10 @@ func (s *Server) handleStreamEventsRequest(args [0]string, argsEscaped bool, w h
 					Name: "types",
 					In:   "query",
 				}: params.Types,
+				{
+					Name: "mode",
+					In:   "query",
+				}: params.Mode,
 			},
 			Raw: r,
 		}
@@ -15416,7 +16393,8 @@ func (s *Server) handleStreamEventsRequest(args [0]string, argsEscaped bool, w h
 
 // handleSyncChannelsRequest handles syncChannels operation.
 //
-// Register only chosen manageable broadcast channels, without deleting existing channels.
+// Register chosen manageable channels atomically. A blocked physical ID rejects the entire set with
+// 409/conflict.
 //
 // POST /v1/channels/sync
 func (s *Server) handleSyncChannelsRequest(args [0]string, argsEscaped bool, w http.ResponseWriter, r *http.Request) {

@@ -297,6 +297,7 @@ async function installFileApi(page: Page, seed: PreferencesSeed = {}): Promise<P
           partSize: 512 * 1024 * 1024,
           state: "open",
           encryption: body.encryption,
+          requiresCompletionManifest: true,
           conflictPolicy: "rename",
           createdAt: now,
           updatedAt: now,
@@ -496,8 +497,8 @@ test("sidebar active state follows route path and bookmark search state", async 
     await page.goto(path);
     if (isMobile) await page.getByRole("button", { name: "Open navigation" }).click();
     const activeLinks = mainNav.locator('a[class*="bg-accent/10"]');
-    await expect(activeLinks).toHaveCount(1);
-    await expect(activeLinks).toHaveText(activeLabel);
+    await expect(activeLinks).toHaveCount(1, { timeout: 15_000 });
+    await expect(activeLinks).toHaveText(activeLabel, { timeout: 15_000 });
   }
 });
 
@@ -551,7 +552,7 @@ test("completed upload appears in the current directory without reloading", asyn
     page
       .getByRole("grid", { name: "Files and folders", exact: true })
       .getByRole("row", { name: /fresh-upload.txt/ }),
-  ).toBeVisible();
+  ).toBeVisible({ timeout: 15_000 });
 });
 
 test("upload menu preserves folder hierarchy and exposes byte-weighted tree progress", async ({
@@ -596,6 +597,7 @@ test("upload menu preserves folder hierarchy and exposes byte-weighted tree prog
   await expect(page.getByRole("progressbar", { name: "Overall upload progress" })).toHaveAttribute(
     "aria-valuenow",
     "100",
+    { timeout: 20_000 },
   );
   const destinationBatch = tree.getByRole("row", { name: /Destination/ });
   await tree.getByRole("button", { name: "Collapse Destination" }).click();

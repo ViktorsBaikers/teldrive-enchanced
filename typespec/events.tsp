@@ -23,6 +23,14 @@ model EventStreamResponse {
   @header("Cache-Control")
   cacheControl: "no-cache, no-transform";
 
+  /** Present only on confirmed ordered streams. */
+  @header("X-TelDrive-Events")
+  events?: "ordered";
+
+  /** Advertised ordered-stream heartbeat in positive decimal milliseconds. */
+  @header("X-TelDrive-Heartbeat-Ms")
+  heartbeatMs?: int32;
+
   @body
   body: bytes;
 }
@@ -53,6 +61,9 @@ namespace Events {
 
     /** Optional comma-separated event types to include. */
     @query types?: string[],
+
+    /** Selects the strict ordered stream when set to "ordered"; absent keeps legacy. */
+    @query mode?: string,
   ):
     | EventStreamResponse
     | ErrorResponse<401>

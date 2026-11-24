@@ -18,6 +18,90 @@ import (
 )
 
 var ErrInvalidJobState = errors.New("invalid job state")
+var ErrSystemPeriodicJob = errors.New("periodic job is system owned")
+var ErrInvalidPeriodicJobPriority = errors.New("periodic job priority must be between 1 and 4")
+var ErrPeriodicJobCapacity = errors.New("periodic job capacity is exhausted")
+
+const receiptCleanupPeriodicID = "receipt_cleanup_sweep"
+
+// The pinned scheduler reads only the first 10000 definitions, ordered by ID.
+const maxPeriodicDefinitions = 10000
+
+func (r *Runtime) lockPeriodicDefinitions(ctx context.Context, tx pgx.Tx) error {
+	table := pgx.Identifier{r.schema, "river_periodic_job"}.Sanitize()
+	if _, err := tx.Exec(ctx, "LOCK TABLE "+table+" IN SHARE ROW EXCLUSIVE MODE"); err != nil {
+		return fmt.Errorf("lock periodic definitions: %w", err)
+	}
+	return nil
+}
+
+func (r *Runtime) checkPeriodicDefinitions(ctx context.Context, tx pgx.Tx) error {
+	table := pgx.Identifier{r.schema, "river_periodic_job"}.Sanitize()
+	var total, invalid int64
+	if err := tx.QueryRow(ctx, "SELECT count(*),count(*) FILTER(WHERE priority NOT BETWEEN 1 AND 4) FROM "+table).Scan(&total, &invalid); err != nil {
+		return fmt.Errorf("check periodic definitions: %w", err)
+	}
+	if invalid > 0 {
+		return ErrInvalidPeriodicJobPriority
+	}
+	if total > maxPeriodicDefinitions {
+		return ErrPeriodicJobCapacity
+	}
+	return nil
+}
+
+func requiredReceiptPeriodicSpec() *riverpro.PeriodicJobSpec {
+	return &riverpro.PeriodicJobSpec{
+		ID: receiptCleanupPeriodicID, Kind: ReceiptDiscoverySweepKind, Args: []byte("{}"),
+		Queue: CleanupQueue, Priority: 2, MaxAttempts: 3, Tags: []string{},
+		Schedule: &riverpro.PeriodicJobSchedule{CronExpression: uploadCleanupDefaultCron, CronTimezone: maintenanceTimezone},
+		Paused:   false,
+	}
+}
+
+func checkRequiredReceiptPeriodic(row *prodriver.PeriodicJob) error {
+	spec := requiredReceiptPeriodicSpec()
+	if row == nil || row.ID != spec.ID || row.Kind != spec.Kind || !jsonBytesEqual(row.Args, spec.Args) ||
+		row.Queue != spec.Queue || row.Priority != spec.Priority || row.MaxAttempts != spec.MaxAttempts ||
+		len(row.Tags) != 0 || row.CronExpression == nil || *row.CronExpression != spec.Schedule.CronExpression ||
+		row.CronTimezone != spec.Schedule.CronTimezone || row.PausedAt != nil {
+		return errors.New("required receipt discovery definition did not reconcile")
+	}
+	return nil
+}
+
+func periodicInsertOptions(input PeriodicJobInput) (*riverpro.PeriodicJobSpec, error) {
+	if input.Priority > 4 {
+		return nil, ErrInvalidPeriodicJobPriority
+	}
+	args, err := newRawPeriodicJobArgs(input.Kind, input.Args)
+	if err != nil {
+		return nil, err
+	}
+	return &riverpro.PeriodicJobSpec{
+		ID: input.ID, JobArgs: args, Queue: defaultQueue(input.Queue), Priority: defaultPriority(input.Priority),
+		MaxAttempts: defaultMaxAttempts(input.MaxAttempts), Tags: append([]string(nil), input.Tags...),
+		Schedule: &riverpro.PeriodicJobSchedule{CronExpression: input.Schedule.CronExpression, CronTimezone: defaultTimezone(input.Schedule.CronTimezone)},
+		Paused:   input.Paused,
+	}, nil
+}
+
+func (r *Runtime) guardPeriodicMutation(ctx context.Context, id, proposedKind string) error {
+	if id == receiptCleanupPeriodicID || strings.TrimSpace(proposedKind) == ReceiptDiscoverySweepKind {
+		return ErrSystemPeriodicJob
+	}
+	row, err := r.client.PeriodicJobGet(ctx, id)
+	if errors.Is(err, river.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if row.Kind == ReceiptDiscoverySweepKind {
+		return ErrSystemPeriodicJob
+	}
+	return nil
+}
 
 type CreateInput struct {
 	Kind        string
@@ -85,12 +169,28 @@ type PeriodicTemplate struct {
 }
 
 func (r *Runtime) Get(ctx context.Context, id int64) (Job, error) {
-	if r == nil || r.client == nil {
+	if r == nil || r.client == nil || r.pool == nil || r.policy == nil {
 		return Job{}, ErrRuntimeNotConfigured
+	}
+	var ownerID int64
+	table := pgx.Identifier{r.schema, "remote_write_receipts"}.Sanitize()
+	err := r.pool.QueryRow(ctx, "SELECT user_id FROM "+table+" WHERE job_id=$1 LIMIT 1", id).Scan(&ownerID)
+	if err == nil {
+		report, err := r.policy.GetReceiptJobReport(ctx, ownerID, id)
+		if err != nil {
+			return Job{}, err
+		}
+		return jobFromReceiptReport(*report), nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return Job{}, err
 	}
 	row, err := r.client.JobGet(ctx, id)
 	if err != nil {
 		return Job{}, err
+	}
+	if row.Kind == ReceiptCleanupKind {
+		return Job{}, river.ErrNotFound
 	}
 	return jobFromRiver(row), nil
 }
@@ -242,55 +342,94 @@ func (r *Runtime) ListPeriodicJobs(ctx context.Context) ([]PeriodicJob, error) {
 	return result, nil
 }
 
-func (r *Runtime) ResetPeriodicJobs(ctx context.Context) ([]PeriodicJob, error) {
-	if r == nil || r.client == nil {
+func (r *Runtime) ResetPeriodicJobs(ctx context.Context) (items []PeriodicJob, resetErr error) {
+	if r == nil || r.client == nil || r.pool == nil {
 		return nil, ErrRuntimeNotConfigured
 	}
-
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin periodic reset: %w", err)
+	}
+	defer rollbackJobTransaction(tx, &resetErr)
+	if err = r.lockPeriodicDefinitions(ctx, tx); err != nil {
+		return nil, err
+	}
 	for {
-		rows, err := r.client.PeriodicJobList(ctx, &riverpro.PeriodicJobListOpts{Max: 1000})
+		rows, err := r.client.PeriodicJobListTx(ctx, tx, &riverpro.PeriodicJobListOpts{Max: 1000})
 		if err != nil {
 			return nil, fmt.Errorf("list periodic jobs for reset: %w", err)
 		}
-		if len(rows) == 0 {
+		deleted := 0
+		for _, row := range rows {
+			if row.ID == receiptCleanupPeriodicID {
+				continue
+			}
+			if _, err = r.client.PeriodicJobDeleteTx(ctx, tx, row.ID); err != nil {
+				return nil, fmt.Errorf("delete periodic job during reset: %w", err)
+			}
+			deleted++
+		}
+		if deleted == 0 {
 			break
 		}
-		for _, row := range rows {
-			if _, err := r.client.PeriodicJobDelete(ctx, row.ID); err != nil {
-				return nil, fmt.Errorf("delete periodic job %q during reset: %w", row.ID, err)
-			}
-		}
 	}
-
 	templates := r.PeriodicJobCatalog()
 	result := make([]PeriodicJob, 0, len(templates))
 	for _, template := range templates {
-		job, err := r.CreatePeriodicJob(ctx, PeriodicJobInput{
-			ID:          template.ID,
-			Kind:        template.Kind,
-			Args:        template.DefaultArgs,
-			Queue:       template.DefaultQueue,
-			Priority:    template.DefaultPriority,
-			MaxAttempts: template.DefaultMaxAttempts,
-			Tags:        append([]string(nil), template.DefaultTags...),
-			Schedule: PeriodicSchedule{
-				CronExpression: template.DefaultCronExpression,
-				CronTimezone:   template.DefaultCronTimezone,
-			},
+		if template.ID == receiptCleanupPeriodicID {
+			continue
+		}
+		opts, err := periodicInsertOptions(PeriodicJobInput{
+			ID: template.ID, Kind: template.Kind, Args: template.DefaultArgs, Queue: template.DefaultQueue,
+			Priority: template.DefaultPriority, MaxAttempts: template.DefaultMaxAttempts, Tags: template.DefaultTags,
+			Schedule: PeriodicSchedule{CronExpression: template.DefaultCronExpression, CronTimezone: template.DefaultCronTimezone},
 		})
 		if err != nil {
-			return nil, fmt.Errorf("restore default periodic job %q: %w", template.ID, err)
+			return nil, err
+		}
+		row, err := r.client.PeriodicJobInsertTx(ctx, tx, opts)
+		if err != nil {
+			return nil, fmt.Errorf("restore default periodic job: %w", err)
+		}
+		job, err := periodicJobFromRiver(row)
+		if err != nil {
+			return nil, err
 		}
 		result = append(result, job)
+	}
+	row, err := r.client.PeriodicJobUpsertTx(ctx, tx, requiredReceiptPeriodicSpec())
+	if err != nil {
+		return nil, fmt.Errorf("reconcile required receipt discovery during reset: %w", err)
+	}
+	if err = checkRequiredReceiptPeriodic(row); err != nil {
+		return nil, err
+	}
+	required, err := periodicJobFromRiver(row)
+	if err != nil {
+		return nil, err
+	}
+	result = append(result, required)
+	if err = r.checkPeriodicDefinitions(ctx, tx); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit periodic reset: %w", err)
 	}
 	return result, nil
 }
 
 func (r *Runtime) PeriodicJobCatalog() []PeriodicTemplate {
+	required := requiredReceiptPeriodicSpec()
 	templates := []PeriodicTemplate{
+		{
+			ID: required.ID, Label: "Receipt cleanup discovery",
+			Description: "System-owned recovery of durable remote-write evidence; full reset preserves this enabled schedule.",
+			Kind:        required.Kind, DefaultArgs: rawArgs(ReceiptDiscoverySweepArgs{}),
+			DefaultQueue: required.Queue, DefaultPriority: required.Priority, DefaultMaxAttempts: required.MaxAttempts, DefaultTags: required.Tags,
+			DefaultCronExpression: required.Schedule.CronExpression, DefaultCronTimezone: required.Schedule.CronTimezone,
+		},
 		{
 			ID: uploadCleanupPeriodicID, Label: "Upload cleanup", Description: "Remove abandoned upload sessions and temporary parts.",
 			Kind: UploadCleanupSweepKind, DefaultArgs: rawArgs(UploadCleanupSweepArgs{}),
@@ -338,32 +477,52 @@ func (r *Runtime) PeriodicJobCatalog() []PeriodicTemplate {
 	return templates
 }
 
-func (r *Runtime) CreatePeriodicJob(ctx context.Context, input PeriodicJobInput) (PeriodicJob, error) {
-	if r == nil || r.client == nil {
+func (r *Runtime) CreatePeriodicJob(ctx context.Context, input PeriodicJobInput) (created PeriodicJob, createErr error) {
+	if r == nil || r.client == nil || r.pool == nil {
 		return PeriodicJob{}, ErrRuntimeNotConfigured
 	}
-	args, err := newRawPeriodicJobArgs(input.Kind, input.Args)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.guardPeriodicMutation(ctx, input.ID, input.Kind); err != nil {
+		return PeriodicJob{}, err
+	}
+	opts, err := periodicInsertOptions(input)
 	if err != nil {
 		return PeriodicJob{}, err
 	}
-	row, err := r.client.PeriodicJobInsert(ctx, &riverpro.PeriodicJobInsertOpts{
-		ID: input.ID, JobArgs: args, Queue: defaultQueue(input.Queue), Priority: defaultPriority(input.Priority),
-		MaxAttempts: defaultMaxAttempts(input.MaxAttempts), Tags: append([]string(nil), input.Tags...),
-		Schedule: &riverpro.PeriodicJobSchedule{
-			CronExpression: input.Schedule.CronExpression,
-			CronTimezone:   defaultTimezone(input.Schedule.CronTimezone),
-		},
-		Paused: input.Paused,
-	})
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return PeriodicJob{}, fmt.Errorf("begin periodic creation: %w", err)
+	}
+	defer rollbackJobTransaction(tx, &createErr)
+	if err = r.lockPeriodicDefinitions(ctx, tx); err != nil {
+		return PeriodicJob{}, err
+	}
+	row, err := r.client.PeriodicJobInsertTx(ctx, tx, opts)
 	if err != nil {
 		return PeriodicJob{}, fmt.Errorf("create periodic job %q: %w", input.ID, err)
 	}
-	return periodicJobFromRiver(row)
+	created, err = periodicJobFromRiver(row)
+	if err != nil {
+		return PeriodicJob{}, err
+	}
+	if err = r.checkPeriodicDefinitions(ctx, tx); err != nil {
+		return PeriodicJob{}, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return PeriodicJob{}, fmt.Errorf("commit periodic creation: %w", err)
+	}
+	return created, nil
 }
 
 func (r *Runtime) UpdatePeriodicJob(ctx context.Context, id string, input PeriodicJobInput) (PeriodicJob, error) {
 	if r == nil || r.client == nil {
 		return PeriodicJob{}, ErrRuntimeNotConfigured
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.guardPeriodicMutation(ctx, id, input.Kind); err != nil {
+		return PeriodicJob{}, err
 	}
 	current, err := r.client.PeriodicJobGet(ctx, id)
 	if err != nil {
@@ -375,6 +534,9 @@ func (r *Runtime) UpdatePeriodicJob(ctx context.Context, id string, input Period
 	}
 	queue := defaultQueue(input.Queue)
 	priority := defaultPriority(input.Priority)
+	if priority > 4 {
+		return PeriodicJob{}, ErrInvalidPeriodicJobPriority
+	}
 	maxAttempts := defaultMaxAttempts(input.MaxAttempts)
 	tags := append([]string(nil), input.Tags...)
 	timezone := defaultTimezone(input.Schedule.CronTimezone)
@@ -423,6 +585,11 @@ func (r *Runtime) DeletePeriodicJob(ctx context.Context, id string) error {
 	if r == nil || r.client == nil {
 		return ErrRuntimeNotConfigured
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.guardPeriodicMutation(ctx, id, ""); err != nil {
+		return err
+	}
 	_, err := r.client.PeriodicJobDelete(ctx, id)
 	return err
 }
@@ -430,6 +597,11 @@ func (r *Runtime) DeletePeriodicJob(ctx context.Context, id string) error {
 func (r *Runtime) PausePeriodicJob(ctx context.Context, id string) (PeriodicJob, error) {
 	if r == nil || r.client == nil {
 		return PeriodicJob{}, ErrRuntimeNotConfigured
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.guardPeriodicMutation(ctx, id, ""); err != nil {
+		return PeriodicJob{}, err
 	}
 	row, err := r.client.PeriodicJobPause(ctx, id)
 	if err != nil {
@@ -441,6 +613,11 @@ func (r *Runtime) PausePeriodicJob(ctx context.Context, id string) (PeriodicJob,
 func (r *Runtime) ResumePeriodicJob(ctx context.Context, id string) (PeriodicJob, error) {
 	if r == nil || r.client == nil {
 		return PeriodicJob{}, ErrRuntimeNotConfigured
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.guardPeriodicMutation(ctx, id, ""); err != nil {
+		return PeriodicJob{}, err
 	}
 	row, err := r.client.PeriodicJobResume(ctx, id)
 	if err != nil {
@@ -463,6 +640,10 @@ func newRawPeriodicJobArgs(kind string, args map[string]json.RawMessage) (rawPer
 }
 
 func rawPeriodicJobArgsAndJSON(kind string, args map[string]json.RawMessage) (rawPeriodicJobArgs, []byte, error) {
+	kind = strings.TrimSpace(kind)
+	if kind == UploadBatchKind || kind == UploadSourceKind || kind == ReceiptCleanupKind {
+		return rawPeriodicJobArgs{}, nil, errors.New("job kind requires its typed transactional producer")
+	}
 	if strings.TrimSpace(kind) == "" {
 		return rawPeriodicJobArgs{}, nil, errors.New("periodic job kind is required")
 	}

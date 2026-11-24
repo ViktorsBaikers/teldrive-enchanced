@@ -53,17 +53,34 @@ type Handler interface {
 	//
 	// DELETE /v1/files/trash
 	CleanTrash(ctx context.Context) (CleanTrashRes, error)
+	// CompleteGuardedUpload implements completeGuardedUpload operation.
+	//
+	// Atomically publish a guarded upload after validating the exact size and BLAKE3 plaintext tree digest
+	// against every stored part. The required incarnation and frozen destination are rechecked under the
+	// commit guard; a mismatch returns 412/upload_recovery_changed or 412/upload_destination_changed
+	// without publication. A same-key changed request returns 409/conflict, terminal destination loss
+	// returns 409/upload_parent_unavailable, and expiry returns 410. Success returns the extended
+	// FileEntry with the current commit-time location.
+	//
+	// POST /v1/uploads/guarded/{uploadId}/complete
+	CompleteGuardedUpload(ctx context.Context, req *GuardedUploadCompleteRequest, params CompleteGuardedUploadParams) (CompleteGuardedUploadRes, error)
 	// CompletePublicShareUpload implements completePublicShareUpload operation.
 	//
+	// Publish with the required size/optional hash manifest. Current result access remains required on
+	// replay; terminal loss returns 409/upload_parent_unavailable.
+	//
 	// POST /v1/public/shares/{token}/uploads/{uploadId}/complete
-	CompletePublicShareUpload(ctx context.Context, params CompletePublicShareUploadParams) (CompletePublicShareUploadRes, error)
+	CompletePublicShareUpload(ctx context.Context, req *UploadCompleteRequest, params CompletePublicShareUploadParams) (CompletePublicShareUploadRes, error)
 	// CompleteUpload implements completeUpload operation.
 	//
-	// Validate all parts and transactionally publish the file. A successful response guarantees immediate
-	// read-after-write visibility.
+	// Validate the current-attempt size/hash against every stored part and atomically publish.
+	// Contradictory completed replays fail; agreeing replays return the original file. Current result
+	// access remains required, including after moves, revocation, trash or purge. Terminal destination
+	// loss returns 409/upload_parent_unavailable with message "upload destination folder is unavailable",
+	// even after restore or restart. Secondary cleanup failure never changes that primary response.
 	//
 	// POST /v1/uploads/{uploadId}/complete
-	CompleteUpload(ctx context.Context, params CompleteUploadParams) (CompleteUploadRes, error)
+	CompleteUpload(ctx context.Context, req *UploadCompleteRequest, params CompleteUploadParams) (CompleteUploadRes, error)
 	// CookieTelegramLoginVerifyCode implements cookieTelegramLoginVerifyCode operation.
 	//
 	// Complete Telegram code verification and establish an HttpOnly cookie session.
@@ -84,7 +101,12 @@ type Handler interface {
 	CookieTelegramQRLoginPoll(ctx context.Context, req *TelegramQRLoginPollRequest, params CookieTelegramQRLoginPollParams) (CookieTelegramQRLoginPollRes, error)
 	// CopyFile implements copyFile operation.
 	//
-	// Copy a file or folder to another destination.
+	// Copy a file or folder with actor-scoped stable request admission. The same Idempotency-Key and
+	// original request return the current authorized result with the existing 201/FileEntry/ETag/Location
+	// response, without another copy. Changed requests or inflight operations return ordinary 409/conflict
+	// after authorization. Destination loss returns 409/upload_parent_unavailable with message "upload
+	// destination folder is unavailable"; restore cannot revive that attempt. Current result access, not
+	// former source or destination access, governs completed replay.
 	//
 	// POST /v1/files/{fileId}/copy
 	CopyFile(ctx context.Context, req *FileCopyRequest, params CopyFileParams) (CopyFileRes, error)
@@ -114,6 +136,16 @@ type Handler interface {
 	//
 	// POST /v1/folders
 	CreateFolder(ctx context.Context, req *FolderCreateRequest, params CreateFolderParams) (CreateFolderRes, error)
+	// CreateGuardedUpload implements createGuardedUpload operation.
+	//
+	// Create an owner-only guarded upload from an immutable destination intent. The required incarnation
+	// must match the current one; a mismatch returns 412/upload_recovery_changed before allocation. A slot
+	// mismatch returns 412/upload_destination_changed. A same-key changed DTO returns 409/conflict, and
+	// terminal destination loss returns 409/upload_parent_unavailable. Semantically malformed guards
+	// return 422; undecodable JSON returns 400.
+	//
+	// POST /v1/uploads/guarded
+	CreateGuardedUpload(ctx context.Context, req *GuardedUploadCreateRequest, params CreateGuardedUploadParams) (CreateGuardedUploadRes, error)
 	// CreateJob implements createJob operation.
 	//
 	// POST /v1/jobs
@@ -128,6 +160,11 @@ type Handler interface {
 	CreatePublicShareFolder(ctx context.Context, req *FolderCreateRequest, params CreatePublicShareFolderParams) (CreatePublicShareFolderRes, error)
 	// CreatePublicShareUpload implements createPublicShareUpload operation.
 	//
+	// Create using the immutable public-share scope and Idempotency-Key. Replay always rechecks password,
+	// permission and the original destination or actual current completed result before exposing an
+	// outcome or mismatch. Authorized terminal loss returns 409/upload_parent_unavailable with message
+	// "upload destination folder is unavailable"; restore never reopens the attempt.
+	//
 	// POST /v1/public/shares/{token}/uploads
 	CreatePublicShareUpload(ctx context.Context, req *UploadCreateRequest, params CreatePublicShareUploadParams) (CreatePublicShareUploadRes, error)
 	// CreateShare implements createShare operation.
@@ -136,13 +173,21 @@ type Handler interface {
 	CreateShare(ctx context.Context, req *ShareCreateRequest, params CreateShareParams) (CreateShareRes, error)
 	// CreateUpload implements createUpload operation.
 	//
-	// Create a durable upload session.
+	// Create a durable upload session scoped by the current actor and Idempotency-Key. Matching requests
+	// return the same session; changed requests return 409/conflict only after current authorization. A
+	// key never grants access. Authorized terminal attempts return 409/upload_parent_unavailable with
+	// message "upload destination folder is unavailable"; restoring a folder cannot reopen them.
+	// Unpublished legacy sessions whose original destination cannot be established also refuse resume and
+	// require a genuinely new attempt, without deleting bytes.
 	//
 	// POST /v1/uploads
 	CreateUpload(ctx context.Context, req *UploadCreateRequest, params CreateUploadParams) (CreateUploadRes, error)
 	// CreateUploadImport implements createUploadImport operation.
 	//
-	// Queue local paths, recursive folders, and HTTP URLs for server-side upload.
+	// Queue server-side imports only after durable destination admission. Concrete existing ancestor
+	// identities are pinned before source access; destination loss permanently fences that admitted batch,
+	// even after restore. Authorized parent loss returns 409/upload_parent_unavailable with message
+	// "upload destination folder is unavailable". Generic jobs cannot bypass admission.
 	//
 	// POST /v1/uploads/imports
 	CreateUploadImport(ctx context.Context, req *UploadImportRequest) (CreateUploadImportRes, error)
@@ -151,6 +196,11 @@ type Handler interface {
 	// DELETE /v1/bots/{botId}
 	DeleteBot(ctx context.Context, params DeleteBotParams) (DeleteBotRes, error)
 	// DeleteChannel implements deleteChannel operation.
+	//
+	// Explicitly delete an owned channel only when all owners' selections, references and nondeleted
+	// remote-write receipts, including inflight reservations, permit it. Failed or ambiguous deletion
+	// leaves the physical channel closed to new writes. Admission/selection/deletion refusal uses ordinary
+	// 409/conflict, not parent loss.
 	//
 	// DELETE /v1/channels/{channelId}
 	DeleteChannel(ctx context.Context, params DeleteChannelParams) (DeleteChannelRes, error)
@@ -170,10 +220,18 @@ type Handler interface {
 	DeletePeriodicJob(ctx context.Context, params DeletePeriodicJobParams) (DeletePeriodicJobRes, error)
 	// DiscoverChannels implements discoverChannels operation.
 	//
-	// List broadcast channels where the authenticated user can add administrators. Groups are excluded.
+	// List manageable broadcast channels, excluding known closing/deleted physical channels. Discovery is
+	// only a hint.
 	//
 	// GET /v1/channels/discover
 	DiscoverChannels(ctx context.Context) (DiscoverChannelsRes, error)
+	// DiscoverGuardedUpload implements discoverGuardedUpload operation.
+	//
+	// Return the current recovery incarnation to authorized guarded clients. The empty object proves only
+	// discovery; it grants no upload capability.
+	//
+	// GET /v1/uploads/guarded
+	DiscoverGuardedUpload(ctx context.Context) (DiscoverGuardedUploadRes, error)
 	// GetCurrentUser implements getCurrentUser operation.
 	//
 	// Return the authenticated user profile.
@@ -204,6 +262,16 @@ type Handler interface {
 	//
 	// GET /v1/files/{fileId}/view-state
 	GetFileViewState(ctx context.Context, params GetFileViewStateParams) (GetFileViewStateRes, error)
+	// GetGuardedUpload implements getGuardedUpload operation.
+	//
+	// Inspect a guarded attempt under the current recovery incarnation. Returns the guarded-only session
+	// extension and `X-TelDrive-Upload-Guard: 1` only after a current guard or exact result check
+	// succeeds. An incarnation mismatch returns 412/upload_recovery_changed; a changed destination returns
+	// 412/upload_destination_changed. Terminal destination loss returns 409/upload_parent_unavailable, and
+	// expiry returns 410.
+	//
+	// GET /v1/uploads/guarded/{uploadId}
+	GetGuardedUpload(ctx context.Context, params GetGuardedUploadParams) (GetGuardedUploadRes, error)
 	// GetJob implements getJob operation.
 	//
 	// GET /v1/jobs/{jobId}
@@ -234,7 +302,7 @@ type Handler interface {
 	GetStorageStats(ctx context.Context) (GetStorageStatsRes, error)
 	// GetUpload implements getUpload operation.
 	//
-	// Inspect an upload for resume and conflict handling.
+	// Inspect an authorized attempt. Terminal destination loss returns 409/upload_parent_unavailable.
 	//
 	// GET /v1/uploads/{uploadId}
 	GetUpload(ctx context.Context, params GetUploadParams) (GetUploadRes, error)
@@ -404,7 +472,8 @@ type Handler interface {
 	ProvisionBots(ctx context.Context, params ProvisionBotsParams) (ProvisionBotsRes, error)
 	// PurgeFile implements purgeFile operation.
 	//
-	// Permanently delete a trashed file or folder from the catalog.
+	// Queue permanent deletion of a trashed file or folder. Physical completion requires proven ownership
+	// and confirmed cleanup.
 	//
 	// DELETE /v1/files/{fileId}/purge
 	PurgeFile(ctx context.Context, params PurgeFileParams) (PurgeFileRes, error)
@@ -418,14 +487,32 @@ type Handler interface {
 	//
 	// PUT /v1/files/{fileId}/view-state
 	PutFileViewState(ctx context.Context, req *FileViewStateUpdate, params PutFileViewStateParams) (PutFileViewStateRes, error)
+	// PutGuardedUploadPart implements putGuardedUploadPart operation.
+	//
+	// Upload one guarded part. The `(uploadId, partNo)` pair is the idempotency key. The incarnation and
+	// admitted destination are rechecked before any body is read; refusal consumes no part body, allocates
+	// nothing and publishes nothing. Completed-part retries verify the exact body before returning stored
+	// metadata. A mismatched incarnation returns 412/upload_recovery_changed and a changed slot returns
+	// 412/upload_destination_changed. Terminal destination loss returns 409/upload_parent_unavailable
+	// without relocation.
+	//
+	// PUT /v1/uploads/guarded/{uploadId}/parts/{partNo}
+	PutGuardedUploadPart(ctx context.Context, req PutGuardedUploadPartReq, params PutGuardedUploadPartParams) (PutGuardedUploadPartRes, error)
 	// PutPublicShareUploadPart implements putPublicShareUploadPart operation.
+	//
+	// Exact-body replay rechecks current result access after verification; terminal destination loss
+	// returns 409/upload_parent_unavailable.
 	//
 	// PUT /v1/public/shares/{token}/uploads/{uploadId}/parts/{partNo}
 	PutPublicShareUploadPart(ctx context.Context, req PutPublicShareUploadPartReq, params PutPublicShareUploadPartParams) (PutPublicShareUploadPartRes, error)
 	// PutUploadPart implements putUploadPart operation.
 	//
-	// Upload one part. The `(uploadId, partNo)` pair is the idempotency key. An exact retry returns the
-	// existing stored part; conflicting size/checksum returns 409.
+	// Upload one part. The `(uploadId, partNo)` pair is the idempotency key. Every retry consumes the
+	// exact body and verifies equality before returning stored metadata. Nonfinal parts use the negotiated
+	// aligned size; only the final part may be shorter. Completed-part retries recheck access to the
+	// actual current result after body verification. Closing/deleted storage channels return ordinary
+	// 409/conflict, not parent loss. Terminal destination loss returns 409/upload_parent_unavailable
+	// without relocation.
 	//
 	// PUT /v1/uploads/{uploadId}/parts/{partNo}
 	PutUploadPart(ctx context.Context, req PutUploadPartReq, params PutUploadPartParams) (PutUploadPartRes, error)
@@ -501,7 +588,8 @@ type Handler interface {
 	SelectChannel(ctx context.Context, params SelectChannelParams) (SelectChannelRes, error)
 	// SyncChannels implements syncChannels operation.
 	//
-	// Register only chosen manageable broadcast channels, without deleting existing channels.
+	// Register chosen manageable channels atomically. A blocked physical ID rejects the entire set with
+	// 409/conflict.
 	//
 	// POST /v1/channels/sync
 	SyncChannels(ctx context.Context, req *ChannelSyncRequest, params SyncChannelsParams) (SyncChannelsRes, error)

@@ -447,7 +447,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** @description List broadcast channels where the authenticated user can add administrators. Groups are excluded. */
+        /** @description List manageable broadcast channels, excluding known closing/deleted physical channels. Discovery is only a hint. */
         get: operations["discoverChannels"];
         put?: never;
         post?: never;
@@ -466,7 +466,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** @description Register only chosen manageable broadcast channels, without deleting existing channels. */
+        /** @description Register chosen manageable channels atomically. A blocked physical ID rejects the entire set with 409/conflict. */
         post: operations["syncChannels"];
         delete?: never;
         options?: never;
@@ -500,6 +500,12 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
+        /**
+         * @description Explicitly delete an owned channel only when all owners' selections, references
+         *     and nondeleted remote-write receipts, including inflight reservations, permit it.
+         *     Failed or ambiguous deletion leaves the physical channel closed to new writes.
+         *     Admission/selection/deletion refusal uses ordinary 409/conflict, not parent loss.
+         */
         delete: operations["deleteChannel"];
         options?: never;
         head?: never;
@@ -686,7 +692,15 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** @description Copy a file or folder to another destination. */
+        /**
+         * @description Copy a file or folder with actor-scoped stable request admission.
+         *     The same Idempotency-Key and original request return the current authorized
+         *     result with the existing 201/FileEntry/ETag/Location response, without another copy.
+         *     Changed requests or inflight operations return ordinary 409/conflict after authorization.
+         *     Destination loss returns 409/upload_parent_unavailable with message
+         *     "upload destination folder is unavailable"; restore cannot revive that attempt.
+         *     Current result access, not former source or destination access, governs completed replay.
+         */
         post: operations["copyFile"];
         delete?: never;
         options?: never;
@@ -721,7 +735,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** @description Permanently delete a trashed file or folder from the catalog. */
+        /** @description Queue permanent deletion of a trashed file or folder. Physical completion requires proven ownership and confirmed cleanup. */
         delete: operations["purgeFile"];
         options?: never;
         head?: never;
@@ -894,7 +908,15 @@ export interface paths {
         /** @description List resumable upload sessions owned by the authenticated user. */
         get: operations["listUploads"];
         put?: never;
-        /** @description Create a durable upload session. */
+        /**
+         * @description Create a durable upload session scoped by the current actor and Idempotency-Key.
+         *     Matching requests return the same session; changed requests return 409/conflict
+         *     only after current authorization. A key never grants access.
+         *     Authorized terminal attempts return 409/upload_parent_unavailable with message
+         *     "upload destination folder is unavailable"; restoring a folder cannot reopen them.
+         *     Unpublished legacy sessions whose original destination cannot be established
+         *     also refuse resume and require a genuinely new attempt, without deleting bytes.
+         */
         post: operations["createUpload"];
         delete?: never;
         options?: never;
@@ -919,6 +941,108 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/uploads/guarded": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * @description Return the current recovery incarnation to authorized guarded clients.
+         *     The empty object proves only discovery; it grants no upload capability.
+         */
+        get: operations["discoverGuardedUpload"];
+        put?: never;
+        /**
+         * @description Create an owner-only guarded upload from an immutable destination intent.
+         *     The required incarnation must match the current one; a mismatch returns
+         *     412/upload_recovery_changed before allocation. A slot mismatch returns
+         *     412/upload_destination_changed. A same-key changed DTO returns 409/conflict,
+         *     and terminal destination loss returns 409/upload_parent_unavailable.
+         *     Semantically malformed guards return 422; undecodable JSON returns 400.
+         */
+        post: operations["createGuardedUpload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/uploads/guarded/{uploadId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * @description Inspect a guarded attempt under the current recovery incarnation.
+         *     Returns the guarded-only session extension and `X-TelDrive-Upload-Guard: 1`
+         *     only after a current guard or exact result check succeeds. An incarnation
+         *     mismatch returns 412/upload_recovery_changed; a changed destination returns
+         *     412/upload_destination_changed. Terminal destination loss returns
+         *     409/upload_parent_unavailable, and expiry returns 410.
+         */
+        get: operations["getGuardedUpload"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/uploads/guarded/{uploadId}/parts/{partNo}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * @description Upload one guarded part. The `(uploadId, partNo)` pair is the idempotency key.
+         *     The incarnation and admitted destination are rechecked before any body is read;
+         *     refusal consumes no part body, allocates nothing and publishes nothing.
+         *     Completed-part retries verify the exact body before returning stored metadata.
+         *     A mismatched incarnation returns 412/upload_recovery_changed and a changed slot
+         *     returns 412/upload_destination_changed. Terminal destination loss returns
+         *     409/upload_parent_unavailable without relocation.
+         */
+        put: operations["putGuardedUploadPart"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/uploads/guarded/{uploadId}/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * @description Atomically publish a guarded upload after validating the exact size and
+         *     BLAKE3 plaintext tree digest against every stored part. The required
+         *     incarnation and frozen destination are rechecked under the commit guard;
+         *     a mismatch returns 412/upload_recovery_changed or 412/upload_destination_changed
+         *     without publication. A same-key changed request returns 409/conflict, terminal
+         *     destination loss returns 409/upload_parent_unavailable, and expiry returns 410.
+         *     Success returns the extended FileEntry with the current commit-time location.
+         */
+        post: operations["completeGuardedUpload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/uploads/imports": {
         parameters: {
             query?: never;
@@ -928,7 +1052,13 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** @description Queue local paths, recursive folders, and HTTP URLs for server-side upload. */
+        /**
+         * @description Queue server-side imports only after durable destination admission.
+         *     Concrete existing ancestor identities are pinned before source access;
+         *     destination loss permanently fences that admitted batch, even after restore.
+         *     Authorized parent loss returns 409/upload_parent_unavailable with message
+         *     "upload destination folder is unavailable". Generic jobs cannot bypass admission.
+         */
         post: operations["createUploadImport"];
         delete?: never;
         options?: never;
@@ -943,7 +1073,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** @description Inspect an upload for resume and conflict handling. */
+        /** @description Inspect an authorized attempt. Terminal destination loss returns 409/upload_parent_unavailable. */
         get: operations["getUpload"];
         put?: never;
         post?: never;
@@ -981,7 +1111,11 @@ export interface paths {
         get?: never;
         /**
          * @description Upload one part. The `(uploadId, partNo)` pair is the idempotency key.
-         *     An exact retry returns the existing stored part; conflicting size/checksum returns 409.
+         *     Every retry consumes the exact body and verifies equality before returning stored metadata.
+         *     Nonfinal parts use the negotiated aligned size; only the final part may be shorter.
+         *     Completed-part retries recheck access to the actual current result after body verification.
+         *     Closing/deleted storage channels return ordinary 409/conflict, not parent loss.
+         *     Terminal destination loss returns 409/upload_parent_unavailable without relocation.
          */
         put: operations["putUploadPart"];
         post?: never;
@@ -1001,8 +1135,12 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * @description Validate all parts and transactionally publish the file. A successful response
-         *     guarantees immediate read-after-write visibility.
+         * @description Validate the current-attempt size/hash against every stored part and atomically publish.
+         *     Contradictory completed replays fail; agreeing replays return the original file.
+         *     Current result access remains required, including after moves, revocation, trash or purge.
+         *     Terminal destination loss returns 409/upload_parent_unavailable with message
+         *     "upload destination folder is unavailable", even after restore or restart.
+         *     Secondary cleanup failure never changes that primary response.
          */
         post: operations["completeUpload"];
         delete?: never;
@@ -1262,6 +1400,13 @@ export interface paths {
         };
         get?: never;
         put?: never;
+        /**
+         * @description Create using the immutable public-share scope and Idempotency-Key.
+         *     Replay always rechecks password, permission and the original destination or
+         *     actual current completed result before exposing an outcome or mismatch.
+         *     Authorized terminal loss returns 409/upload_parent_unavailable with message
+         *     "upload destination folder is unavailable"; restore never reopens the attempt.
+         */
         post: operations["createPublicShareUpload"];
         delete?: never;
         options?: never;
@@ -1277,6 +1422,7 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
+        /** @description Exact-body replay rechecks current result access after verification; terminal destination loss returns 409/upload_parent_unavailable. */
         put: operations["putPublicShareUploadPart"];
         post?: never;
         delete?: never;
@@ -1294,6 +1440,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
+        /** @description Publish with the required size/optional hash manifest. Current result access remains required on replay; terminal loss returns 409/upload_parent_unavailable. */
         post: operations["completePublicShareUpload"];
         delete?: never;
         options?: never;
@@ -1936,6 +2083,10 @@ export interface components {
             algorithm: components["schemas"]["HashAlgorithm"];
             value: components["schemas"]["Checksum"];
         };
+        /** @description Canonical stored-name segments from the pinned root to the parent; `[]` at root. */
+        GuardedFileEntry: {
+            parentSegments?: string[];
+        } & components["schemas"]["FileEntry"];
         FileEntry: {
             id: components["schemas"]["Uuid"];
             parentId?: components["schemas"]["Uuid"];
@@ -2051,6 +2202,20 @@ export interface components {
         };
         /** @enum {string} */
         UploadState: "open" | "completing" | "completed" | "aborted" | "expired";
+        /** @description Immutable publication receipt for a reauthorized exact guarded result. */
+        GuardedCompletedReceipt: {
+            admissionKey: string;
+            uploadId: components["schemas"]["Uuid"];
+            /** Format: int64 */
+            size: number;
+            hash: components["schemas"]["FileHash"];
+            result: components["schemas"]["GuardedFileEntry"];
+        };
+        /** @description Guarded-only extension of the existing session DTO. */
+        GuardedUploadSession: {
+            /** @description Present only for a reauthorized exact result in the current incarnation. */
+            completedReceipt?: components["schemas"]["GuardedCompletedReceipt"];
+        } & components["schemas"]["UploadSession"];
         UploadSession: {
             id: components["schemas"]["Uuid"];
             parentId?: components["schemas"]["Uuid"];
@@ -2065,6 +2230,11 @@ export interface components {
             conflictPolicy: components["schemas"]["NameConflictPolicy"];
             /** Format: int64 */
             partSize: number;
+            /**
+             * @description Requires current-attempt completion proof and exact-body part replay.
+             * @enum {boolean}
+             */
+            requiresCompletionManifest: true;
             state: components["schemas"]["UploadState"];
             /** Format: date-time */
             expiresAt: string;
@@ -2081,6 +2251,79 @@ export interface components {
             uploadedBytes: number;
             /** Format: int64 */
             completedFiles: number;
+        };
+        /** @description Authorized guarded discovery response; the body is intentionally empty. */
+        GuardedUploadDiscovery: Record<string, never>;
+        /** @description Empty-slot intent: the admitted destination must stay empty through commit. */
+        GuardedSlotAbsent: {
+            /** @enum {string} */
+            kind: "absent";
+        };
+        /** @description Occupied-slot intent: exactly this file identity and generation are replaced. */
+        GuardedSlotVersion: {
+            /** @enum {string} */
+            kind: "version";
+            fileId: components["schemas"]["Uuid"];
+            /** @description Positive canonical int64 decimal file generation. */
+            generation: string;
+        };
+        GuardedSlotExpectation: components["schemas"]["GuardedSlotAbsent"] | components["schemas"]["GuardedSlotVersion"];
+        /**
+         * @description Immutable destination intent for a guarded upload.
+         *     A null mountRoot or parentId explicitly means the account root; omissions are invalid.
+         *     The leaf is the guarded create `name` and is never a path or rename request.
+         */
+        GuardedUploadDestination: {
+            mountRoot: (string & components["schemas"]["Uuid"]) | null;
+            parentId: (string & components["schemas"]["Uuid"]) | null;
+            expected: components["schemas"]["GuardedSlotExpectation"];
+        };
+        /**
+         * @description Guarded create body. The destination owns the parent slot, so the legacy
+         *     `parentId` and derived `conflictPolicy` are not accepted here.
+         */
+        GuardedUploadCreateRequest: {
+            destination: components["schemas"]["GuardedUploadDestination"];
+            name: string;
+            /**
+             * Format: int64
+             * @description Expected size in bytes, or -1 when the size is unknown until completion.
+             */
+            size: number;
+            mimeType?: string;
+            /** Format: date-time */
+            modTime: string;
+            hash?: components["schemas"]["FileHash"];
+            /** @default false */
+            encryption: boolean;
+            /**
+             * Format: int64
+             * @description Optional preferred part size, rounded upward to a 16 MiB multiple.
+             */
+            preferredPartSize?: number;
+        };
+        /** @enum {string} */
+        UploadPartState: "reserved" | "uploading" | "stored" | "failed";
+        UploadPart: {
+            uploadId: components["schemas"]["Uuid"];
+            /** Format: int32 */
+            partNo: number;
+            state: components["schemas"]["UploadPartState"];
+            /** Format: int64 */
+            plainSize: number;
+            /** Format: int64 */
+            storedSize?: number;
+            checksum?: components["schemas"]["Checksum"];
+            /** Format: date-time */
+            createdAt: string;
+            /** Format: date-time */
+            updatedAt: string;
+        };
+        /** @description Guarded completion always carries the exact plaintext size and BLAKE3 tree digest. */
+        GuardedUploadCompleteRequest: {
+            /** Format: int64 */
+            size: number;
+            hash: components["schemas"]["FileHash"];
         };
         /** @enum {string} */
         JobState: "available" | "cancelled" | "completed" | "discarded" | "pending" | "retryable" | "running" | "scheduled";
@@ -2179,26 +2422,15 @@ export interface components {
             conflictPolicy: components["schemas"]["NameConflictPolicy"];
             /**
              * Format: int64
-             * @description Optional preferred part size. The server may choose a different value.
+             * @description Optional preferred part size, rounded upward to a 16 MiB multiple.
              */
             preferredPartSize?: number;
         };
-        /** @enum {string} */
-        UploadPartState: "reserved" | "uploading" | "stored" | "failed";
-        UploadPart: {
-            uploadId: components["schemas"]["Uuid"];
-            /** Format: int32 */
-            partNo: number;
-            state: components["schemas"]["UploadPartState"];
+        /** @description Current-attempt plaintext EOF and optional whole-source tree hash. */
+        UploadCompleteRequest: {
             /** Format: int64 */
-            plainSize: number;
-            /** Format: int64 */
-            storedSize?: number;
-            checksum?: components["schemas"]["Checksum"];
-            /** Format: date-time */
-            createdAt: string;
-            /** Format: date-time */
-            updatedAt: string;
+            size: number;
+            hash?: components["schemas"]["FileHash"];
         };
         /** @enum {string} */
         SharePermission: "read" | "edit";
@@ -2519,6 +2751,8 @@ export interface components {
         "FileContentRequestOptions.ifNoneMatch": components["schemas"]["ETag"];
         /** @description Force a browser download instead of inline display. */
         "FileContentRequestOptions.download": "1";
+        /** @description Current recovery incarnation; a mismatch returns 412/upload_recovery_changed. */
+        RecoveryIncarnationHeader: components["schemas"]["Uuid"];
         "UploadPartHeaders.contentLength": number;
         /** @description BLAKE3 checksum of the plaintext part. */
         "UploadPartHeaders.checksum": components["schemas"]["Checksum"];
@@ -4035,6 +4269,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description The request conflicts with the current state of the server. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description Client error */
             422: {
                 headers: {
@@ -4452,6 +4695,8 @@ export interface operations {
                 after?: number;
                 /** @description Optional comma-separated event types to include. */
                 types?: string[];
+                /** @description Selects the strict ordered stream when set to "ordered"; absent keeps legacy. */
+                mode?: string;
             };
             header?: {
                 /** @description Resume after the last successfully processed event. */
@@ -4466,6 +4711,10 @@ export interface operations {
             200: {
                 headers: {
                     "Cache-Control": "no-cache, no-transform";
+                    /** @description Present only on confirmed ordered streams. */
+                    "X-TelDrive-Events"?: "ordered";
+                    /** @description Advertised ordered-stream heartbeat in positive decimal milliseconds. */
+                    "X-TelDrive-Heartbeat-Ms"?: number;
                     [name: string]: unknown;
                 };
                 content: {
@@ -4928,6 +5177,15 @@ export interface operations {
             };
             /** @description Access is unauthorized. */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Access is forbidden. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5827,8 +6085,26 @@ export interface operations {
                     "application/json": components["schemas"]["UploadSession"];
                 };
             };
+            /** @description The server could not understand the request due to invalid syntax. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description Access is unauthorized. */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Access is forbidden. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5923,6 +6199,497 @@ export interface operations {
             };
         };
     };
+    discoverGuardedUpload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The request has succeeded. */
+            200: {
+                headers: {
+                    "X-TelDrive-Recovery-Incarnation": components["schemas"]["Uuid"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GuardedUploadDiscovery"];
+                };
+            };
+            /** @description Access is unauthorized. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    createGuardedUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Stable UUID generated by the caller for safe request retries. */
+                "Idempotency-Key": components["parameters"]["IdempotencyHeader"];
+                /** @description Current recovery incarnation; a mismatch returns 412/upload_recovery_changed. */
+                "X-TelDrive-Recovery-Incarnation": components["parameters"]["RecoveryIncarnationHeader"];
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GuardedUploadCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description The request has succeeded and a new resource has been created as a result. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadSession"];
+                };
+            };
+            /** @description The server could not understand the request due to invalid syntax. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Access is unauthorized. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Access is forbidden. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The server cannot find the requested resource. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The request conflicts with the current state of the server. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Precondition failed. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Client error */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Client error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Client error */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    getGuardedUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current recovery incarnation; a mismatch returns 412/upload_recovery_changed. */
+                "X-TelDrive-Recovery-Incarnation": components["parameters"]["RecoveryIncarnationHeader"];
+            };
+            path: {
+                uploadId: components["schemas"]["Uuid"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The request has succeeded. */
+            200: {
+                headers: {
+                    "X-TelDrive-Recovery-Incarnation": components["schemas"]["Uuid"];
+                    /** @description Emitted only after a current guard or exact result check succeeded. */
+                    "X-TelDrive-Upload-Guard": "1";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GuardedUploadSession"];
+                };
+            };
+            /** @description Access is unauthorized. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Access is forbidden. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The server cannot find the requested resource. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The request conflicts with the current state of the server. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Client error */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Precondition failed. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Client error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    putGuardedUploadPart: {
+        parameters: {
+            query?: {
+                /** @description Store the part in this owned channel instead of the selected channel. */
+                channelId?: number;
+            };
+            header: {
+                "Content-Length": components["parameters"]["UploadPartHeaders.contentLength"];
+                /** @description BLAKE3 checksum of the plaintext part. */
+                "X-Part-Checksum"?: components["parameters"]["UploadPartHeaders.checksum"];
+                /** @description Current recovery incarnation; a mismatch returns 412/upload_recovery_changed. */
+                "X-TelDrive-Recovery-Incarnation": components["parameters"]["RecoveryIncarnationHeader"];
+            };
+            path: {
+                uploadId: components["schemas"]["Uuid"];
+                partNo: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description The request has succeeded. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadPart"];
+                };
+            };
+            /** @description The request has succeeded and a new resource has been created as a result. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadPart"];
+                };
+            };
+            /** @description The server could not understand the request due to invalid syntax. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Access is unauthorized. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Access is forbidden. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The server cannot find the requested resource. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The request conflicts with the current state of the server. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Client error */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Precondition failed. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Client error */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Client error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Client error */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Service unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
+    completeGuardedUpload: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Stable UUID generated by the caller for safe request retries. */
+                "Idempotency-Key": components["parameters"]["IdempotencyHeader"];
+                /** @description Current recovery incarnation; a mismatch returns 412/upload_recovery_changed. */
+                "X-TelDrive-Recovery-Incarnation": components["parameters"]["RecoveryIncarnationHeader"];
+            };
+            path: {
+                uploadId: components["schemas"]["Uuid"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GuardedUploadCompleteRequest"];
+            };
+        };
+        responses: {
+            /** @description The request has succeeded. */
+            200: {
+                headers: {
+                    Etag: components["schemas"]["ETag"];
+                    Location: components["schemas"]["Uri"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GuardedFileEntry"];
+                };
+            };
+            /** @description The request has succeeded and a new resource has been created as a result. */
+            201: {
+                headers: {
+                    Etag: components["schemas"]["ETag"];
+                    Location: components["schemas"]["Uri"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GuardedFileEntry"];
+                };
+            };
+            /** @description The server could not understand the request due to invalid syntax. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Access is unauthorized. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Access is forbidden. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The server cannot find the requested resource. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The request conflicts with the current state of the server. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Client error */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Precondition failed. */
+            412: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Client error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+        };
+    };
     createUploadImport: {
         parameters: {
             query?: never;
@@ -5956,6 +6723,33 @@ export interface operations {
             };
             /** @description Access is unauthorized. */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Access is forbidden. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The server cannot find the requested resource. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The request conflicts with the current state of the server. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6012,6 +6806,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description Access is forbidden. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description The server cannot find the requested resource. */
             404: {
                 headers: {
@@ -6021,8 +6824,26 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description The request conflicts with the current state of the server. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description Client error */
             410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Client error */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6114,6 +6935,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description Access is forbidden. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description The server cannot find the requested resource. */
             404: {
                 headers: {
@@ -6123,8 +6953,26 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description The request conflicts with the current state of the server. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description Client error */
             410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Client error */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6190,6 +7038,15 @@ export interface operations {
             };
             /** @description Access is unauthorized. */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Access is forbidden. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -6274,7 +7131,11 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UploadCompleteRequest"];
+            };
+        };
         responses: {
             /** @description The request has succeeded. */
             200: {
@@ -6298,8 +7159,26 @@ export interface operations {
                     "application/json": components["schemas"]["FileEntry"];
                 };
             };
+            /** @description The server could not understand the request due to invalid syntax. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description Access is unauthorized. */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description Access is forbidden. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7869,6 +8748,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description The request conflicts with the current state of the server. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description Client error */
             410: {
                 headers: {
@@ -7990,6 +8878,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["UploadSession"];
+                };
+            };
+            /** @description The server could not understand the request due to invalid syntax. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Access is unauthorized. */
@@ -8176,7 +9073,11 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UploadCompleteRequest"];
+            };
+        };
         responses: {
             /** @description The request has succeeded. */
             200: {
@@ -8198,6 +9099,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["FileEntry"];
+                };
+            };
+            /** @description The server could not understand the request due to invalid syntax. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
             /** @description Access is unauthorized. */
@@ -8297,6 +9207,15 @@ export interface operations {
             };
             /** @description The server cannot find the requested resource. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The request conflicts with the current state of the server. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -8838,6 +9757,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description Access is forbidden. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description The request conflicts with the current state of the server. */
             409: {
                 headers: {
@@ -8905,6 +9833,15 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description Access is forbidden. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
         };
     };
     updatePeriodicJob: {
@@ -8949,8 +9886,26 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description Access is forbidden. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description The server cannot find the requested resource. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The request conflicts with the current state of the server. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -8987,8 +9942,26 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description Access is forbidden. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description The server cannot find the requested resource. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The request conflicts with the current state of the server. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -9027,8 +10000,26 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description Access is forbidden. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description The server cannot find the requested resource. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The request conflicts with the current state of the server. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -9067,8 +10058,26 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
+            /** @description Access is forbidden. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
             /** @description The server cannot find the requested resource. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
+                };
+            };
+            /** @description The request conflicts with the current state of the server. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

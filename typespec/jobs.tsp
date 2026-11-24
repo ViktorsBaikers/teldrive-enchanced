@@ -257,6 +257,9 @@ namespace Jobs {
 @tag("Periodic Jobs")
 @route("/v1/periodic-jobs")
 @useAuth(TelDriveAuth)
+/** The receipt_cleanup_sweep definition is system-owned. Full reset restores
+ * ordinary defaults atomically and preserves enabled receipt discovery.
+ */
 namespace PeriodicJobs {
   @get
   @operationId("listPeriodicJobs")
@@ -268,6 +271,7 @@ namespace PeriodicJobs {
     | JsonResponse<201, PeriodicJob>
     | ErrorResponse<400>
     | ErrorResponse<401>
+    | ErrorResponse<403>
     | ErrorResponse<409>;
 
   @get
@@ -278,7 +282,7 @@ namespace PeriodicJobs {
   @post
   @route("/reset")
   @operationId("resetPeriodicJobs")
-  op reset(): JsonResponse<200, PeriodicJobList> | ErrorResponse<401>;
+  op reset(): JsonResponse<200, PeriodicJobList> | ErrorResponse<401> | ErrorResponse<403>;
 
   @put
   @route("/{periodicJobId}")
@@ -287,7 +291,9 @@ namespace PeriodicJobs {
     | JsonResponse<200, PeriodicJob>
     | ErrorResponse<400>
     | ErrorResponse<401>
-    | ErrorResponse<404>;
+    | ErrorResponse<403>
+    | ErrorResponse<404>
+    | ErrorResponse<409>;
 
   @delete
   @route("/{periodicJobId}")
@@ -295,7 +301,9 @@ namespace PeriodicJobs {
   op delete(@path periodicJobId: string):
     | EmptyResponse<204>
     | ErrorResponse<401>
-    | ErrorResponse<404>;
+    | ErrorResponse<403>
+    | ErrorResponse<404>
+    | ErrorResponse<409>;
 
   @post
   @route("/{periodicJobId}/pause")
@@ -303,7 +311,9 @@ namespace PeriodicJobs {
   op pause(@path periodicJobId: string):
     | JsonResponse<200, PeriodicJob>
     | ErrorResponse<401>
-    | ErrorResponse<404>;
+    | ErrorResponse<403>
+    | ErrorResponse<404>
+    | ErrorResponse<409>;
 
   @post
   @route("/{periodicJobId}/resume")
@@ -311,5 +321,7 @@ namespace PeriodicJobs {
   op resume(@path periodicJobId: string):
     | JsonResponse<200, PeriodicJob>
     | ErrorResponse<401>
-    | ErrorResponse<404>;
+    | ErrorResponse<403>
+    | ErrorResponse<404>
+    | ErrorResponse<409>;
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/tgdrive/teldrive/v2/internal/catalog"
 	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
 	"github.com/tgdrive/teldrive/v2/internal/dbtypes"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 	testpostgres "github.com/tgdrive/teldrive/v2/internal/testutil/postgres"
 	"github.com/tgdrive/teldrive/v2/internal/testutil/querytrace"
 )
@@ -132,7 +133,7 @@ FROM generate_series(1, 500) AS value`); err != nil {
 	if len(moved) != len(fileIDs) {
 		t.Fatalf("moved files = %d, want %d", len(moved), len(fileIDs))
 	}
-	for _, name := range []string{"LockActiveFiles", "ListFileAncestorIDs", "LockActiveDestinationEntries", "MoveFilesWithNames"} {
+	for _, name := range []string{"ListActiveFilesForLifecycle", "ListFileAncestorIDs", "ListActiveDestinationEntries", "MoveFilesWithNames"} {
 		if got := tracer.Count(name); got != 1 {
 			t.Fatalf("%s queries = %d, want 1", name, got)
 		}
@@ -194,6 +195,7 @@ func TestCatalogLifecycleAgainstRealPostgres(t *testing.T) {
 	seedUser(t, db.Pool, 2002)
 
 	svc := catalog.NewService(db.Pool, nil)
+	bindCatalogMutationFixture(t, db.Pool, svc)
 	docs, err := svc.CreateFolder(ctx, catalog.CreateFolderInput{UserID: 1001, Name: "Docs"})
 	if err != nil {
 		t.Fatalf("create root folder: %v", err)
@@ -282,6 +284,7 @@ func TestTrashRootListingIncludesNestedDeletedItems(t *testing.T) {
 	ctx := context.Background()
 	seedUser(t, db.Pool, 1001)
 	svc := catalog.NewService(db.Pool, nil)
+	bindCatalogMutationFixture(t, db.Pool, svc)
 
 	activeFolder, err := svc.CreateFolder(ctx, catalog.CreateFolderInput{UserID: 1001, Name: "Active"})
 	if err != nil {
@@ -327,6 +330,7 @@ func TestAdvancedListingBulkOperationsAndStatistics(t *testing.T) {
 	ctx := context.Background()
 	seedUser(t, db.Pool, 1001)
 	svc := catalog.NewService(db.Pool, nil)
+	bindCatalogMutationFixture(t, db.Pool, svc)
 
 	docs, err := svc.CreateFolder(ctx, catalog.CreateFolderInput{UserID: 1001, Name: "Docs"})
 	if err != nil {
@@ -413,8 +417,8 @@ func TestCatalogRejectsInvalidParent(t *testing.T) {
 	seedUser(t, db.Pool, 1001)
 	svc := catalog.NewService(db.Pool, nil)
 	missing := uuid.New()
-	if _, err := svc.CreateFolder(ctx, catalog.CreateFolderInput{UserID: 1001, ParentID: &missing, Name: "child"}); !errors.Is(err, catalog.ErrInvalidParent) {
-		t.Fatalf("invalid parent error = %v", err)
+	if _, err := svc.CreateFolder(ctx, catalog.CreateFolderInput{UserID: 1001, ParentID: &missing, Name: "child"}); !errors.Is(err, catalog.ErrParentUnavailable) {
+		t.Fatalf("invalid parent error = %v, want ErrParentUnavailable", err)
 	}
 }
 
@@ -446,4 +450,18 @@ INSERT INTO files (
 		t.Fatalf("seed file: %v", err)
 	}
 	return id
+}
+
+func bindCatalogMutationFixture(t testing.TB, pool *pgxpool.Pool, service *catalog.Service) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), "CREATE TABLE IF NOT EXISTS hierarchy_jobs(id bigint GENERATED ALWAYS AS IDENTITY,user_id bigint)"); err != nil {
+		t.Fatal(err)
+	}
+	policy := lifecycle.NewService(pool, nil)
+	if err := policy.BindReceiptEnqueuer(&hierarchyQueue{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.BindLifecycle(policy); err != nil {
+		t.Fatal(err)
+	}
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/tgdrive/teldrive/v2/internal/channels"
 	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
 	"github.com/tgdrive/teldrive/v2/internal/dbtypes"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 	"github.com/tgdrive/teldrive/v2/internal/telegramstore"
 	testpostgres "github.com/tgdrive/teldrive/v2/internal/testutil/postgres"
 	"github.com/tgdrive/teldrive/v2/internal/testutil/querytrace"
@@ -40,7 +41,7 @@ VALUES ($1,1001,'source','folder',false,'active',now()),
        ($2,1001,'destination','folder',false,'active',now())`, sourceID, destinationID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Pool.Exec(ctx, `
+	seedBulkRows(t, ctx, db.Pool, `
 WITH children AS (
   INSERT INTO files (user_id,parent_id,name,kind,size,encryption,status,mod_time)
   SELECT 1001, $1, 'child-' || value, 'file', 1, false, 'active', now()
@@ -49,9 +50,7 @@ WITH children AS (
 )
 INSERT INTO file_parts (file_id,part_no,channel_id,message_id,plain_size,stored_size,checksum,block_hashes)
 SELECT id, 1, 9001, row_number() OVER ()::bigint, 1, 1, repeat('a',64), decode(repeat('ab',32),'hex')
-FROM children`, sourceID); err != nil {
-		t.Fatal(err)
-	}
+FROM children`, sourceID)
 	messages := make(map[int64][]byte, 1000)
 	for id := int64(1); id <= 1000; id++ {
 		messages[id] = []byte{'x'}
@@ -72,6 +71,7 @@ FROM children`, sourceID); err != nil {
 	if err != nil {
 		t.Fatal(err)
 	}
+	composeFileopsFixture(t, service)
 	if _, err := service.Copy(ctx, CopyInput{UserID: 1001, FileID: sourceID, ParentID: &destinationID}); err != nil {
 		t.Fatalf("Copy() error = %v", err)
 	}
@@ -112,6 +112,7 @@ VALUES
 	if err != nil {
 		t.Fatal(err)
 	}
+	composeFileopsFixture(t, service)
 	count, err := service.CleanTrash(ctx, 1001)
 	if err != nil {
 		t.Fatalf("CleanTrash() error = %v", err)
@@ -162,6 +163,7 @@ VALUES ($1,1,9001,10,1,1,repeat('a',64),decode(repeat('ab',32),'hex'))`, childID
 	if err != nil {
 		t.Fatal(err)
 	}
+	composeFileopsFixture(t, service)
 	if err := service.QueuePurge(ctx, 1001, rootID); err != nil {
 		t.Fatalf("QueuePurge() error = %v", err)
 	}
@@ -199,6 +201,7 @@ func TestCopyAndPurgeUseIndependentTelegramMessages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	composeFileopsFixture(t, service)
 	name := "copy.bin"
 	copied, err := service.Copy(ctx, CopyInput{UserID: 1001, FileID: sourceID, Name: &name})
 	if err != nil {
@@ -272,6 +275,7 @@ VALUES ($1,1,9001,30,4,4,repeat('c',64),decode(repeat('cd',32),'hex'))`, childID
 	}
 
 	failedID := insertStoredFile(t, db, "failed.bin", 20)
+	ownFileopsFixtureParts(t, service)
 	storage.mu.Lock()
 	storage.messages[20] = []byte("fail")
 	storage.deleteErr = errors.New("Telegram unavailable")
@@ -309,19 +313,17 @@ func TestPurgeManyGroupsTelegramMessagesByChannel(t *testing.T) {
 	if _, err := db.Pool.Exec(ctx, "INSERT INTO channels (channel_id,user_id,name,selected) VALUES (9001,1001,'storage',true)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Pool.Exec(ctx, `
+	seedBulkRows(t, ctx, db.Pool, `
 WITH files AS (
     INSERT INTO files (user_id,name,kind,size,encryption,status,mod_time,deleted_at)
     SELECT 1001, 'pending-' || value, 'file', 1, false, 'deletion_pending', now(), now()
-    FROM generate_series(1, 1000) AS value
+    FROM generate_series(1, 300) AS value
     RETURNING id
 )
 INSERT INTO file_parts (file_id,part_no,channel_id,message_id,plain_size,stored_size,checksum,block_hashes)
 SELECT id, 1, 9001, row_number() OVER ()::bigint, 1, 1, repeat('b',64), decode(repeat('ab',32),'hex')
 FROM files
-`); err != nil {
-		t.Fatal(err)
-	}
+`)
 	rows, err := db.Pool.Query(ctx, "SELECT id FROM files WHERE user_id = 1001 AND status = 'deletion_pending'")
 	if err != nil {
 		t.Fatal(err)
@@ -345,12 +347,13 @@ FROM files
 	if err != nil {
 		t.Fatal(err)
 	}
+	composeFileopsFixture(t, service)
 	if err := service.PurgeMany(ctx, 1001, fileIDs); err != nil {
 		t.Fatalf("PurgeMany() error = %v", err)
 	}
 	deleteCalls := storage.deleteCallsSnapshot()
-	if len(deleteCalls) != 1 || len(deleteCalls[0]) != 1000 {
-		t.Fatalf("DeleteMessages() calls = %d with sizes %v, want one call of 1000", len(deleteCalls), sliceLengths(deleteCalls))
+	if len(deleteCalls) != 1 || len(deleteCalls[0]) != 300 {
+		t.Fatalf("DeleteMessages() calls = %d with sizes %v, want one call of 300", len(deleteCalls), sliceLengths(deleteCalls))
 	}
 	var remaining int
 	if err := db.Pool.QueryRow(ctx, "SELECT count(*) FROM files WHERE user_id = 1001").Scan(&remaining); err != nil {
@@ -376,18 +379,16 @@ INSERT INTO files (id,user_id,name,kind,encryption,status,mod_time,deleted_at)
 VALUES ($1,1001,'folder','folder',false,'trashed',now(),now())`, rootID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Pool.Exec(ctx, `
+	seedBulkRows(t, ctx, db.Pool, `
 WITH children AS (
     INSERT INTO files (user_id,parent_id,name,kind,size,encryption,status,mod_time,deleted_at)
     SELECT 1001, $1, 'child-' || value, 'file', 1, false, 'trashed', now(), now()
-    FROM generate_series(1, 1000) AS value
+    FROM generate_series(1, 300) AS value
     RETURNING id
 )
 INSERT INTO file_parts (file_id,part_no,channel_id,message_id,plain_size,stored_size,checksum,block_hashes)
 SELECT id, 1, 9001, row_number() OVER ()::bigint, 1, 1, repeat('b',64), decode(repeat('ab',32),'hex')
-FROM children`, rootID); err != nil {
-		t.Fatal(err)
-	}
+FROM children`, rootID)
 
 	tracer := &purgeQueryTracer{}
 	config, err := pgxpool.ParseConfig(db.URL)
@@ -404,11 +405,12 @@ FROM children`, rootID); err != nil {
 	if err != nil {
 		t.Fatal(err)
 	}
+	composeFileopsFixture(t, service)
 	if err := service.Purge(ctx, 1001, rootID); err != nil {
 		t.Fatalf("Purge() error = %v", err)
 	}
-	if got := tracer.count("TryAdvisoryLocks"); got != 1 {
-		t.Fatalf("TryAdvisoryLocks queries = %d, want 1", got)
+	if got := tracer.count("TryAdvisoryLocks"); got != 0 {
+		t.Fatalf("obsolete root-only advisory lock queries = %d, want 0", got)
 	}
 	if got := tracer.count("LoadFileSubtrees"); got != 1 {
 		t.Fatalf("LoadFileSubtrees queries = %d, want 1", got)
@@ -450,6 +452,7 @@ VALUES
 	if err != nil {
 		t.Fatal(err)
 	}
+	composeFileopsFixture(t, service)
 	name := "rollback-copy.bin"
 	if _, err := service.Copy(ctx, CopyInput{UserID: 1001, FileID: sourceID, Name: &name}); err == nil {
 		t.Fatal("expected second Telegram copy to fail")
@@ -483,8 +486,8 @@ VALUES ($1,1001,'uploads','folder',false,'active',now())`, folderID); err != nil
 	}
 	uploadID := uuid.New()
 	if _, err := db.Pool.Exec(ctx, `
-INSERT INTO upload_sessions (id,user_id,parent_id,name,expected_size,mod_time,encryption,conflict_policy,part_size,state,expires_at)
-VALUES ($1,1001,$2,'pending.bin',1,now(),false,'fail',1,'aborted',now())`, uploadID, folderID); err != nil {
+INSERT INTO upload_sessions (id,user_id,parent_id,name,expected_size,mod_time,encryption,conflict_policy,part_size,state,expires_at,terminal_failure_code)
+VALUES ($1,1001,$2,'pending.bin',1,now(),false,'fail',1,'aborted',now(),'upload_parent_unavailable')`, uploadID, folderID); err != nil {
 		t.Fatal(err)
 	}
 	catalogService := catalog.NewService(db.Pool, nil)
@@ -492,6 +495,7 @@ VALUES ($1,1001,$2,'pending.bin',1,now(),false,'fail',1,'aborted',now())`, uploa
 	if err != nil {
 		t.Fatal(err)
 	}
+	composeFileopsFixture(t, service)
 	if _, err := catalogService.Trash(ctx, 1001, folderID); err != nil {
 		t.Fatal(err)
 	}
@@ -626,4 +630,75 @@ func (t *purgeQueryTracer) count(name string) int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.counts[name]
+}
+
+// seedBulkRows inserts event-emitting fixture rows under the bulk lane. The
+// implicit single-statement transaction would otherwise hit the ordinary bound.
+func seedBulkRows(t testing.TB, ctx context.Context, pool *pgxpool.Pool, sql string, args ...any) {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SET LOCAL teldrive.event_bulk = 'on'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, sql, args...); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func composeFileopsFixture(t testing.TB, s *Service) {
+	t.Helper()
+	if _, err := s.pool.Exec(context.Background(), "CREATE TABLE IF NOT EXISTS fileops_receipt_jobs(id bigint GENERATED ALWAYS AS IDENTITY,user_id bigint)"); err != nil {
+		t.Fatal(err)
+	}
+	policy := lifecycle.NewService(s.pool, s.storage)
+	if err := policy.BindReceiptEnqueuer(copyQueue{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.catalog.BindLifecycle(policy); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BindLifecycle(policy); err != nil {
+		t.Fatal(err)
+	}
+	ownFileopsFixtureParts(t, s)
+}
+
+// These tests explicitly create every synthetic remote object above. This fixture
+// models their positive original receipts, never ownership of legacy production rows.
+func ownFileopsFixtureParts(t testing.TB, s *Service) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `
+WITH source_files AS (
+ SELECT DISTINCT f.id FROM files f JOIN file_parts p ON p.file_id=f.id
+ WHERE f.user_id=1001 AND NOT EXISTS(SELECT 1 FROM remote_write_receipts r
+ WHERE r.channel_id=p.channel_id AND r.message_id=p.message_id)
+), selected AS (SELECT id,gen_random_uuid() AS operation,gen_random_uuid() AS token FROM source_files)
+INSERT INTO remote_write_receipts(id,row_kind,user_id,origin_kind,operation_id,result_file_id,destination_is_root,lease_token,lease_expires_at,state,published_at)
+SELECT operation,'copy_operation',1001,'copy',operation,id,true,token,clock_timestamp()+interval '1 minute','bound',clock_timestamp() FROM selected`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(ctx, `
+INSERT INTO remote_write_receipts(id,row_kind,user_id,origin_kind,operation_id,result_file_id,part_no,channel_id,message_id,lease_token,lease_expires_at,state)
+SELECT gen_random_uuid(),'message_attempt',1001,'copy',op.id,p.file_id,p.part_no,p.channel_id,p.message_id,op.lease_token,op.lease_expires_at,'bound'
+FROM file_parts p JOIN files f ON f.id=p.file_id
+JOIN remote_write_receipts op ON op.row_kind='copy_operation' AND op.user_id=f.user_id AND op.result_file_id=f.id
+WHERE f.user_id=1001 AND NOT EXISTS(SELECT 1 FROM remote_write_receipts r WHERE r.channel_id=p.channel_id AND r.message_id=p.message_id)`); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
 }

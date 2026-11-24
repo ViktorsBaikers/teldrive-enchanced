@@ -16,14 +16,15 @@ function unitFormatter(
   locale: string,
   unit: (typeof BYTE_UNITS)[number],
   fractions: number,
+  display: "short" | "narrow" = "short",
 ): Intl.NumberFormat {
-  const key = `${locale}|${unit}|${fractions}`;
+  const key = `${locale}|${unit}|${fractions}|${display}`;
   const cached = unitCache.get(key);
   if (cached) return cached;
   const formatter = new Intl.NumberFormat(locale, {
     style: "unit",
     unit,
-    unitDisplay: "short",
+    unitDisplay: display,
     minimumFractionDigits: fractions,
     maximumFractionDigits: fractions,
   });
@@ -31,13 +32,20 @@ function unitFormatter(
   return formatter;
 }
 
+function byteLabel(locale: string, value: number): string {
+  return normalizeSpace(unitFormatter(locale, "byte", 0, "narrow").format(value)).replace(
+    /(\d)(\p{L})/u,
+    "$1 $2",
+  );
+}
+
 export function formatBytesWithLocale(locale: string, bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) {
-    return normalizeSpace(unitFormatter(locale, "byte", 0).format(0));
+    return byteLabel(locale, 0);
   }
   const power = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), BYTE_UNITS.length - 1);
   const value = bytes / 1024 ** power;
-  if (power === 0) return normalizeSpace(unitFormatter(locale, "byte", 0).format(value));
+  if (power === 0) return byteLabel(locale, value);
   const rounded = Math.round(value * 10) / 10;
   return normalizeSpace(unitFormatter(locale, BYTE_UNITS[power], 1).format(rounded));
 }

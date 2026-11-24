@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -133,6 +134,13 @@ func (h *prettyHandler) appendAttr(line *strings.Builder, groups []string, attr 
 	line.WriteString(formatSlogValue(attr.Value))
 }
 
+func quoteSlogText(text string) string {
+	if strings.ContainsAny(text, "\n\r\t=\"") || strings.TrimSpace(text) != text {
+		return strconv.Quote(text)
+	}
+	return text
+}
+
 func prettyLevel(level slog.Level) (icon, text, color string) {
 	switch {
 	case level <= slog.LevelDebug:
@@ -151,7 +159,7 @@ func prettyLevel(level slog.Level) (icon, text, color string) {
 func formatSlogValue(value slog.Value) string {
 	switch value.Kind() {
 	case slog.KindString:
-		return value.String()
+		return quoteSlogText(value.String())
 	case slog.KindBool:
 		return fmt.Sprintf("%t", value.Bool())
 	case slog.KindInt64:

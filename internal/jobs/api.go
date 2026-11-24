@@ -6,17 +6,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/riverqueue/river"
-	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/rivertype"
+
+	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
+	"github.com/tgdrive/teldrive/v2/internal/dbtypes"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 )
 
 var ErrInvalidCursor = errors.New("invalid job cursor")
+var ErrReceiptRetryUnavailable = errors.New("receipt cleanup retry is unavailable")
 
 type JobError struct {
 	Attempt int
@@ -99,6 +105,8 @@ func (r *Runtime) List(ctx context.Context, input ListInput) ([]Job, string, err
 	if input.UserID > 0 {
 		params = params.Where("COALESCE(args->>'user_id', metadata->>'user_id') = @user_id", river.NamedArgs{"user_id": strconv.FormatInt(input.UserID, 10)})
 	}
+	// Only the immutable first owner ID represents receipt work in job views.
+	params = params.Where("kind <> @receipt_kind", river.NamedArgs{"receipt_kind": ReceiptCleanupKind})
 	if beforeID > 0 {
 		params = params.Where("id < @before_id", river.NamedArgs{"before_id": beforeID})
 	}
@@ -120,6 +128,34 @@ func (r *Runtime) List(ctx context.Context, input ListInput) ([]Job, string, err
 	for _, row := range result.Jobs {
 		items = append(items, jobFromRiver(row))
 	}
+	if input.UserID > 0 && (input.Kind == "" || input.Kind == ReceiptCleanupKind) && (input.Queue == "" || input.Queue == CleanupQueue) {
+		before := pgtype.Int8{}
+		if beforeID > 0 {
+			before = dbtypes.Int8(beforeID)
+		}
+		state := pgtype.Text{}
+		if input.State != "" {
+			state = dbtypes.Text(input.State)
+		}
+		reports, err := r.policy.ListReceiptJobReports(ctx, sqlcgen.ListReceiptJobReportsParams{
+			UserID: input.UserID, BeforeJobID: before, State: state, PageSize: input.Limit + 1,
+		})
+		if err != nil {
+			return nil, "", fmt.Errorf("list durable receipt reports: %w", err)
+		}
+		for _, report := range reports {
+			items = append(items, jobFromReceiptReport(sqlcgen.GetReceiptJobReportRow(*report)))
+		}
+		slices.SortFunc(items, func(a, b Job) int {
+			if a.ID > b.ID {
+				return -1
+			}
+			if a.ID < b.ID {
+				return 1
+			}
+			return 0
+		})
+	}
 	var next string
 	if len(items) > int(input.Limit) {
 		items = items[:input.Limit]
@@ -131,6 +167,16 @@ func (r *Runtime) List(ctx context.Context, input ListInput) ([]Job, string, err
 func (r *Runtime) GetForUser(ctx context.Context, id, userID int64) (Job, error) {
 	if userID <= 0 {
 		return Job{}, river.ErrNotFound
+	}
+	if r == nil || r.policy == nil {
+		return Job{}, ErrRuntimeNotConfigured
+	}
+	report, err := r.policy.GetReceiptJobReport(ctx, userID, id)
+	if err == nil {
+		return jobFromReceiptReport(*report), nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return Job{}, fmt.Errorf("get durable receipt report: %w", err)
 	}
 	item, err := r.Get(ctx, id)
 	if err != nil {
@@ -165,65 +211,63 @@ func (r *Runtime) DeleteForUser(ctx context.Context, id, userID int64) error {
 }
 
 func (r *Runtime) StatisticsForUser(ctx context.Context, userID int64) (Statistics, error) {
-	if r == nil || r.pool == nil || userID <= 0 {
+	if userID <= 0 {
+		return Statistics{}, ErrRuntimeNotConfigured
+	}
+	return r.jobStatistics(ctx, &userID)
+}
+
+func (r *Runtime) Statistics(ctx context.Context) (Statistics, error) {
+	return r.jobStatistics(ctx, nil)
+}
+
+func (r *Runtime) jobStatistics(ctx context.Context, userID *int64) (Statistics, error) {
+	if r == nil || r.pool == nil {
 		return Statistics{}, ErrRuntimeNotConfigured
 	}
 	jobTable := pgx.Identifier{r.schema, "river_job"}.Sanitize()
-	rows, err := r.pool.Query(ctx, "SELECT state::text, count(*) FROM "+jobTable+" WHERE COALESCE(args->>'user_id', metadata->>'user_id') = $1 GROUP BY state", strconv.FormatInt(userID, 10))
+	receiptTable := pgx.Identifier{r.schema, "remote_write_receipts"}.Sanitize()
+	rows, err := r.pool.Query(ctx, `WITH states AS (
+ SELECT state::text AS state FROM `+jobTable+`
+ WHERE kind<>$2 AND ($1::bigint IS NULL OR COALESCE(args->>'user_id',metadata->>'user_id')=$1::text)
+ UNION ALL
+ SELECT CASE WHEN bool_and(state='deleted') THEN 'completed'
+   WHEN bool_or(state IN ('unresolved','exhausted')) THEN 'discarded'
+   WHEN bool_or(attempts>0) THEN 'retryable' ELSE 'pending' END
+ FROM `+receiptTable+` WHERE job_id IS NOT NULL AND ($1::bigint IS NULL OR user_id=$1::bigint)
+ GROUP BY user_id,job_id
+) SELECT state,count(*) FROM states GROUP BY state`, dbtypes.OptionalInt8(userID), ReceiptCleanupKind)
 	if err != nil {
-		return Statistics{}, fmt.Errorf("job statistics for user: %w", err)
+		return Statistics{}, fmt.Errorf("job statistics: %w", err)
 	}
 	defer rows.Close()
 	var stats Statistics
 	for rows.Next() {
 		var state string
 		var count int64
-		if err := rows.Scan(&state, &count); err != nil {
-			return Statistics{}, fmt.Errorf("scan job statistics for user: %w", err)
+		if err = rows.Scan(&state, &count); err != nil {
+			return Statistics{}, err
 		}
-		switch rivertype.JobState(state) {
-		case rivertype.JobStateAvailable:
+		switch state {
+		case "available":
 			stats.Available = count
-		case rivertype.JobStateCancelled:
+		case "cancelled":
 			stats.Cancelled = count
-		case rivertype.JobStateCompleted:
+		case "completed":
 			stats.Completed = count
-		case rivertype.JobStateDiscarded:
+		case "discarded":
 			stats.Discarded = count
-		case rivertype.JobStatePending:
+		case "pending":
 			stats.Pending = count
-		case rivertype.JobStateRetryable:
+		case "retryable":
 			stats.Retryable = count
-		case rivertype.JobStateRunning:
+		case "running":
 			stats.Running = count
-		case rivertype.JobStateScheduled:
+		case "scheduled":
 			stats.Scheduled = count
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return Statistics{}, fmt.Errorf("iterate job statistics for user: %w", err)
-	}
-	return stats, nil
-}
-
-func (r *Runtime) Statistics(ctx context.Context) (Statistics, error) {
-	if r == nil || r.client == nil {
-		return Statistics{}, ErrRuntimeNotConfigured
-	}
-	counts, err := r.client.Driver().GetExecutor().JobCountByAllStates(ctx, &riverdriver.JobCountByAllStatesParams{Schema: r.schema})
-	if err != nil {
-		return Statistics{}, fmt.Errorf("job statistics: %w", err)
-	}
-	return Statistics{
-		Available: int64(counts[rivertype.JobStateAvailable]),
-		Cancelled: int64(counts[rivertype.JobStateCancelled]),
-		Completed: int64(counts[rivertype.JobStateCompleted]),
-		Discarded: int64(counts[rivertype.JobStateDiscarded]),
-		Pending:   int64(counts[rivertype.JobStatePending]),
-		Retryable: int64(counts[rivertype.JobStateRetryable]),
-		Running:   int64(counts[rivertype.JobStateRunning]),
-		Scheduled: int64(counts[rivertype.JobStateScheduled]),
-	}, nil
+	return stats, rows.Err()
 }
 
 func (r *Runtime) Cancel(ctx context.Context, id int64) (Job, error) {
@@ -244,6 +288,16 @@ func (r *Runtime) Retry(ctx context.Context, id int64) (Job, error) {
 	var row *rivertype.JobRow
 	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
 		var err error
+		var ownerID int64
+		receiptTable := pgx.Identifier{r.schema, "remote_write_receipts"}.Sanitize()
+		err = tx.QueryRow(ctx, "SELECT user_id FROM "+receiptTable+" WHERE job_id=$1 OR wakeup_job_id=$1 ORDER BY id LIMIT 1", id).Scan(&ownerID)
+		if err == nil {
+			if err = lifecycleReceiptRetryTx(ctx, tx, r.schema, ownerID, id); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
 		row, err = r.client.JobRetryTx(ctx, tx, id)
 		if err != nil || row.State == rivertype.JobStateRunning {
 			return err
@@ -311,4 +365,49 @@ func decodeCursor(cursor string) (int64, error) {
 		return 0, ErrInvalidCursor
 	}
 	return id, nil
+}
+
+func lifecycleReceiptRetryTx(ctx context.Context, tx pgx.Tx, schema string, ownerID, id int64) error {
+	// Serialize retry admission with every lifetime claim before River changes.
+	if err := lifecycle.LockOwnerTx(ctx, tx, ownerID); err != nil {
+		return err
+	}
+	var unavailable bool
+	table := pgx.Identifier{schema, "remote_write_receipts"}.Sanitize()
+	if err := tx.QueryRow(ctx, "SELECT COALESCE(bool_or(state IN ('unresolved','exhausted') OR attempts>=4),false) FROM "+table+" WHERE user_id=$1 AND (job_id=$2 OR wakeup_job_id=$2)", ownerID, id).Scan(&unavailable); err != nil {
+		return err
+	}
+	if unavailable {
+		return ErrReceiptRetryUnavailable
+	}
+	return nil
+}
+
+func jobFromReceiptReport(report sqlcgen.GetReceiptJobReportRow) Job {
+	output := struct {
+		Receipts    int64  `json:"receipts"`
+		Attempts    int32  `json:"attempts"`
+		PrimaryCode string `json:"primaryCode,omitempty"`
+		CleanupCode string `json:"cleanupCode,omitempty"`
+	}{Receipts: report.ReceiptCount, Attempts: report.Attempts, PrimaryCode: report.PrimaryCode, CleanupCode: report.CleanupCode}
+	encoded, _ := json.Marshal(output)
+	item := Job{ID: report.JobID, State: report.State, Kind: ReceiptCleanupKind, Queue: CleanupQueue,
+		Attempt: int(report.Attempts), MaxAttempts: 4, Priority: 2, CreatedAt: report.CreatedAt.Time,
+		ScheduledAt: report.UpdatedAt.Time, Args: rawArgs(struct {
+			UserID int64 `json:"user_id"`
+		}{report.UserID}),
+		Metadata: map[string]json.RawMessage{}, Output: encoded, Errors: []JobError{}, Tags: []string{}, AttemptedBy: []string{}}
+	if report.State == "completed" || report.State == "discarded" {
+		at := report.UpdatedAt.Time
+		item.FinalizedAt = &at
+	}
+	if report.RetryUnavailable {
+		code := output.CleanupCode
+		if code == "" {
+			code = "remote_outcome_unknown"
+		}
+		item.LastError = code
+		item.Errors = append(item.Errors, JobError{Attempt: item.Attempt, At: report.UpdatedAt.Time, Error: code})
+	}
+	return item
 }

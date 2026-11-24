@@ -284,27 +284,35 @@ func TestGeneratedServerEventStreamReplayTicketAndShutdown(t *testing.T) {
 
 func openEventStream(t *testing.T, endpoint string, headers map[string]string) (*http.Response, context.CancelFunc) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		cancel()
-		t.Fatal(err)
-	}
-	for name, value := range headers {
-		request.Header.Set(name, value)
-	}
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		cancel()
-		t.Fatalf("open event stream: %v", err)
-	}
-	if response.StatusCode != http.StatusOK {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		for name, value := range headers {
+			request.Header.Set(name, value)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			cancel()
+			t.Fatalf("open event stream: %v", err)
+		}
+		if response.StatusCode == http.StatusOK {
+			return response, cancel
+		}
 		body, _ := io.ReadAll(response.Body)
 		_ = response.Body.Close()
 		cancel()
+		// A just-closed predecessor may still be unsubscribing; retry briefly.
+		if response.StatusCode == http.StatusTooManyRequests && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
 		t.Fatalf("event stream status = %d, body = %s", response.StatusCode, body)
 	}
-	return response, cancel
 }
 
 func readEventFrame(t *testing.T, reader *bufio.Reader, eventName string) map[string]string {

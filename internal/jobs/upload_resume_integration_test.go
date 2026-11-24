@@ -13,6 +13,7 @@ import (
 	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
 	testpostgres "github.com/tgdrive/teldrive/v2/internal/testutil/postgres"
 	"github.com/tgdrive/teldrive/v2/internal/testutil/querytrace"
+	"github.com/tgdrive/teldrive/v2/internal/treehash"
 	"github.com/tgdrive/teldrive/v2/internal/uploads"
 )
 
@@ -35,12 +36,15 @@ FROM generate_series(1,500) AS value`); err != nil {
 	modTime := time.Now().UTC().Truncate(time.Second)
 	if _, err := db.Pool.Exec(ctx, `
 INSERT INTO upload_sessions (id,user_id,name,expected_size,mime_type,mod_time,encryption,conflict_policy,part_size,expires_at)
-VALUES ($1,1001,'target.bin',10,'application/octet-stream',$2,false,'replace',10,now() + interval '1 day')`, matchingID, modTime); err != nil {
+VALUES ($1,1001,'target.bin',10,'application/octet-stream',$2,false,'replace',16777216,now() + interval '1 day')`, matchingID, modTime); err != nil {
 		t.Fatal(err)
 	}
+	hasher := treehash.NewBlockHasher()
+	_, _ = hasher.Write([]byte("0123456789"))
+	blocks := hasher.Sum()
 	if _, err := db.Pool.Exec(ctx, `
-INSERT INTO upload_parts (upload_id,part_no,channel_id,message_id,plain_size,stored_size,state)
-VALUES ($1,1,9001,77,10,10,'stored')`, matchingID); err != nil {
+INSERT INTO upload_parts (upload_id,part_no,channel_id,message_id,plain_size,stored_size,state,checksum,block_hashes)
+VALUES ($1,1,9001,77,10,10,'stored',$2,$3)`, matchingID, treehash.SumToHex(treehash.ComputeTreeHash(blocks)), blocks); err != nil {
 		t.Fatal(err)
 	}
 

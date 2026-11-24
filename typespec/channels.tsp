@@ -77,7 +77,7 @@ namespace Channels {
     | JsonResponse<200, CursorPage<ChannelSummary>>
     | ErrorResponse<401>;
 
-  /** List broadcast channels where the authenticated user can add administrators. Groups are excluded. */
+  /** List manageable broadcast channels, excluding known closing/deleted physical channels. Discovery is only a hint. */
   @get
   @route("/discover")
   @operationId("discoverChannels")
@@ -86,7 +86,7 @@ namespace Channels {
     | ErrorResponse<401>
     | ErrorResponse<429>;
 
-  /** Register only chosen manageable broadcast channels, without deleting existing channels. */
+  /** Register chosen manageable channels atomically. A blocked physical ID rejects the entire set with 409/conflict. */
   @post
   @route("/sync")
   @operationId("syncChannels")
@@ -94,6 +94,7 @@ namespace Channels {
     | JsonResponse<200, ChannelSummary[]>
     | ErrorResponse<401>
     | ErrorResponse<404>
+    | ErrorResponse<409>
     | ErrorResponse<422>
     | ErrorResponse<429>;
   @post
@@ -114,6 +115,12 @@ namespace Channels {
     | ErrorResponse<404>
     | ErrorResponse<409>;
 
+  /**
+   * Explicitly delete an owned channel only when all owners' selections, references
+   * and nondeleted remote-write receipts, including inflight reservations, permit it.
+   * Failed or ambiguous deletion leaves the physical channel closed to new writes.
+   * Admission/selection/deletion refusal uses ordinary 409/conflict, not parent loss.
+   */
   @delete
   @route("/{channelId}")
   @operationId("deleteChannel")

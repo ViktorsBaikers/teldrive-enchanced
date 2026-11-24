@@ -1203,8 +1203,8 @@ paths:
   /v1/channels/discover:
     get:
       operationId: discoverChannels
-      description: List broadcast channels where the authenticated user can add
-        administrators. Groups are excluded.
+      description: List manageable broadcast channels, excluding known closing/deleted
+        physical channels. Discovery is only a hint.
       parameters: []
       responses:
         "200":
@@ -1236,8 +1236,8 @@ paths:
   /v1/channels/sync:
     post:
       operationId: syncChannels
-      description: Register only chosen manageable broadcast channels, without
-        deleting existing channels.
+      description: Register chosen manageable channels atomically. A blocked physical
+        ID rejects the entire set with 409/conflict.
       parameters:
         - $ref: "#/components/parameters/IdempotencyHeader"
       responses:
@@ -1257,6 +1257,12 @@ paths:
                 $ref: "#/components/schemas/ErrorEnvelope"
         "404":
           description: The server cannot find the requested resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The request conflicts with the current state of the server.
           content:
             application/json:
               schema:
@@ -1329,6 +1335,18 @@ paths:
   /v1/channels/{channelId}:
     delete:
       operationId: deleteChannel
+      description: >-
+        Explicitly delete an owned channel only when all owners' selections,
+        references
+
+        and nondeleted remote-write receipts, including inflight reservations,
+        permit it.
+
+        Failed or ambiguous deletion leaves the physical channel closed to new
+        writes.
+
+        Admission/selection/deletion refusal uses ordinary 409/conflict, not
+        parent loss.
       parameters:
         - name: channelId
           in: path
@@ -1625,6 +1643,14 @@ paths:
             items:
               type: string
           explode: false
+        - name: mode
+          in: query
+          required: false
+          description: Selects the strict ordered stream when set to "ordered"; absent
+            keeps legacy.
+          schema:
+            type: string
+          explode: false
       responses:
         "200":
           description: The request has succeeded.
@@ -1635,6 +1661,20 @@ paths:
                 type: string
                 enum:
                   - no-cache, no-transform
+            X-TelDrive-Events:
+              required: false
+              description: Present only on confirmed ordered streams.
+              schema:
+                type: string
+                enum:
+                  - ordered
+            X-TelDrive-Heartbeat-Ms:
+              required: false
+              description: Advertised ordered-stream heartbeat in positive decimal
+                milliseconds.
+              schema:
+                type: integer
+                format: int32
           content:
             text/event-stream:
               schema:
@@ -2006,7 +2046,25 @@ paths:
   /v1/files/{fileId}/copy:
     post:
       operationId: copyFile
-      description: Copy a file or folder to another destination.
+      description: >-
+        Copy a file or folder with actor-scoped stable request admission.
+
+        The same Idempotency-Key and original request return the current
+        authorized
+
+        result with the existing 201/FileEntry/ETag/Location response, without
+        another copy.
+
+        Changed requests or inflight operations return ordinary 409/conflict
+        after authorization.
+
+        Destination loss returns 409/upload_parent_unavailable with message
+
+        "upload destination folder is unavailable"; restore cannot revive that
+        attempt.
+
+        Current result access, not former source or destination access, governs
+        completed replay.
       parameters:
         - $ref: "#/components/parameters/IdempotencyHeader"
         - name: fileId
@@ -2033,6 +2091,12 @@ paths:
                 $ref: "#/components/schemas/FileEntry"
         "401":
           description: Access is unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
           content:
             application/json:
               schema:
@@ -2117,7 +2181,8 @@ paths:
   /v1/files/{fileId}/purge:
     delete:
       operationId: purgeFile
-      description: Permanently delete a trashed file or folder from the catalog.
+      description: Queue permanent deletion of a trashed file or folder. Physical
+        completion requires proven ownership and confirmed cleanup.
       parameters:
         - name: fileId
           in: path
@@ -2905,7 +2970,26 @@ paths:
         - ExternalApiKeyAuth: []
     post:
       operationId: createUpload
-      description: Create a durable upload session.
+      description: >-
+        Create a durable upload session scoped by the current actor and
+        Idempotency-Key.
+
+        Matching requests return the same session; changed requests return
+        409/conflict
+
+        only after current authorization. A key never grants access.
+
+        Authorized terminal attempts return 409/upload_parent_unavailable with
+        message
+
+        "upload destination folder is unavailable"; restoring a folder cannot
+        reopen them.
+
+        Unpublished legacy sessions whose original destination cannot be
+        established
+
+        also refuse resume and require a genuinely new attempt, without deleting
+        bytes.
       parameters:
         - $ref: "#/components/parameters/IdempotencyHeader"
       responses:
@@ -2916,8 +3000,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UploadSession"
+        "400":
+          description: The server could not understand the request due to invalid syntax.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "401":
           description: Access is unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
           content:
             application/json:
               schema:
@@ -3006,11 +3102,498 @@ paths:
         - BearerAuth: []
         - CookieAuth: []
         - ExternalApiKeyAuth: []
+  /v1/uploads/guarded:
+    get:
+      operationId: discoverGuardedUpload
+      description: |-
+        Return the current recovery incarnation to authorized guarded clients.
+        The empty object proves only discovery; it grants no upload capability.
+      parameters: []
+      responses:
+        "200":
+          description: The request has succeeded.
+          headers:
+            X-TelDrive-Recovery-Incarnation:
+              required: true
+              schema:
+                $ref: "#/components/schemas/Uuid"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GuardedUploadDiscovery"
+        "401":
+          description: Access is unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+      tags:
+        - Uploads
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+        - ExternalApiKeyAuth: []
+    post:
+      operationId: createGuardedUpload
+      description: >-
+        Create an owner-only guarded upload from an immutable destination
+        intent.
+
+        The required incarnation must match the current one; a mismatch returns
+
+        412/upload_recovery_changed before allocation. A slot mismatch returns
+
+        412/upload_destination_changed. A same-key changed DTO returns
+        409/conflict,
+
+        and terminal destination loss returns 409/upload_parent_unavailable.
+
+        Semantically malformed guards return 422; undecodable JSON returns 400.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyHeader"
+        - $ref: "#/components/parameters/RecoveryIncarnationHeader"
+      responses:
+        "201":
+          description: The request has succeeded and a new resource has been created as a
+            result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadSession"
+        "400":
+          description: The server could not understand the request due to invalid syntax.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "401":
+          description: Access is unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "404":
+          description: The server cannot find the requested resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The request conflicts with the current state of the server.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "412":
+          description: Precondition failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "413":
+          description: Client error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "422":
+          description: Client error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "429":
+          description: Client error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+      tags:
+        - Uploads
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GuardedUploadCreateRequest"
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+        - ExternalApiKeyAuth: []
+  /v1/uploads/guarded/{uploadId}:
+    get:
+      operationId: getGuardedUpload
+      description: >-
+        Inspect a guarded attempt under the current recovery incarnation.
+
+        Returns the guarded-only session extension and `X-TelDrive-Upload-Guard:
+        1`
+
+        only after a current guard or exact result check succeeds. An
+        incarnation
+
+        mismatch returns 412/upload_recovery_changed; a changed destination
+        returns
+
+        412/upload_destination_changed. Terminal destination loss returns
+
+        409/upload_parent_unavailable, and expiry returns 410.
+      parameters:
+        - $ref: "#/components/parameters/RecoveryIncarnationHeader"
+        - name: uploadId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/Uuid"
+      responses:
+        "200":
+          description: The request has succeeded.
+          headers:
+            X-TelDrive-Recovery-Incarnation:
+              required: true
+              schema:
+                $ref: "#/components/schemas/Uuid"
+            X-TelDrive-Upload-Guard:
+              required: true
+              description: Emitted only after a current guard or exact result check succeeded.
+              schema:
+                type: string
+                enum:
+                  - "1"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GuardedUploadSession"
+        "401":
+          description: Access is unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "404":
+          description: The server cannot find the requested resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The request conflicts with the current state of the server.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "410":
+          description: Client error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "412":
+          description: Precondition failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "422":
+          description: Client error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+      tags:
+        - Uploads
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+        - ExternalApiKeyAuth: []
+  /v1/uploads/guarded/{uploadId}/parts/{partNo}:
+    put:
+      operationId: putGuardedUploadPart
+      description: >-
+        Upload one guarded part. The `(uploadId, partNo)` pair is the
+        idempotency key.
+
+        The incarnation and admitted destination are rechecked before any body
+        is read;
+
+        refusal consumes no part body, allocates nothing and publishes nothing.
+
+        Completed-part retries verify the exact body before returning stored
+        metadata.
+
+        A mismatched incarnation returns 412/upload_recovery_changed and a
+        changed slot
+
+        returns 412/upload_destination_changed. Terminal destination loss
+        returns
+
+        409/upload_parent_unavailable without relocation.
+      parameters:
+        - $ref: "#/components/parameters/UploadPartHeaders.contentLength"
+        - $ref: "#/components/parameters/UploadPartHeaders.checksum"
+        - $ref: "#/components/parameters/RecoveryIncarnationHeader"
+        - name: uploadId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/Uuid"
+        - name: partNo
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+        - name: channelId
+          in: query
+          required: false
+          description: Store the part in this owned channel instead of the selected channel.
+          schema:
+            type: integer
+            format: int64
+          explode: false
+      responses:
+        "200":
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadPart"
+        "201":
+          description: The request has succeeded and a new resource has been created as a
+            result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadPart"
+        "400":
+          description: The server could not understand the request due to invalid syntax.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "401":
+          description: Access is unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "404":
+          description: The server cannot find the requested resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The request conflicts with the current state of the server.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "410":
+          description: Client error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "412":
+          description: Precondition failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "413":
+          description: Client error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "422":
+          description: Client error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "429":
+          description: Client error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "503":
+          description: Service unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+      tags:
+        - Uploads
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+        - ExternalApiKeyAuth: []
+  /v1/uploads/guarded/{uploadId}/complete:
+    post:
+      operationId: completeGuardedUpload
+      description: >-
+        Atomically publish a guarded upload after validating the exact size and
+
+        BLAKE3 plaintext tree digest against every stored part. The required
+
+        incarnation and frozen destination are rechecked under the commit guard;
+
+        a mismatch returns 412/upload_recovery_changed or
+        412/upload_destination_changed
+
+        without publication. A same-key changed request returns 409/conflict,
+        terminal
+
+        destination loss returns 409/upload_parent_unavailable, and expiry
+        returns 410.
+
+        Success returns the extended FileEntry with the current commit-time
+        location.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyHeader"
+        - $ref: "#/components/parameters/RecoveryIncarnationHeader"
+        - name: uploadId
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/Uuid"
+      responses:
+        "200":
+          description: The request has succeeded.
+          headers:
+            Etag:
+              required: true
+              schema:
+                $ref: "#/components/schemas/ETag"
+            Location:
+              required: true
+              schema:
+                $ref: "#/components/schemas/Uri"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GuardedFileEntry"
+        "201":
+          description: The request has succeeded and a new resource has been created as a
+            result.
+          headers:
+            Etag:
+              required: true
+              schema:
+                $ref: "#/components/schemas/ETag"
+            Location:
+              required: true
+              schema:
+                $ref: "#/components/schemas/Uri"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GuardedFileEntry"
+        "400":
+          description: The server could not understand the request due to invalid syntax.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "401":
+          description: Access is unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "404":
+          description: The server cannot find the requested resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The request conflicts with the current state of the server.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "410":
+          description: Client error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "412":
+          description: Precondition failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "422":
+          description: Client error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+      tags:
+        - Uploads
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GuardedUploadCompleteRequest"
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+        - ExternalApiKeyAuth: []
   /v1/uploads/imports:
     post:
       operationId: createUploadImport
-      description: Queue local paths, recursive folders, and HTTP URLs for server-side
-        upload.
+      description: >-
+        Queue server-side imports only after durable destination admission.
+
+        Concrete existing ancestor identities are pinned before source access;
+
+        destination loss permanently fences that admitted batch, even after
+        restore.
+
+        Authorized parent loss returns 409/upload_parent_unavailable with
+        message
+
+        "upload destination folder is unavailable". Generic jobs cannot bypass
+        admission.
       parameters: []
       responses:
         "202":
@@ -3028,6 +3611,24 @@ paths:
                 $ref: "#/components/schemas/ErrorEnvelope"
         "401":
           description: Access is unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "404":
+          description: The server cannot find the requested resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The request conflicts with the current state of the server.
           content:
             application/json:
               schema:
@@ -3059,7 +3660,8 @@ paths:
   /v1/uploads/{uploadId}:
     get:
       operationId: getUpload
-      description: Inspect an upload for resume and conflict handling.
+      description: Inspect an authorized attempt. Terminal destination loss returns
+        409/upload_parent_unavailable.
       parameters:
         - name: uploadId
           in: path
@@ -3079,13 +3681,31 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "404":
           description: The server cannot find the requested resource.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The request conflicts with the current state of the server.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "410":
+          description: Client error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "422":
           description: Client error
           content:
             application/json:
@@ -3168,13 +3788,31 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "404":
           description: The server cannot find the requested resource.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The request conflicts with the current state of the server.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "410":
+          description: Client error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "422":
           description: Client error
           content:
             application/json:
@@ -3192,8 +3830,20 @@ paths:
       description: >-
         Upload one part. The `(uploadId, partNo)` pair is the idempotency key.
 
-        An exact retry returns the existing stored part; conflicting
-        size/checksum returns 409.
+        Every retry consumes the exact body and verifies equality before
+        returning stored metadata.
+
+        Nonfinal parts use the negotiated aligned size; only the final part may
+        be shorter.
+
+        Completed-part retries recheck access to the actual current result after
+        body verification.
+
+        Closing/deleted storage channels return ordinary 409/conflict, not
+        parent loss.
+
+        Terminal destination loss returns 409/upload_parent_unavailable without
+        relocation.
       parameters:
         - $ref: "#/components/parameters/UploadPartHeaders.contentLength"
         - $ref: "#/components/parameters/UploadPartHeaders.checksum"
@@ -3246,6 +3896,12 @@ paths:
                 $ref: "#/components/schemas/ErrorEnvelope"
         "401":
           description: Access is unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
           content:
             application/json:
               schema:
@@ -3309,10 +3965,22 @@ paths:
     post:
       operationId: completeUpload
       description: >-
-        Validate all parts and transactionally publish the file. A successful
-        response
+        Validate the current-attempt size/hash against every stored part and
+        atomically publish.
 
-        guarantees immediate read-after-write visibility.
+        Contradictory completed replays fail; agreeing replays return the
+        original file.
+
+        Current result access remains required, including after moves,
+        revocation, trash or purge.
+
+        Terminal destination loss returns 409/upload_parent_unavailable with
+        message
+
+        "upload destination folder is unavailable", even after restore or
+        restart.
+
+        Secondary cleanup failure never changes that primary response.
       parameters:
         - $ref: "#/components/parameters/IdempotencyHeader"
         - name: uploadId
@@ -3352,8 +4020,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/FileEntry"
+        "400":
+          description: The server could not understand the request due to invalid syntax.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "401":
           description: Access is unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
           content:
             application/json:
               schema:
@@ -3384,6 +4064,12 @@ paths:
                 $ref: "#/components/schemas/ErrorEnvelope"
       tags:
         - Uploads
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UploadCompleteRequest"
       security:
         - BearerAuth: []
         - CookieAuth: []
@@ -4948,6 +5634,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The request conflicts with the current state of the server.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "410":
           description: Client error
           content:
@@ -4961,6 +5653,19 @@ paths:
   /v1/public/shares/{token}/uploads:
     post:
       operationId: createPublicShareUpload
+      description: >-
+        Create using the immutable public-share scope and Idempotency-Key.
+
+        Replay always rechecks password, permission and the original destination
+        or
+
+        actual current completed result before exposing an outcome or mismatch.
+
+        Authorized terminal loss returns 409/upload_parent_unavailable with
+        message
+
+        "upload destination folder is unavailable"; restore never reopens the
+        attempt.
       parameters:
         - $ref: "#/components/parameters/SharePasswordHeader"
         - $ref: "#/components/parameters/IdempotencyHeader"
@@ -4977,6 +5682,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/UploadSession"
+        "400":
+          description: The server could not understand the request due to invalid syntax.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "401":
           description: Access is unauthorized.
           content:
@@ -5026,6 +5737,9 @@ paths:
   /v1/public/shares/{token}/uploads/{uploadId}/parts/{partNo}:
     put:
       operationId: putPublicShareUploadPart
+      description: Exact-body replay rechecks current result access after
+        verification; terminal destination loss returns
+        409/upload_parent_unavailable.
       parameters:
         - $ref: "#/components/parameters/SharePasswordHeader"
         - $ref: "#/components/parameters/UploadPartHeaders.contentLength"
@@ -5123,6 +5837,9 @@ paths:
   /v1/public/shares/{token}/uploads/{uploadId}/complete:
     post:
       operationId: completePublicShareUpload
+      description: Publish with the required size/optional hash manifest. Current
+        result access remains required on replay; terminal loss returns
+        409/upload_parent_unavailable.
       parameters:
         - $ref: "#/components/parameters/SharePasswordHeader"
         - $ref: "#/components/parameters/IdempotencyHeader"
@@ -5168,6 +5885,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/FileEntry"
+        "400":
+          description: The server could not understand the request due to invalid syntax.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "401":
           description: Access is unauthorized.
           content:
@@ -5206,6 +5929,12 @@ paths:
                 $ref: "#/components/schemas/ErrorEnvelope"
       tags:
         - Public shares
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UploadCompleteRequest"
       security:
         - {}
   /v1/public/shares/{token}/uploads/{uploadId}:
@@ -5241,6 +5970,12 @@ paths:
                 $ref: "#/components/schemas/ErrorEnvelope"
         "404":
           description: The server cannot find the requested resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The request conflicts with the current state of the server.
           content:
             application/json:
               schema:
@@ -5664,6 +6399,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "409":
           description: The request conflicts with the current state of the server.
           content:
@@ -5722,6 +6463,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
       tags:
         - Periodic Jobs
       security:
@@ -5756,8 +6503,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "404":
           description: The server cannot find the requested resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The request conflicts with the current state of the server.
           content:
             application/json:
               schema:
@@ -5792,8 +6551,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "404":
           description: The server cannot find the requested resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The request conflicts with the current state of the server.
           content:
             application/json:
               schema:
@@ -5826,8 +6597,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "404":
           description: The server cannot find the requested resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The request conflicts with the current state of the server.
           content:
             application/json:
               schema:
@@ -5860,8 +6643,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorEnvelope"
+        "403":
+          description: Access is forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "404":
           description: The server cannot find the requested resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "409":
+          description: The request conflicts with the current state of the server.
           content:
             application/json:
               schema:
@@ -6071,6 +6866,14 @@ components:
         enum:
           - "1"
       explode: false
+    RecoveryIncarnationHeader:
+      name: X-TelDrive-Recovery-Incarnation
+      in: header
+      required: true
+      description: Current recovery incarnation; a mismatch returns
+        412/upload_recovery_changed.
+      schema:
+        $ref: "#/components/schemas/Uuid"
     UploadPartHeaders.contentLength:
       name: Content-Length
       in: header
@@ -6969,6 +7772,17 @@ components:
           $ref: "#/components/schemas/HashAlgorithm"
         value:
           $ref: "#/components/schemas/Checksum"
+    GuardedFileEntry:
+      type: object
+      properties:
+        parentSegments:
+          type: array
+          items:
+            type: string
+      allOf:
+        - $ref: "#/components/schemas/FileEntry"
+      description: Canonical stored-name segments from the pinned root to the parent;
+        `[]` at root.
     FileEntry:
       type: object
       required:
@@ -7224,6 +8038,38 @@ components:
         - completed
         - aborted
         - expired
+    GuardedCompletedReceipt:
+      type: object
+      required:
+        - admissionKey
+        - uploadId
+        - size
+        - hash
+        - result
+      properties:
+        admissionKey:
+          type: string
+        uploadId:
+          $ref: "#/components/schemas/Uuid"
+        size:
+          type: integer
+          format: int64
+        hash:
+          $ref: "#/components/schemas/FileHash"
+        result:
+          $ref: "#/components/schemas/GuardedFileEntry"
+      description: Immutable publication receipt for a reauthorized exact guarded result.
+    GuardedUploadSession:
+      type: object
+      properties:
+        completedReceipt:
+          allOf:
+            - $ref: "#/components/schemas/GuardedCompletedReceipt"
+          description: Present only for a reauthorized exact result in the current
+            incarnation.
+      allOf:
+        - $ref: "#/components/schemas/UploadSession"
+      description: Guarded-only extension of the existing session DTO.
     UploadSession:
       type: object
       required:
@@ -7234,6 +8080,7 @@ components:
         - encryption
         - conflictPolicy
         - partSize
+        - requiresCompletionManifest
         - state
         - expiresAt
         - createdAt
@@ -7254,6 +8101,7 @@ components:
         modTime:
           type: string
           format: date-time
+          x-ogen-time-format: 2006-01-02T15:04:05.999999999Z07:00
         encryption:
           type: boolean
         conflictPolicy:
@@ -7261,6 +8109,11 @@ components:
         partSize:
           type: integer
           format: int64
+        requiresCompletionManifest:
+          type: boolean
+          enum:
+            - true
+          description: Requires current-attempt completion proof and exact-body part replay.
         state:
           $ref: "#/components/schemas/UploadState"
         expiresAt:
@@ -7290,6 +8143,159 @@ components:
         completedFiles:
           type: integer
           format: int64
+    GuardedUploadDiscovery:
+      type: object
+      description: Authorized guarded discovery response; the body is intentionally empty.
+    GuardedSlotAbsent:
+      type: object
+      required:
+        - kind
+      properties:
+        kind:
+          type: string
+          enum:
+            - absent
+      description: "Empty-slot intent: the admitted destination must stay empty
+        through commit."
+    GuardedSlotVersion:
+      type: object
+      required:
+        - kind
+        - fileId
+        - generation
+      properties:
+        kind:
+          type: string
+          enum:
+            - version
+        fileId:
+          $ref: "#/components/schemas/Uuid"
+        generation:
+          type: string
+          description: Positive canonical int64 decimal file generation.
+      description: "Occupied-slot intent: exactly this file identity and generation
+        are replaced."
+    GuardedSlotExpectation:
+      oneOf:
+        - $ref: "#/components/schemas/GuardedSlotAbsent"
+        - $ref: "#/components/schemas/GuardedSlotVersion"
+    GuardedUploadDestination:
+      type: object
+      required:
+        - mountRoot
+        - parentId
+        - expected
+      properties:
+        mountRoot:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/Uuid"
+          nullable: true
+        parentId:
+          type: string
+          allOf:
+            - $ref: "#/components/schemas/Uuid"
+          nullable: true
+        expected:
+          $ref: "#/components/schemas/GuardedSlotExpectation"
+      description: >-
+        Immutable destination intent for a guarded upload.
+
+        A null mountRoot or parentId explicitly means the account root;
+        omissions are invalid.
+
+        The leaf is the guarded create `name` and is never a path or rename
+        request.
+    GuardedUploadCreateRequest:
+      type: object
+      required:
+        - destination
+        - name
+        - size
+        - modTime
+      properties:
+        destination:
+          $ref: "#/components/schemas/GuardedUploadDestination"
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        size:
+          type: integer
+          format: int64
+          minimum: -1
+          description: Expected size in bytes, or -1 when the size is unknown until
+            completion.
+        mimeType:
+          type: string
+        modTime:
+          type: string
+          format: date-time
+        hash:
+          $ref: "#/components/schemas/FileHash"
+        encryption:
+          type: boolean
+          default: false
+        preferredPartSize:
+          type: integer
+          format: int64
+          minimum: 1048576
+          description: Optional preferred part size, rounded upward to a 16 MiB multiple.
+      description: |-
+        Guarded create body. The destination owns the parent slot, so the legacy
+        `parentId` and derived `conflictPolicy` are not accepted here.
+    UploadPartState:
+      type: string
+      enum:
+        - reserved
+        - uploading
+        - stored
+        - failed
+    UploadPart:
+      type: object
+      required:
+        - uploadId
+        - partNo
+        - state
+        - plainSize
+        - createdAt
+        - updatedAt
+      properties:
+        uploadId:
+          $ref: "#/components/schemas/Uuid"
+        partNo:
+          type: integer
+          format: int32
+        state:
+          $ref: "#/components/schemas/UploadPartState"
+        plainSize:
+          type: integer
+          format: int64
+        storedSize:
+          type: integer
+          format: int64
+        checksum:
+          $ref: "#/components/schemas/Checksum"
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    GuardedUploadCompleteRequest:
+      type: object
+      required:
+        - size
+        - hash
+      properties:
+        size:
+          type: integer
+          format: int64
+          minimum: 0
+        hash:
+          $ref: "#/components/schemas/FileHash"
+      description: Guarded completion always carries the exact plaintext size and
+        BLAKE3 tree digest.
     JobState:
       type: string
       enum:
@@ -7493,46 +8499,19 @@ components:
           type: integer
           format: int64
           minimum: 1048576
-          description: Optional preferred part size. The server may choose a different
-            value.
-    UploadPartState:
-      type: string
-      enum:
-        - reserved
-        - uploading
-        - stored
-        - failed
-    UploadPart:
+          description: Optional preferred part size, rounded upward to a 16 MiB multiple.
+    UploadCompleteRequest:
       type: object
       required:
-        - uploadId
-        - partNo
-        - state
-        - plainSize
-        - createdAt
-        - updatedAt
+        - size
       properties:
-        uploadId:
-          $ref: "#/components/schemas/Uuid"
-        partNo:
-          type: integer
-          format: int32
-        state:
-          $ref: "#/components/schemas/UploadPartState"
-        plainSize:
+        size:
           type: integer
           format: int64
-        storedSize:
-          type: integer
-          format: int64
-        checksum:
-          $ref: "#/components/schemas/Checksum"
-        createdAt:
-          type: string
-          format: date-time
-        updatedAt:
-          type: string
-          format: date-time
+          minimum: 0
+        hash:
+          $ref: "#/components/schemas/FileHash"
+      description: Current-attempt plaintext EOF and optional whole-source tree hash.
     SharePermission:
       type: string
       enum:

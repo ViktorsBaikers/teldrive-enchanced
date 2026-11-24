@@ -33,6 +33,23 @@ var transientTelegramMessages = []string{
 
 type retryMiddleware struct{ max int }
 
+// The durable lifecycle policy, not either retry loop, owns destructive replay.
+type receiptRetryBypass struct{ retry telegram.Middleware }
+
+func (m receiptRetryBypass) Handle(next tg.Invoker) telegram.InvokeFunc {
+	retrying := m.retry.Handle(next)
+	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		switch input.(type) {
+		case *tg.ChannelsDeleteMessagesRequest, *tg.ChannelsDeleteChannelRequest:
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return next.Invoke(ctx, input, output)
+		}
+		return retrying(ctx, input, output)
+	}
+}
+
 func (m retryMiddleware) Handle(next tg.Invoker) telegram.InvokeFunc {
 	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
 		for attempt := 0; ; attempt++ {

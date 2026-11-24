@@ -46,6 +46,9 @@ jobs:
         run: just build
 
       - name: Run unit and PostgreSQL integration tests
+        env:
+          TELDRIVE_CONTAINER_RUNTIME: docker
+          B2_CI_APPROVAL: "1"
         run: just test-integration
 
       - name: Upload browser test reports

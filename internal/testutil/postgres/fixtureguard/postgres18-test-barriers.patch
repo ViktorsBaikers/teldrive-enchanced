@@ -1,0 +1,494 @@
+--- a/src/backend/tcop/postgres.c
++++ b/src/backend/tcop/postgres.c
+@@ -69,6 +69,7 @@
+ #include "storage/sinval.h"
+ #include "tcop/backend_startup.h"
+ #include "tcop/fastpath.h"
++#include "tcop/fixtureguard.h"
+ #include "tcop/pquery.h"
+ #include "tcop/tcopprot.h"
+ #include "tcop/utility.h"
+@@ -88,6 +89,8 @@
+  */
+ const char *debug_query_string; /* client-supplied query string */
+ 
++B3FixtureHooks *B3Fixture = NULL;
++
+ /* Note: whereToSendOutput is initialized for the bootstrap/standalone case */
+ CommandDest whereToSendOutput = DestDebug;
+ 
+@@ -1065,6 +1068,9 @@
+ 	parsetree_list = pg_parse_query(query_string);
+ 
++	if (B3Fixture && IsUnderPostmaster)
++		B3Fixture->parsed(query_string, parsetree_list);
++
+ 	/* Log immediately if dictated by log_statement */
+ 	if (check_log_statement(parsetree_list))
+ 	{
+ 		ereport(LOG,
+@@ -4750,6 +4756,9 @@
+ 		 * (7) process the command.  But ignore it if we're skipping till
+ 		 * Sync.
+ 		 */
++		if (B3Fixture && IsUnderPostmaster)
++			B3Fixture->message(firstchar);
++
+ 		if (ignore_till_sync && firstchar != EOF)
+ 			continue;
+ 
+@@ -4764,6 +4773,9 @@
+ 
+ 					query_string = pq_getmsgstring(&input_message);
+ 					pq_getmsgend(&input_message);
++
++					if (B3Fixture && IsUnderPostmaster)
++						B3Fixture->sql(query_string, false, 0, NULL);
+ 
+ 					if (am_walsender)
+ 					{
+@@ -4795,20 +4807,23 @@
+ 					query_string = pq_getmsgstring(&input_message);
+ 					numParams = pq_getmsgint(&input_message, 2);
+ 					if (numParams > 0)
+ 					{
+ 						paramTypes = palloc_array(Oid, numParams);
+ 						for (int i = 0; i < numParams; i++)
+ 							paramTypes[i] = pq_getmsgint(&input_message, 4);
+ 					}
+ 					pq_getmsgend(&input_message);
+ 
++					if (B3Fixture && IsUnderPostmaster)
++						B3Fixture->sql(query_string, true, numParams, paramTypes);
++
+ 					exec_parse_message(query_string, stmt_name,
+ 									   paramTypes, numParams);
+ 
+ 					valgrind_report_error_query(query_string);
+ 				}
+ 				break;
+ 
+ 			case PqMsg_Bind:
+ 				forbidden_in_wal_sender(firstchar);
+ 
+--- a/src/backend/utils/init/postinit.c
++++ b/src/backend/utils/init/postinit.c
+@@ -56,6 +56,7 @@
+ #include "storage/smgr.h"
+ #include "storage/sync.h"
+ #include "tcop/backend_startup.h"
++#include "tcop/fixtureguard.h"
+ #include "tcop/tcopprot.h"
+ #include "utils/acl.h"
+ #include "utils/builtins.h"
+@@ -963,5 +964,9 @@
+ 					 errdetail("Only roles with the %s attribute may start a WAL sender process.",
+ 							   "REPLICATION")));
++		if (B3Fixture)
++			ereport(FATAL,
++					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
++					 errmsg("replication is forbidden on the B3 fixture server")));
+ 	}
+ 
+ 	/*
+@@ -1217,6 +1222,9 @@
+ 	/* Initialize this backend's session state. */
+ 	InitializeSession();
+ 
++	if (B3Fixture && IsExternalConnectionBackend(MyBackendType))
++		B3Fixture->backend();
++
+ 	/*
+ 	 * If this is an interactive session, load any libraries that should be
+ 	 * preloaded at backend start.  Since those are determined by GUCs, this
+--- a/src/backend/access/transam/xact.c
++++ b/src/backend/access/transam/xact.c
+@@ -61,6 +61,7 @@
+ #include "storage/procarray.h"
+ #include "storage/sinvaladt.h"
+ #include "storage/smgr.h"
++#include "tcop/fixtureguard.h"
+ #include "utils/builtins.h"
+ #include "utils/combocid.h"
+ #include "utils/guc.h"
+@@ -2293,6 +2294,9 @@
+ 	 * the transaction-abort path.
+ 	 */
+ 
++	if (B3Fixture && !is_parallel_worker)
++		B3Fixture->commit(true);
++
+ 	CallXactCallbacks(is_parallel_worker ? XACT_EVENT_PARALLEL_PRE_COMMIT
+ 					  : XACT_EVENT_PRE_COMMIT);
+ 
+@@ -2353,6 +2357,10 @@
+ 	 */
+ 	if (!is_parallel_worker)
+ 		PreCommit_CheckForSerializationFailure();
++
++	/* Hold fixture tails before interrupts are held and commit is recorded. */
++	if (B3Fixture && !is_parallel_worker)
++		B3Fixture->commit(false);
+ 
+ 	/* Prevent cancel/die interrupt while cleaning up */
+ 	HOLD_INTERRUPTS();
+--- a/src/backend/commands/trigger.c
++++ b/src/backend/commands/trigger.c
+@@ -48,6 +48,7 @@
+ #include "storage/lmgr.h"
++#include "tcop/fixtureguard.h"
+ #include "utils/acl.h"
+ #include "utils/builtins.h"
+ #include "utils/fmgroids.h"
+ #include "utils/guc_hooks.h"
+ #include "utils/inval.h"
+@@ -4669,6 +4670,9 @@
+ 			deferred_found = true;
+ 			/* add it to move_list */
+ 			afterTriggerAddEvent(move_list, event, evtshared);
++			if (B3Fixture && move_list == &afterTriggers.events)
++				B3Fixture->queued(evtshared->ats_relid, evtshared->ats_tgoid);
++
+ 			/* mark original copy "done" so we don't do it again */
+ 			event->ate_flags |= AFTER_TRIGGER_DONE;
+ 		}
+@@ -4811,6 +4815,9 @@
+ 				 * still set, so recursive examinations of the event list
+ 				 * won't try to re-fire it.
+ 				 */
++				if (B3Fixture && events == &afterTriggers.events)
++					B3Fixture->deferred(RelationGetRelid(rInfo->ri_RelationDesc),
++											GetTriggerSharedData(event)->ats_tgoid);
+ 				AfterTriggerExecute(estate, event, rInfo,
+ 									src_rInfo, dst_rInfo,
+ 									trigdesc, finfo, instr,
+@@ -5326,6 +5333,8 @@
+ 	{
+ 		CommandId	firing_id = afterTriggers.firing_counter++;
+ 
++		if (B3Fixture)
++			B3Fixture->deferred(InvalidOid, InvalidOid);
+ 		if (afterTriggerInvokeEvents(events, firing_id, NULL, true))
+ 			break;				/* all fired */
+ 	}
+--- a/src/backend/commands/copyfromparse.c
++++ b/src/backend/commands/copyfromparse.c
+@@ -72,6 +72,7 @@
+ #include "miscadmin.h"
+ #include "pgstat.h"
+ #include "port/pg_bswap.h"
++#include "tcop/fixtureguard.h"
+ #include "utils/builtins.h"
+ #include "utils/rel.h"
+ 
+@@ -302,6 +303,9 @@
+ 								(errcode(ERRCODE_CONNECTION_FAILURE),
+ 								 errmsg("unexpected EOF on client connection with an open transaction")));
+ 					RESUME_CANCEL_INTERRUPTS();
++					if (B3Fixture)
++						B3Fixture->copy_message(mtype, cstate->fe_msgbuf->data,
++												cstate->fe_msgbuf->len);
+ 					/* ... and process it */
+ 					switch (mtype)
+ 					{
+--- a/src/include/nodes/primnodes.h
++++ b/src/include/nodes/primnodes.h
+@@ -2126,6 +2126,9 @@
+ 	Expr		xpr;
+ 	Oid			seqid;
+ 	Oid			typeId;
++	Oid			fixtureTable;
++	int32		fixtureColumn;
++	bool		fixtureSerial;
+ } NextValueExpr;
+ 
+ /*
+--- a/src/include/executor/execExpr.h
++++ b/src/include/executor/execExpr.h
+@@ -472,6 +472,9 @@
+ 		{
+ 			Oid			seqid;
+ 			Oid			seqtypid;
++			Oid			fixture_table;
++			int32		fixture_column;
++			bool		fixture_serial;
+ 		}			nextvalueexpr;
+ 
+ 		/* for EEOP_ARRAYEXPR */
+--- a/src/backend/executor/execExpr.c
++++ b/src/backend/executor/execExpr.c
+@@ -2635,6 +2635,9 @@
+ 				scratch.opcode = EEOP_NEXTVALUEEXPR;
+ 				scratch.d.nextvalueexpr.seqid = nve->seqid;
+ 				scratch.d.nextvalueexpr.seqtypid = nve->typeId;
++				scratch.d.nextvalueexpr.fixture_table = nve->fixtureTable;
++				scratch.d.nextvalueexpr.fixture_column = nve->fixtureColumn;
++				scratch.d.nextvalueexpr.fixture_serial = nve->fixtureSerial;
+ 
+ 				ExprEvalPushStep(state, &scratch);
+ 				break;
+--- a/src/backend/executor/execExprInterp.c
++++ b/src/backend/executor/execExprInterp.c
+@@ -3280,7 +3280,10 @@
+ void
+ ExecEvalNextValueExpr(ExprState *state, ExprEvalStep *op)
+ {
+-	int64		newval = nextval_internal(op->d.nextvalueexpr.seqid, false);
++	int64		newval = nextval_with_origin(op->d.nextvalueexpr.seqid,
++										op->d.nextvalueexpr.fixture_serial,
++										op->d.nextvalueexpr.fixture_table,
++										op->d.nextvalueexpr.fixture_column);
+ 
+ 	switch (op->d.nextvalueexpr.seqtypid)
+ 	{
+--- a/src/backend/rewrite/rewriteHandler.c
++++ b/src/backend/rewrite/rewriteHandler.c
+@@ -24,6 +24,7 @@
+ #include "access/sysattr.h"
+ #include "access/table.h"
+ #include "catalog/dependency.h"
++#include "catalog/pg_type.h"
+ #include "commands/trigger.h"
+ #include "executor/executor.h"
+ #include "foreign/fdwapi.h"
+@@ -40,8 +41,10 @@
+ #include "rewrite/rewriteManip.h"
+ #include "rewrite/rewriteSearchCycle.h"
+ #include "rewrite/rowsecurity.h"
++#include "tcop/fixtureguard.h"
+ #include "tcop/tcopprot.h"
+ #include "utils/builtins.h"
++#include "utils/fmgroids.h"
+ #include "utils/lsyscache.h"
+ #include "utils/rel.h"
+ 
+@@ -1275,6 +1278,11 @@
+ 
+ 		nve->seqid = getIdentitySequence(rel, attrno, false);
+ 		nve->typeId = att_tup->atttypid;
++		if (B3Fixture)
++		{
++			nve->fixtureTable = RelationGetRelid(rel);
++			nve->fixtureColumn = attrno;
++		}
+ 
+ 		return (Node *) nve;
+ 	}
+@@ -1288,6 +1295,37 @@
+ 		if (expr == NULL)
+ 			elog(ERROR, "default expression not found for attribute %d of relation \"%s\"",
+ 				 attrno, RelationGetRelationName(rel));
++
++		/* Tag only the actual stored direct built-in default; preserve its cast. */
++		if (B3Fixture && !att_tup->attgenerated && IsA(expr, FuncExpr))
++		{
++			Node **slot = &expr;
++			FuncExpr *fn = (FuncExpr *) expr;
++
++			if (list_length(fn->args) == 1 &&
++				(fn->funcid == F_INT4_INT8 || fn->funcid == F_INT2_INT8))
++				slot = (Node **) &linitial(fn->args);
++			if (IsA(*slot, FuncExpr))
++			{
++				fn = (FuncExpr *) *slot;
++				if (fn->funcid == F_NEXTVAL && list_length(fn->args) == 1 && IsA(linitial(fn->args), Const))
++				{
++					Const *arg = linitial_node(Const, fn->args);
++
++					if (!arg->constisnull && arg->consttype == REGCLASSOID)
++					{
++						NextValueExpr *nve = makeNode(NextValueExpr);
++
++						nve->seqid = DatumGetObjectId(arg->constvalue);
++						nve->typeId = INT8OID;
++						nve->fixtureTable = RelationGetRelid(rel);
++						nve->fixtureColumn = attrno;
++						nve->fixtureSerial = true;
++						*slot = (Node *) nve;
++					}
++				}
++			}
++		}
+ 	}
+ 
+ 	/*
+--- a/src/include/commands/sequence.h
++++ b/src/include/commands/sequence.h
+@@ -52,6 +52,7 @@
+ } xl_seq_rec;
+ 
+ extern int64 nextval_internal(Oid relid, bool check_permissions);
++extern int64 nextval_with_origin(Oid relid, bool check_permissions, Oid table, int32 attnum);
+ extern Datum nextval(PG_FUNCTION_ARGS);
+ extern List *sequence_options(Oid relid);
+ 
+--- a/src/backend/commands/sequence.c
++++ b/src/backend/commands/sequence.c
+@@ -43,6 +43,7 @@
+ #include "storage/proc.h"
+ #include "storage/smgr.h"
++#include "tcop/fixtureguard.h"
+ #include "utils/acl.h"
+ #include "utils/builtins.h"
+ #include "utils/lsyscache.h"
+ #include "utils/resowner.h"
+@@ -277,6 +278,8 @@
+ 	 * indeed a sequence.
+ 	 */
+ 	init_sequence(seq_relid, &elm, &seq_rel);
++	if (B3Fixture)
++		B3Fixture->sequence_ddl(seq_rel, false);
+ 	(void) read_seq_tuple(seq_rel, &buf, &seqdatatuple);
+ 
+ 	pgstuple = SearchSysCache1(SEQRELID, ObjectIdGetDatum(seq_relid));
+@@ -478,6 +481,10 @@
+ 
+ 	init_sequence(relid, &elm, &seqrel);
+ 
++	if (B3Fixture)
++		B3Fixture->sequence_ddl(seqrel, list_length(stmt->options) == 1 &&
++							   strcmp(linitial_node(DefElem, stmt->options)->defname, "owned_by") == 0);
++
+ 	rel = table_open(SequenceRelationId, RowExclusiveLock);
+ 	seqtuple = SearchSysCacheCopy1(SEQRELID,
+ 								   ObjectIdGetDatum(relid));
+@@ -565,6 +572,8 @@
+ 	 */
+ 	LockRelationOid(relid, AccessExclusiveLock);
+ 	init_sequence(relid, &elm, &seqrel);
++	if (B3Fixture)
++		B3Fixture->sequence_ddl(seqrel, false);
+ 
+ 	/* check the comment above nextval_internal()'s equivalent call. */
+ 	if (RelationNeedsWAL(seqrel))
+@@ -633,6 +642,12 @@
+ 
+ int64
+ nextval_internal(Oid relid, bool check_permissions)
++{
++	return nextval_with_origin(relid, check_permissions, InvalidOid, 0);
++}
++
++int64
++nextval_with_origin(Oid relid, bool check_permissions, Oid table, int32 attnum)
+ {
+ 	SeqTable	elm;
+ 	Relation	seqrel;
+@@ -655,6 +670,9 @@
+ 	bool		cycle;
+ 	bool		logit = false;
+ 
++	if (B3Fixture)
++		B3Fixture->allocate(relid, table, attnum, check_permissions, B3_SEQUENCE_ENTRY);
++
+ 	/* open and lock sequence */
+ 	init_sequence(relid, &elm, &seqrel);
+ 
+@@ -681,9 +699,13 @@
+ 	{
+ 		Assert(elm->last_valid);
+ 		Assert(elm->increment != 0);
++		if (B3Fixture)
++			B3Fixture->allocate(relid, table, attnum, check_permissions, B3_SEQUENCE_EFFECT);
+ 		elm->last += elm->increment;
+ 		sequence_close(seqrel, NoLock);
+ 		last_used_seq = elm;
++		if (B3Fixture)
++			B3Fixture->allocate(relid, table, attnum, check_permissions, B3_SEQUENCE_DONE);
+ 		return elm->last;
+ 	}
+ 
+@@ -798,6 +820,9 @@
+ 	log -= fetch;				/* adjust for any unfetched numbers */
+ 	Assert(log >= 0);
+ 
++	if (B3Fixture)
++		B3Fixture->allocate(relid, table, attnum, check_permissions, B3_SEQUENCE_EFFECT);
++
+ 	/* save info in local cache */
+ 	elm->increment = incby;
+ 	elm->last = result;			/* last returned number */
+@@ -871,6 +896,8 @@
+ 
+ 	sequence_close(seqrel, NoLock);
+ 
++	if (B3Fixture)
++		B3Fixture->allocate(relid, table, attnum, check_permissions, B3_SEQUENCE_DONE);
+ 	return result;
+ }
+ 
+@@ -966,6 +993,9 @@
+ 	int64		maxv,
+ 				minv;
+ 
++	if (B3Fixture)
++		B3Fixture->setval(relid, NULL, next, iscalled, B3_SEQUENCE_ENTRY);
++
+ 	/* open and lock sequence */
+ 	init_sequence(relid, &elm, &seqrel);
+ 
+@@ -994,6 +1024,9 @@
+ 	 */
+ 	PreventCommandIfParallelMode("setval()");
+ 
++	if (B3Fixture)
++		B3Fixture->setval(relid, seqrel, next, iscalled, B3_SEQUENCE_PROVENANCE);
++
+ 	/* lock page buffer and read tuple */
+ 	seq = read_seq_tuple(seqrel, &buf, &seqdatatuple);
+ 
+@@ -1004,6 +1037,9 @@
+ 						next, RelationGetRelationName(seqrel),
+ 						minv, maxv)));
+ 
++	if (B3Fixture)
++		B3Fixture->setval(relid, NULL, next, iscalled, B3_SEQUENCE_EFFECT);
++
+ 	/* Set the currval() state only if iscalled = true */
+ 	if (iscalled)
+ 	{
+@@ -1051,6 +1087,8 @@
+ 	UnlockReleaseBuffer(buf);
+ 
+ 	sequence_close(seqrel, NoLock);
++	if (B3Fixture)
++		B3Fixture->setval(relid, NULL, next, iscalled, B3_SEQUENCE_DONE);
+ }
+ 
+ /*
+--- /dev/null
++++ b/src/include/tcop/fixtureguard.h
+@@ -0,0 +1,33 @@
++/* Private server ABI for the isolated B3 qualification fixture only. */
++#ifndef B3_FIXTURE_GUARD_H
++#define B3_FIXTURE_GUARD_H
++
++#include "nodes/pg_list.h"
++#include "utils/relcache.h"
++
++typedef enum B3SequenceStep
++{
++	B3_SEQUENCE_ENTRY,
++	B3_SEQUENCE_PROVENANCE,
++	B3_SEQUENCE_EFFECT,
++	B3_SEQUENCE_DONE
++} B3SequenceStep;
++
++typedef struct B3FixtureHooks
++{
++	void (*backend)(void);
++	void (*message)(int type);
++	void (*copy_message)(int type, const char *data, size_t len);
++	void (*sql)(const char *query, bool extended, int params, const Oid *types);
++	void (*parsed)(const char *query, List *statements);
++	void (*deferred)(Oid table, Oid trigger);
++	void (*queued)(Oid table, Oid trigger);
++	void (*commit)(bool before_decision);
++	void (*allocate)(Oid sequence, Oid table, int32 attnum, bool serial, B3SequenceStep step);
++	void (*setval)(Oid sequence, Relation rel, int64 value, bool called, B3SequenceStep step);
++	void (*sequence_ddl)(Relation rel, bool ownership_only);
++} B3FixtureHooks;
++
++extern PGDLLIMPORT B3FixtureHooks *B3Fixture;
++
++#endif

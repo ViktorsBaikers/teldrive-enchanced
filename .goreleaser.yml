@@ -14,11 +14,14 @@ builds:
       - CGO_ENABLED=0
     flags:
       - -trimpath
+      - -buildvcs=false
     ldflags:
       - -s -w
       - -X main.version={{ .Version }}
       - -X main.commit={{ .FullCommit }}
       - -X main.date={{ .Date }}
+      - -X main.snapshot={{ .Env.SNAPSHOT }}
+      - -X main.dirty={{ .Env.DIRTY }}
     mod_timestamp: "{{ .CommitTimestamp }}"
     goos:
       - linux
@@ -63,6 +66,10 @@ dockers_v2:
       "org.opencontainers.image.revision": "{{.FullCommit}}"
       "org.opencontainers.image.source": "{{.GitURL}}"
       "org.opencontainers.image.version": "{{.Version}}"
+      "org.opencontainers.image.base.name": "{{ .Env.BASE_IMAGE_NAME }}"
+      "org.opencontainers.image.base.digest": "{{ .Env.BASE_IMAGE_DIGEST }}"
+      "io.enchanced.source.snapshot": "{{ .Env.SNAPSHOT }}"
+      "io.enchanced.source.dirty": "{{ .Env.DIRTY }}"
 
 changelog:
   use: github

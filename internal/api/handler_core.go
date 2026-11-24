@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/tgdrive/teldrive/v2/internal/catalog"
 	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
 	"github.com/tgdrive/teldrive/v2/internal/dbtypes"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 	"github.com/tgdrive/teldrive/v2/internal/shares"
 	"github.com/tgdrive/teldrive/v2/internal/transfer"
 	"github.com/tgdrive/teldrive/v2/internal/uploads"
@@ -402,18 +404,38 @@ func (h *Handler) CreateUpload(ctx context.Context, req *gen.UploadCreateRequest
 	if h.Uploads == nil || req == nil {
 		return nil, mapServiceError(ErrOperationUnavailable)
 	}
-	parentID := optionalGoogleUUID(req.ParentId)
-	ownerID := userID
-	if parentID != nil {
-		access, err := h.resolveAuthenticatedFileAccess(ctx, *parentID, true)
-		if err != nil {
-			return nil, mapServiceError(err)
-		}
-		ownerID = access.OwnerID
-	}
-	session, err := h.createUploadForOwner(ctx, ownerID, parentID, req)
+	admission, err := uploadRequestAdmission(lifecycle.RequestScope{ActorUserID: &userID}, googleUUID(params.IdempotencyKey), req)
 	if err != nil {
-		return nil, err
+		return nil, mapServiceError(err)
+	}
+	session, found, err := h.replayUploadAdmission(ctx, admission, "", "")
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	if !found {
+		parentID := optionalGoogleUUID(req.ParentId)
+		ownerID := userID
+		if parentID != nil {
+			access, resolveErr := h.resolveAuthenticatedFileAccess(ctx, *parentID, true)
+			if resolveErr != nil {
+				return nil, mapServiceError(resolveErr)
+			}
+			ownerID = access.OwnerID
+		}
+		session, err = h.createUploadForOwner(ctx, ownerID, parentID, req, admission)
+	}
+	if err != nil {
+		retained, exists, replayErr := h.replayUploadAdmission(ctx, admission, "", "")
+		if replayErr != nil {
+			return nil, mapServiceError(replayErr)
+		}
+		if !exists {
+			return nil, err
+		}
+		session = retained
+	}
+	if _, err := h.resolveAuthenticatedUploadOwner(ctx, uuid.UUID(session.ID.Bytes), true); err != nil {
+		return nil, mapServiceError(err)
 	}
 	response, err := uploadSession(session)
 	if err != nil {
@@ -535,6 +557,9 @@ func (h *Handler) PutUploadPart(ctx context.Context, req gen.PutUploadPartReq, p
 		RequestedChannelID: params.ChannelId.Or(0),
 		PlainSize:          params.ContentLength, Checksum: checksum, Body: req.Data,
 	})
+	if _, accessErr := h.resolveAuthenticatedUploadOwner(ctx, googleUUID(params.UploadId), true); accessErr != nil {
+		return nil, mapServiceError(accessErr)
+	}
 	if err != nil {
 		return nil, mapServiceError(err)
 	}
@@ -550,7 +575,7 @@ func (h *Handler) PutUploadPart(ctx context.Context, req gen.PutUploadPartReq, p
 	return &response, nil
 }
 
-func (h *Handler) CompleteUpload(ctx context.Context, params gen.CompleteUploadParams) (gen.CompleteUploadRes, error) {
+func (h *Handler) CompleteUpload(ctx context.Context, req *gen.UploadCompleteRequest, params gen.CompleteUploadParams) (gen.CompleteUploadRes, error) {
 	if h.Uploads == nil {
 		return nil, mapServiceError(ErrOperationUnavailable)
 	}
@@ -558,8 +583,16 @@ func (h *Handler) CompleteUpload(ctx context.Context, params gen.CompleteUploadP
 	if err != nil {
 		return nil, mapServiceError(err)
 	}
-	file, err := h.Uploads.Complete(ctx, ownerID, googleUUID(params.UploadId))
+	in := uploads.CompleteInput{UserID: ownerID, UploadID: googleUUID(params.UploadId), Size: req.Size}
+	if hash, ok := req.Hash.Get(); ok {
+		algorithm, value := string(hash.Algorithm), string(hash.Value)
+		in.HashAlgorithm, in.HashValue = &algorithm, &value
+	}
+	file, err := h.Uploads.Complete(ctx, in)
 	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	if _, err := h.resolveAuthenticatedFileAccess(ctx, uuid.UUID(file.ID.Bytes), true); err != nil {
 		return nil, mapServiceError(err)
 	}
 	entry, err := fileEntry(file)
@@ -587,6 +620,329 @@ func (h *Handler) AbortUpload(ctx context.Context, params gen.AbortUploadParams)
 		return nil, mapServiceError(err)
 	}
 	return &gen.AbortUploadNoContent{}, nil
+}
+
+func (h *Handler) DiscoverGuardedUpload(ctx context.Context) (gen.DiscoverGuardedUploadRes, error) {
+	if _, err := UserIDFromContext(ctx); err != nil {
+		return nil, mapServiceError(err)
+	}
+	if h.Uploads == nil {
+		return nil, mapServiceError(ErrOperationUnavailable)
+	}
+	incarnation, err := h.Uploads.RecoveryIncarnation(ctx)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	return &gen.GuardedUploadDiscoveryHeaders{
+		XTelDriveRecoveryIncarnation: apiUUID(incarnation),
+		Response:                     gen.GuardedUploadDiscovery{},
+	}, nil
+}
+
+func (h *Handler) CreateGuardedUpload(ctx context.Context, req *gen.GuardedUploadCreateRequest, params gen.CreateGuardedUploadParams) (gen.CreateGuardedUploadRes, error) {
+	actorID, err := UserIDFromContext(ctx)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	if h.Uploads == nil || req == nil {
+		return nil, mapServiceError(ErrOperationUnavailable)
+	}
+	admission, err := guardedCreateRequestAdmission(lifecycle.RequestScope{ActorUserID: &actorID}, googleUUID(params.IdempotencyKey), req)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	destination := req.Destination
+	guard := &uploads.GuardInput{RecoveryIncarnation: googleUUID(params.XTelDriveRecoveryIncarnation)}
+	if mountRoot, ok := destination.MountRoot.Get(); ok {
+		id := googleUUID(mountRoot)
+		if id == uuid.Nil {
+			return nil, mapServiceError(uploads.ErrInvalidInput)
+		}
+		guard.MountRoot = &id
+	}
+	parentID := optionalNilUUID(destination.ParentId)
+	conflictPolicy := sqlcgen.NameConflictPolicyFail
+	if version, ok := destination.Expected.GetGuardedSlotVersion(); ok {
+		generation, parseErr := strconv.ParseInt(version.Generation, 10, 64)
+		if parseErr != nil || generation <= 0 || strconv.FormatInt(generation, 10) != version.Generation {
+			return nil, mapServiceError(uploads.ErrInvalidInput)
+		}
+		fileID := googleUUID(version.FileId)
+		if fileID == uuid.Nil {
+			return nil, mapServiceError(uploads.ErrInvalidInput)
+		}
+		guard.ExpectedFileID = &fileID
+		guard.ExpectedGeneration = &generation
+		conflictPolicy = sqlcgen.NameConflictPolicyReplace
+	} else if _, ok := destination.Expected.GetGuardedSlotAbsent(); !ok {
+		return nil, mapServiceError(uploads.ErrInvalidInput)
+	}
+	input := uploads.CreateInput{
+		UserID: actorID, ParentID: parentID, Name: req.Name, ExpectedSize: req.Size,
+		ModTime: req.ModTime, PartSize: req.PreferredPartSize.Or(0),
+		Admission: admission, ConflictPolicy: conflictPolicy, Guard: guard,
+	}
+	if value, ok := req.MimeType.Get(); ok {
+		input.MIMEType = &value
+	}
+	if value, ok := req.Hash.Get(); ok {
+		algorithm, checksum := string(value.Algorithm), string(value.Value)
+		input.ExpectedHashAlgorithm, input.ExpectedHashValue = &algorithm, &checksum
+	}
+	if value, ok := req.Encryption.Get(); ok {
+		input.Encryption = value
+	}
+	input.Encryption = input.Encryption || h.UploadEncryptionRequired
+	if input.Encryption {
+		if h.ActiveEncryptionKeyVersion <= 0 {
+			return nil, mapServiceError(transfer.ErrEncryptionKey)
+		}
+		version := h.ActiveEncryptionKeyVersion
+		input.EncryptionKeyVersion = &version
+	}
+	session, err := h.Uploads.Create(ctx, input)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	response, err := uploadSession(session)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	return &response, nil
+}
+
+func (h *Handler) GetGuardedUpload(ctx context.Context, params gen.GetGuardedUploadParams) (gen.GetGuardedUploadRes, error) {
+	uploadID := googleUUID(params.UploadId)
+	ownerID, err := h.guardedUploadOwner(ctx, uploadID, false)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	incarnation := googleUUID(params.XTelDriveRecoveryIncarnation)
+	upload, err := h.Uploads.GetGuarded(ctx, ownerID, uploadID, incarnation)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	response, err := guardedUploadSession(upload)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	return &gen.GuardedUploadSessionHeaders{
+		XTelDriveRecoveryIncarnation: apiUUID(incarnation),
+		XTelDriveUploadGuard:         gen.GetGuardedUploadOKXTelDriveUploadGuard1,
+		Response:                     response,
+	}, nil
+}
+
+func (h *Handler) PutGuardedUploadPart(ctx context.Context, req gen.PutGuardedUploadPartReq, params gen.PutGuardedUploadPartParams) (gen.PutGuardedUploadPartRes, error) {
+	if h.UploadPipeline == nil {
+		return nil, mapServiceError(ErrOperationUnavailable)
+	}
+	ownerID, err := h.guardedUploadOwner(ctx, googleUUID(params.UploadId), true)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	var checksum *string
+	if value, ok := params.XPartChecksum.Get(); ok {
+		text := string(value)
+		checksum = &text
+	}
+	result, err := h.UploadPipeline.UploadPart(ctx, transfer.UploadPartRequest{
+		UserID: ownerID, UploadID: googleUUID(params.UploadId), PartNo: params.PartNo,
+		RequestedChannelID: params.ChannelId.Or(0),
+		PlainSize:          params.ContentLength, Checksum: checksum, Body: req.Data,
+		Guarded: true, RecoveryIncarnation: googleUUID(params.XTelDriveRecoveryIncarnation),
+	})
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	part, err := uploadPart(result.Part)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	if result.Existing {
+		response := gen.PutGuardedUploadPartOK(part)
+		return &response, nil
+	}
+	response := gen.PutGuardedUploadPartCreated(part)
+	return &response, nil
+}
+
+func (h *Handler) CompleteGuardedUpload(ctx context.Context, req *gen.GuardedUploadCompleteRequest, params gen.CompleteGuardedUploadParams) (gen.CompleteGuardedUploadRes, error) {
+	if h.Uploads == nil || req == nil {
+		return nil, mapServiceError(ErrOperationUnavailable)
+	}
+	uploadID := googleUUID(params.UploadId)
+	ownerID, err := h.guardedUploadOwner(ctx, uploadID, true)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	actorID, err := UserIDFromContext(ctx)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	admission, err := guardedCompleteRequestAdmission(lifecycle.RequestScope{ActorUserID: &actorID}, googleUUID(params.IdempotencyKey), req)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	incarnation := googleUUID(params.XTelDriveRecoveryIncarnation)
+	algorithm, hashValue := string(req.Hash.Algorithm), string(req.Hash.Value)
+	file, err := h.Uploads.Complete(ctx, uploads.CompleteInput{
+		UserID: ownerID, UploadID: uploadID, Size: req.Size,
+		HashAlgorithm: &algorithm, HashValue: &hashValue,
+		Guarded: true, Admission: admission, RecoveryIncarnation: incarnation,
+	})
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	var segments []string
+	if upload, getErr := h.Uploads.GetGuarded(ctx, ownerID, uploadID, incarnation); getErr == nil && upload.Receipt != nil {
+		segments = upload.Receipt.ParentSegments
+	}
+	entry, err := guardedFileEntry(file, segments)
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	fileID := googleUUID(entry.ID)
+	response := gen.CompleteGuardedUploadOK(gen.GuardedFileEntryHeaders{
+		Etag: generationETag(file.Generation), Location: gen.URI(url.URL{Path: "/files/" + fileID.String()}),
+		Response: entry,
+	})
+	return &response, nil
+}
+
+func (h *Handler) guardedUploadOwner(ctx context.Context, uploadID uuid.UUID, requireEdit bool) (int64, error) {
+	actorID, err := UserIDFromContext(ctx)
+	if err != nil {
+		return 0, err
+	}
+	ownerID, err := h.resolveAuthenticatedUploadOwner(ctx, uploadID, requireEdit)
+	if err != nil {
+		return 0, err
+	}
+	if ownerID != actorID {
+		return 0, shares.ErrForbidden
+	}
+	return ownerID, nil
+}
+
+func optionalNilUUID(value gen.NilUUID) *uuid.UUID {
+	id, ok := value.Get()
+	if !ok {
+		return nil
+	}
+	converted := googleUUID(id)
+	return &converted
+}
+
+func guardedCreateRequestAdmission(scope lifecycle.RequestScope, key uuid.UUID, req *gen.GuardedUploadCreateRequest) (*lifecycle.RequestAdmissionInput, error) {
+	if key == uuid.Nil || req == nil {
+		return nil, uploads.ErrInvalidInput
+	}
+	h := admissionHasher{digest: sha256.New()}
+	h.text("teldrive.request.guarded_upload_create.v1")
+	writeNilUUID := func(value gen.NilUUID) {
+		id, ok := value.Get()
+		h.present(ok)
+		if ok {
+			converted := googleUUID(id)
+			_, _ = h.digest.Write(converted[:])
+		}
+	}
+	destination := req.Destination
+	writeNilUUID(destination.MountRoot)
+	writeNilUUID(destination.ParentId)
+	if absent, ok := destination.Expected.GetGuardedSlotAbsent(); ok {
+		h.text("absent")
+		h.text(string(absent.Kind))
+	} else if version, ok := destination.Expected.GetGuardedSlotVersion(); ok {
+		h.text("version")
+		h.text(string(version.Kind))
+		id := googleUUID(version.FileId)
+		_, _ = h.digest.Write(id[:])
+		h.text(version.Generation)
+	} else {
+		return nil, uploads.ErrInvalidInput
+	}
+	h.text(req.Name)
+	h.number(req.Size)
+	mime, present := req.MimeType.Get()
+	h.optionalText(mime, present)
+	h.number(req.ModTime.UTC().UnixMicro())
+	proof, present := req.Hash.Get()
+	h.present(present)
+	if present {
+		h.text(string(proof.Algorithm))
+		h.text(string(proof.Value))
+	}
+	h.present(req.Encryption.Or(false))
+	size, present := req.PreferredPartSize.Get()
+	h.present(present)
+	if present {
+		h.number(size)
+	}
+	in := &lifecycle.RequestAdmissionInput{Scope: scope, RequestKey: key}
+	h.digest.Sum(in.RequestFingerprint[:0])
+	return in, nil
+}
+
+func guardedCompleteRequestAdmission(scope lifecycle.RequestScope, key uuid.UUID, req *gen.GuardedUploadCompleteRequest) (*lifecycle.RequestAdmissionInput, error) {
+	if key == uuid.Nil || req == nil {
+		return nil, uploads.ErrInvalidInput
+	}
+	h := admissionHasher{digest: sha256.New()}
+	h.text("teldrive.request.guarded_upload_complete.v1")
+	h.number(req.Size)
+	h.text(string(req.Hash.Algorithm))
+	h.text(string(req.Hash.Value))
+	in := &lifecycle.RequestAdmissionInput{Scope: scope, RequestKey: key}
+	h.digest.Sum(in.RequestFingerprint[:0])
+	return in, nil
+}
+
+func guardedUploadSession(upload *uploads.GuardedUpload) (gen.GuardedUploadSession, error) {
+	base, err := uploadSession(upload.Session)
+	if err != nil {
+		return gen.GuardedUploadSession{}, err
+	}
+	result := gen.GuardedUploadSession{
+		ID: base.ID, ParentId: base.ParentId, Name: base.Name,
+		ExpectedSize: base.ExpectedSize, ExpectedHash: base.ExpectedHash, MimeType: base.MimeType,
+		ModTime: base.ModTime, Encryption: base.Encryption, ConflictPolicy: base.ConflictPolicy,
+		PartSize: base.PartSize, RequiresCompletionManifest: gen.GuardedUploadSessionRequiresCompletionManifestTrue,
+		State: base.State, ExpiresAt: base.ExpiresAt, CreatedAt: base.CreatedAt,
+		CompletedAt: base.CompletedAt, FileId: base.FileId,
+	}
+	if upload.Receipt != nil {
+		entry, err := guardedFileEntry(upload.Receipt.File, upload.Receipt.ParentSegments)
+		if err != nil {
+			return gen.GuardedUploadSession{}, err
+		}
+		result.CompletedReceipt = gen.NewOptGuardedCompletedReceipt(gen.GuardedCompletedReceipt{
+			AdmissionKey: upload.Receipt.AdmissionKey.String(),
+			UploadId:     apiUUID(upload.Receipt.UploadID),
+			Size:         upload.Receipt.Size,
+			Hash: gen.FileHash{
+				Algorithm: gen.HashAlgorithm(upload.Receipt.HashAlgorithm),
+				Value:     gen.Checksum(upload.Receipt.HashValue),
+			},
+			Result: entry,
+		})
+	}
+	return result, nil
+}
+
+func guardedFileEntry(file *sqlcgen.File, parentSegments []string) (gen.GuardedFileEntry, error) {
+	entry, err := fileEntry(file)
+	if err != nil {
+		return gen.GuardedFileEntry{}, err
+	}
+	return gen.GuardedFileEntry{
+		ID: entry.ID, ParentId: entry.ParentId, Name: entry.Name, Kind: entry.Kind,
+		MimeType: entry.MimeType, Size: entry.Size, Hash: entry.Hash,
+		Encryption: entry.Encryption, Status: entry.Status, ModTime: entry.ModTime,
+		Generation: entry.Generation, CreatedAt: entry.CreatedAt, UpdatedAt: entry.UpdatedAt,
+		ParentPath: entry.ParentPath, ParentSegments: parentSegments,
+	}, nil
 }
 
 func (h *Handler) HeadFile(ctx context.Context, params gen.HeadFileParams) (gen.HeadFileRes, error) {

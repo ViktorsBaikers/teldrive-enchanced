@@ -77,6 +77,7 @@ INSERT INTO upload_sessions (
 	if err != nil {
 		t.Fatal(err)
 	}
+	composeFileopsFixture(t, service)
 	if _, err := catalogService.Trash(ctx, 1001, fileID); err != nil {
 		t.Fatal(err)
 	}

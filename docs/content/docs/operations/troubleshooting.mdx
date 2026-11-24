@@ -70,6 +70,31 @@ Adjust ownership for rootless containers and apply the required bind-mount label
 
 There is no automatic rotation or size limit. Prefer console-log collection when available. If rotating the file by renaming it, restart Teldrive to reopen the configured path; otherwise it continues writing to the old file. Monitor disk usage and keep log files private.
 
+## Log rotation, retention and size
+
+Rotation belongs to the host, not to Teldrive. The process writes to stderr; whatever collects that stream owns size limits and retention.
+
+- **Container.** Docker's `json-file` driver rotates the container log. On the current installation `docker inspect teldrive` reports `max-size=10m` and `max-file=3`, and `docker info` reports the same `json-file` driver. `docker inspect teldrive` reports the log path; its size must stay below `max-size` converted to bytes.
+- **Host service.** A systemd unit with `StandardOutput=journal` is bounded by journald. Check the budget with `journalctl --disk-usage` and the limits in `journald.conf`.
+- **Application file log.** `log-file` is opt-in and append-only. New files are mode `0600`; Teldrive never rotates or truncates them. If you enable it, add host rotation (logrotate with `copytruncate`, or a size-bounded sink) first.
+
+Check the effective sink at any time:
+
+```bash
+docker inspect teldrive --format '{{json .HostConfig.LogConfig}}'
+docker info --format '{{.LoggingDriver}}'
+systemctl show <unit> -p StandardOutput -p StandardError
+journalctl --disk-usage
+```
+
+Redaction applies to paths Teldrive writes: the server sinks and the Teldrive rclone backend redact local and remote paths. Core rclone operations outside that backend can still log generic object paths; treat those log lines as sensitive when sharing.
+
+## Profiler endpoint
+
+Teldrive mounts no profiling endpoint, including Go `net/http/pprof`. Do not add one to a deployed server.
+
+The rclone mount has an RC profiler path (`/debug/pprof/`), but it is reachable only when the RC server is enabled and authenticated. Never enable RC with its no-auth flag on a host that is reachable by others: that would expose the profile, process arguments and environment.
+
 ## Teldrive exits immediately
 
 Check the first error. Common causes:

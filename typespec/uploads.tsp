@@ -35,9 +35,17 @@ model UploadCreateRequest {
   encryption?: boolean = false;
   conflictPolicy?: NameConflictPolicy = NameConflictPolicy.fail;
 
-  /** Optional preferred part size. The server may choose a different value. */
+  /** Optional preferred part size, rounded upward to a 16 MiB multiple. */
   @minValue(1048576)
   preferredPartSize?: int64;
+}
+
+/** Current-attempt plaintext EOF and optional whole-source tree hash. */
+model UploadCompleteRequest {
+  @minValue(0)
+  size: int64;
+
+  hash?: FileHash;
 }
 
 model UploadSession {
@@ -47,10 +55,17 @@ model UploadSession {
   expectedSize: int64;
   expectedHash?: FileHash;
   mimeType?: string;
+
+  @extension("x-ogen-time-format", "2006-01-02T15:04:05.999999999Z07:00")
   modTime: utcDateTime;
+
   encryption: boolean;
   conflictPolicy: NameConflictPolicy;
   partSize: int64;
+
+  /** Requires current-attempt completion proof and exact-body part replay. */
+  requiresCompletionManifest: true;
+
   state: UploadState;
   expiresAt: utcDateTime;
   createdAt: utcDateTime;
@@ -146,6 +161,139 @@ model UploadCompletedResponse {
   body: FileEntry;
 }
 
+/** Authorized guarded discovery response; the body is intentionally empty. */
+model GuardedUploadDiscovery {}
+
+@oneOf
+union GuardedSlotExpectation {
+  absent: GuardedSlotAbsent,
+  version: GuardedSlotVersion,
+}
+
+/** Empty-slot intent: the admitted destination must stay empty through commit. */
+model GuardedSlotAbsent {
+  kind: "absent";
+}
+
+/** Occupied-slot intent: exactly this file identity and generation are replaced. */
+model GuardedSlotVersion {
+  kind: "version";
+  fileId: Uuid;
+
+  /** Positive canonical int64 decimal file generation. */
+  generation: string;
+}
+
+/**
+ * Immutable destination intent for a guarded upload.
+ * A null mountRoot or parentId explicitly means the account root; omissions are invalid.
+ * The leaf is the guarded create `name` and is never a path or rename request.
+ */
+model GuardedUploadDestination {
+  mountRoot: Uuid | null;
+  parentId: Uuid | null;
+  expected: GuardedSlotExpectation;
+}
+
+/**
+ * Guarded create body. The destination owns the parent slot, so the legacy
+ * `parentId` and derived `conflictPolicy` are not accepted here.
+ */
+model GuardedUploadCreateRequest {
+  destination: GuardedUploadDestination;
+
+  @minLength(1)
+  @maxLength(255)
+  name: string;
+
+  /** Expected size in bytes, or -1 when the size is unknown until completion. */
+  @minValue(-1)
+  size: int64;
+
+  mimeType?: string;
+  modTime: utcDateTime;
+  hash?: FileHash;
+  encryption?: boolean = false;
+
+  /** Optional preferred part size, rounded upward to a 16 MiB multiple. */
+  @minValue(1048576)
+  preferredPartSize?: int64;
+}
+
+/** Guarded completion always carries the exact plaintext size and BLAKE3 tree digest. */
+model GuardedUploadCompleteRequest {
+  @minValue(0)
+  size: int64;
+
+  hash: FileHash;
+}
+
+/** Canonical stored-name segments from the pinned root to the parent; `[]` at root. */
+model GuardedFileEntry extends FileEntry {
+  parentSegments?: string[];
+}
+
+/** Immutable publication receipt for a reauthorized exact guarded result. */
+model GuardedCompletedReceipt {
+  admissionKey: string;
+  uploadId: Uuid;
+  size: int64;
+  hash: FileHash;
+  result: GuardedFileEntry;
+}
+
+/** Guarded-only extension of the existing session DTO. */
+model GuardedUploadSession extends UploadSession {
+  /** Present only for a reauthorized exact result in the current incarnation. */
+  completedReceipt?: GuardedCompletedReceipt;
+}
+
+model RecoveryIncarnationHeader {
+  /** Current recovery incarnation; a mismatch returns 412/upload_recovery_changed. */
+  @header("X-TelDrive-Recovery-Incarnation")
+  recoveryIncarnation: Uuid;
+}
+
+model GuardedDiscoveryResponse {
+  @statusCode
+  statusCode: 200;
+
+  @header("X-TelDrive-Recovery-Incarnation")
+  recoveryIncarnation: Uuid;
+
+  @body
+  body: GuardedUploadDiscovery;
+}
+
+model GuardedUploadStatusResponse {
+  @statusCode
+  statusCode: 200;
+
+  @header("X-TelDrive-Recovery-Incarnation")
+  recoveryIncarnation: Uuid;
+
+  /** Emitted only after a current guard or exact result check succeeded. */
+  @header("X-TelDrive-Upload-Guard")
+  uploadGuard: "1";
+
+  @body
+  body: GuardedUploadSession;
+}
+
+model GuardedUploadCompletedResponse {
+  @statusCode
+  statusCode: 200 | 201;
+
+  @header("Etag")
+  ETag: ETag;
+
+  @header("Location")
+  location: Uri;
+
+  @body
+  body: GuardedFileEntry;
+}
+
 @tag("Uploads")
 @route("/v1/uploads")
 @useAuth(TelDriveAuth)
@@ -172,7 +320,134 @@ namespace Uploads {
     | ErrorResponse<401>
     | ErrorResponse<422>;
 
-  /** Queue local paths, recursive folders, and HTTP URLs for server-side upload. */
+  /**
+   * Return the current recovery incarnation to authorized guarded clients.
+   * The empty object proves only discovery; it grants no upload capability.
+   */
+  @get
+  @route("/guarded")
+  @operationId("discoverGuardedUpload")
+  op discoverGuarded(): GuardedDiscoveryResponse | ErrorResponse<401>;
+
+  /**
+   * Create an owner-only guarded upload from an immutable destination intent.
+   * The required incarnation must match the current one; a mismatch returns
+   * 412/upload_recovery_changed before allocation. A slot mismatch returns
+   * 412/upload_destination_changed. A same-key changed DTO returns 409/conflict,
+   * and terminal destination loss returns 409/upload_parent_unavailable.
+   * Semantically malformed guards return 422; undecodable JSON returns 400.
+   */
+  @post
+  @route("/guarded")
+  @operationId("createGuardedUpload")
+  op createGuarded(
+    ...IdempotencyHeader,
+    ...RecoveryIncarnationHeader,
+    @body body: GuardedUploadCreateRequest,
+  ):
+    | JsonResponse<201, UploadSession>
+    | ErrorResponse<400>
+    | ErrorResponse<401>
+    | ErrorResponse<403>
+    | ErrorResponse<404>
+    | ErrorResponse<409>
+    | ErrorResponse<412>
+    | ErrorResponse<413>
+    | ErrorResponse<422>
+    | ErrorResponse<429>;
+
+  /**
+   * Inspect a guarded attempt under the current recovery incarnation.
+   * Returns the guarded-only session extension and `X-TelDrive-Upload-Guard: 1`
+   * only after a current guard or exact result check succeeds. An incarnation
+   * mismatch returns 412/upload_recovery_changed; a changed destination returns
+   * 412/upload_destination_changed. Terminal destination loss returns
+   * 409/upload_parent_unavailable, and expiry returns 410.
+   */
+  @get
+  @route("/guarded/{uploadId}")
+  @operationId("getGuardedUpload")
+  op getGuarded(...RecoveryIncarnationHeader, @path uploadId: Uuid):
+    | GuardedUploadStatusResponse
+    | ErrorResponse<401>
+    | ErrorResponse<403>
+    | ErrorResponse<404>
+    | ErrorResponse<409>
+    | ErrorResponse<410>
+    | ErrorResponse<412>
+    | ErrorResponse<422>;
+
+  /**
+   * Upload one guarded part. The `(uploadId, partNo)` pair is the idempotency key.
+   * The incarnation and admitted destination are rechecked before any body is read;
+   * refusal consumes no part body, allocates nothing and publishes nothing.
+   * Completed-part retries verify the exact body before returning stored metadata.
+   * A mismatched incarnation returns 412/upload_recovery_changed and a changed slot
+   * returns 412/upload_destination_changed. Terminal destination loss returns
+   * 409/upload_parent_unavailable without relocation.
+   */
+  @put
+  @route("/guarded/{uploadId}/parts/{partNo}")
+  @operationId("putGuardedUploadPart")
+  op putGuardedPart(
+    ...UploadPartHeaders,
+    ...RecoveryIncarnationHeader,
+    @path uploadId: Uuid,
+    @path @minValue(1) partNo: int32,
+
+    /** Store the part in this owned channel instead of the selected channel. */
+    @query channelId?: int64,
+
+    @body body: bytes,
+  ):
+    | UploadPartStoredResponse
+    | ErrorResponse<400>
+    | ErrorResponse<401>
+    | ErrorResponse<403>
+    | ErrorResponse<404>
+    | ErrorResponse<409>
+    | ErrorResponse<410>
+    | ErrorResponse<412>
+    | ErrorResponse<413>
+    | ErrorResponse<422>
+    | ErrorResponse<429>
+    | ErrorResponse<503>;
+
+  /**
+   * Atomically publish a guarded upload after validating the exact size and
+   * BLAKE3 plaintext tree digest against every stored part. The required
+   * incarnation and frozen destination are rechecked under the commit guard;
+   * a mismatch returns 412/upload_recovery_changed or 412/upload_destination_changed
+   * without publication. A same-key changed request returns 409/conflict, terminal
+   * destination loss returns 409/upload_parent_unavailable, and expiry returns 410.
+   * Success returns the extended FileEntry with the current commit-time location.
+   */
+  @post
+  @route("/guarded/{uploadId}/complete")
+  @operationId("completeGuardedUpload")
+  op completeGuarded(
+    ...IdempotencyHeader,
+    ...RecoveryIncarnationHeader,
+    @path uploadId: Uuid,
+    @body body: GuardedUploadCompleteRequest,
+  ):
+    | GuardedUploadCompletedResponse
+    | ErrorResponse<400>
+    | ErrorResponse<401>
+    | ErrorResponse<403>
+    | ErrorResponse<404>
+    | ErrorResponse<409>
+    | ErrorResponse<410>
+    | ErrorResponse<412>
+    | ErrorResponse<422>;
+
+  /**
+   * Queue server-side imports only after durable destination admission.
+   * Concrete existing ancestor identities are pinned before source access;
+   * destination loss permanently fences that admitted batch, even after restore.
+   * Authorized parent loss returns 409/upload_parent_unavailable with message
+   * "upload destination folder is unavailable". Generic jobs cannot bypass admission.
+   */
   @post
   @route("/imports")
   @operationId("createUploadImport")
@@ -180,22 +455,35 @@ namespace Uploads {
     | JsonResponse<202, Job>
     | ErrorResponse<400>
     | ErrorResponse<401>
+    | ErrorResponse<403>
+    | ErrorResponse<404>
+    | ErrorResponse<409>
     | ErrorResponse<422>
     | ErrorResponse<503>;
 
-  /** Create a durable upload session. */
+  /**
+   * Create a durable upload session scoped by the current actor and Idempotency-Key.
+   * Matching requests return the same session; changed requests return 409/conflict
+   * only after current authorization. A key never grants access.
+   * Authorized terminal attempts return 409/upload_parent_unavailable with message
+   * "upload destination folder is unavailable"; restoring a folder cannot reopen them.
+   * Unpublished legacy sessions whose original destination cannot be established
+   * also refuse resume and require a genuinely new attempt, without deleting bytes.
+   */
   @post
   @operationId("createUpload")
   op create(...IdempotencyHeader, @body body: UploadCreateRequest):
     | JsonResponse<201, UploadSession>
+    | ErrorResponse<400>
     | ErrorResponse<401>
+    | ErrorResponse<403>
     | ErrorResponse<404>
     | ErrorResponse<409>
     | ErrorResponse<413>
     | ErrorResponse<422>
     | ErrorResponse<429>;
 
-  /** Inspect an upload for resume and conflict handling. */
+  /** Inspect an authorized attempt. Terminal destination loss returns 409/upload_parent_unavailable. */
   @get
   @route("/{uploadId}")
   @operationId("getUpload")
@@ -203,7 +491,10 @@ namespace Uploads {
     | JsonResponse<200, UploadSession>
     | ErrorResponse<401>
     | ErrorResponse<404>
-    | ErrorResponse<410>;
+    | ErrorResponse<403>
+    | ErrorResponse<409>
+    | ErrorResponse<410>
+    | ErrorResponse<422>;
 
   /** List parts already known to the upload session. */
   @get
@@ -213,11 +504,18 @@ namespace Uploads {
     | JsonResponse<200, CursorPage<UploadPart>>
     | ErrorResponse<401>
     | ErrorResponse<404>
-    | ErrorResponse<410>;
+    | ErrorResponse<403>
+    | ErrorResponse<409>
+    | ErrorResponse<410>
+    | ErrorResponse<422>;
 
   /**
    * Upload one part. The `(uploadId, partNo)` pair is the idempotency key.
-   * An exact retry returns the existing stored part; conflicting size/checksum returns 409.
+   * Every retry consumes the exact body and verifies equality before returning stored metadata.
+   * Nonfinal parts use the negotiated aligned size; only the final part may be shorter.
+   * Completed-part retries recheck access to the actual current result after body verification.
+   * Closing/deleted storage channels return ordinary 409/conflict, not parent loss.
+   * Terminal destination loss returns 409/upload_parent_unavailable without relocation.
    */
   @put
   @route("/{uploadId}/parts/{partNo}")
@@ -239,6 +537,7 @@ namespace Uploads {
     | UploadPartStoredResponse
     | ErrorResponse<400>
     | ErrorResponse<401>
+    | ErrorResponse<403>
     | ErrorResponse<404>
     | ErrorResponse<409>
     | ErrorResponse<410>
@@ -248,15 +547,25 @@ namespace Uploads {
     | ErrorResponse<503>;
 
   /**
-   * Validate all parts and transactionally publish the file. A successful response
-   * guarantees immediate read-after-write visibility.
+   * Validate the current-attempt size/hash against every stored part and atomically publish.
+   * Contradictory completed replays fail; agreeing replays return the original file.
+   * Current result access remains required, including after moves, revocation, trash or purge.
+   * Terminal destination loss returns 409/upload_parent_unavailable with message
+   * "upload destination folder is unavailable", even after restore or restart.
+   * Secondary cleanup failure never changes that primary response.
    */
   @post
   @route("/{uploadId}/complete")
   @operationId("completeUpload")
-  op complete(...IdempotencyHeader, @path uploadId: Uuid):
+  op complete(
+    ...IdempotencyHeader,
+    @path uploadId: Uuid,
+    @body body: UploadCompleteRequest,
+  ):
     | UploadCompletedResponse
+    | ErrorResponse<400>
     | ErrorResponse<401>
+    | ErrorResponse<403>
     | ErrorResponse<404>
     | ErrorResponse<409>
     | ErrorResponse<410>

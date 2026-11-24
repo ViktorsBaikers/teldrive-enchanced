@@ -19,9 +19,11 @@ import (
 )
 
 var (
-	version = "dev"
-	commit  = "unknown"
-	date    = "unknown"
+	version  = "dev"
+	commit   = "unknown"
+	date     = "unknown"
+	snapshot = "unknown"
+	dirty    = "unknown"
 )
 
 func main() {
@@ -121,8 +123,8 @@ func newVersionCommand() *cobra.Command {
 			if len(shortCommit) > 7 {
 				shortCommit = shortCommit[:7]
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "teldrive %s\n- commit: %s\n- built: %s\n- go/version: %s\n- os/arch: %s/%s\n",
-				buildVersion(), shortCommit, date, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+			fmt.Fprintf(cmd.OutOrStdout(), "teldrive %s\n- commit: %s\n- built: %s\n- snapshot: %s\n- dirty: %s\n- go/version: %s\n- os/arch: %s/%s\n",
+				buildVersion(), shortCommit, date, snapshot, dirty, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 		},
 	}
 }

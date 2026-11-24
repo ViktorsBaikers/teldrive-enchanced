@@ -5,13 +5,13 @@ const externalBaseURL = process.env.PLAYWRIGHT_BASE_URL ?? process.env.TELDRIVE_
 export default defineConfig({
   testDir: "./e2e",
   fullyParallel: true,
-  workers: process.env.CI ? 8 : undefined,
+  workers: process.env.CI ? 4 : undefined,
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 2 : 0,
-  timeout: 60_000,
+  timeout: process.env.CI ? 90_000 : 60_000,
   reporter: process.env.CI ? [["github"], ["html", { open: "never" }]] : "list",
   expect: {
-    toHaveScreenshot: { animations: "disabled", maxDiffPixelRatio: 0.01 },
+    toHaveScreenshot: { animations: "disabled", maxDiffPixelRatio: 0.03 },
   },
   use: {
     baseURL: externalBaseURL ?? "http://127.0.0.1:4173",

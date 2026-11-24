@@ -32,6 +32,8 @@ type UploadRequest struct {
 	Threads   int
 }
 
+// StoredPart is a validated destination receipt, even when Upload or CopyPart
+// also returns an error. Callers must inspect both values before compensation.
 type StoredPart struct {
 	ChannelID int64
 	MessageID int64
@@ -100,6 +102,18 @@ type Channel struct {
 	ID   int64
 	Name string
 }
+
+// ChannelCreationError retains a positively known allocation when provisioning
+// or the outer runner fails. UserID is positive, ChannelID nonzero and Err required.
+// It grants no automatic whole-channel deletion authority.
+type ChannelCreationError struct {
+	UserID    int64
+	ChannelID int64
+	Err       error
+}
+
+func (e *ChannelCreationError) Error() string { return e.Err.Error() }
+func (e *ChannelCreationError) Unwrap() error { return e.Err }
 
 // Storage is the Telegram object boundary used by upload, download, cleanup,
 // and rollover services. Tests use deterministic in-memory implementations;

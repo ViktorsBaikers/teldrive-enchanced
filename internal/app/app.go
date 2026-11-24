@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,7 @@ import (
 	"github.com/tgdrive/teldrive/v2/internal/health"
 	"github.com/tgdrive/teldrive/v2/internal/jobs"
 	"github.com/tgdrive/teldrive/v2/internal/legacymigrate"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 	"github.com/tgdrive/teldrive/v2/internal/secureblob"
 	"github.com/tgdrive/teldrive/v2/internal/shares"
 	"github.com/tgdrive/teldrive/v2/internal/telegramstore"
@@ -44,6 +46,8 @@ import (
 var (
 	ErrInvalidDependencies = errors.New("invalid application dependencies")
 	ErrAlreadyRunning      = errors.New("application is already running")
+
+	requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 )
 
 type Dependencies struct {
@@ -176,9 +180,16 @@ func New(ctx context.Context, cfg config.Config, dependencies Dependencies) (*Ap
 	if err != nil {
 		return nil, fmt.Errorf("create bot service: %w", err)
 	}
+	receiptPolicy := lifecycle.NewService(pool, storage)
 	catalogService := catalog.NewService(pool, globalCache)
 	uploadService := uploads.NewService(pool, cfg.Uploads.SessionTTL)
 	uploadService.SetCacheInvalidator(catalogService)
+	if err := catalogService.BindLifecycle(receiptPolicy); err != nil {
+		return nil, fmt.Errorf("bind catalog lifecycle: %w", err)
+	}
+	if err := uploadService.BindLifecycle(receiptPolicy); err != nil {
+		return nil, fmt.Errorf("bind upload lifecycle: %w", err)
+	}
 	channelService := channels.NewService(pool, channels.TelegramCreator{Storage: storage}, channels.Config{
 		PartLimit: cfg.Telegram.ChannelPartLimit, AutoCreate: cfg.Telegram.AutoChannelCreate,
 		NamePrefix: cfg.Telegram.ChannelNamePrefix,
@@ -188,6 +199,7 @@ func New(ctx context.Context, cfg config.Config, dependencies Dependencies) (*Ap
 	uploadPipeline := transfer.NewPipeline(uploadService, channelService, storage, keys, transfer.Config{
 		UploadThreads: cfg.Telegram.UploadThreads, RandomizePartNames: cfg.Telegram.RandomizePartNames,
 		DisableHashing: !cfg.Uploads.HashingEnabled,
+		Receipts:       receiptPolicy,
 	})
 	downloadCache, err := newDownloadCache(cfg.Cache.Disk)
 	if err != nil {
@@ -204,6 +216,9 @@ func New(ctx context.Context, cfg config.Config, dependencies Dependencies) (*Ap
 	if err != nil {
 		return nil, fmt.Errorf("create file operations service: %w", err)
 	}
+	if err := fileService.BindLifecycle(receiptPolicy); err != nil {
+		return nil, fmt.Errorf("bind file operations lifecycle: %w", err)
+	}
 	shareService, err := shares.NewService(pool, catalogService)
 	if err != nil {
 		return nil, fmt.Errorf("create share service: %w", err)
@@ -212,10 +227,13 @@ func New(ctx context.Context, cfg config.Config, dependencies Dependencies) (*Ap
 	jobRuntime, err := jobs.NewRuntimeWithServices(
 		pool, storage, cfg.Database.Schema, botService, secureCipher, cfg.Uploads.SessionTTL,
 		jobs.UploaderServices{Catalog: catalogService, Uploads: uploadService, Pipeline: uploadPipeline, ActiveKeyVersion: cfg.Encryption.ActiveKeyVersion, EncryptionRequired: cfg.Uploads.EncryptionRequired, LocalImportRoots: cfg.Uploads.LocalImportRoots},
-		fileService,
+		receiptPolicy, fileService,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create job runtime: %w", err)
+	}
+	if err := receiptPolicy.BindReceiptEnqueuer(jobRuntime); err != nil {
+		return nil, fmt.Errorf("bind receipt recovery enqueuer: %w", err)
 	}
 	handler := api.NewHandler(
 		catalogService, uploadService, uploadPipeline, downloader, healthService,
@@ -237,7 +255,7 @@ func New(ctx context.Context, cfg config.Config, dependencies Dependencies) (*Ap
 	if err != nil {
 		return nil, fmt.Errorf("configure trusted proxies: %w", err)
 	}
-	mux.Use(httpRequestLogger(dependencies.Logger, requestSecurity))
+	mux.Use(httpRequestLogger(dependencies.Logger, requestSecurity, httpServer))
 	routeApplication(mux, requestSecurity.middleware(browserCSRFMiddleware(sessionRenewalMiddleware(authService, httpServer))), webUI)
 
 	application := &App{
@@ -289,7 +307,7 @@ func expandHomePath(path string) (string, error) {
 func requestIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
-		if requestID == "" {
+		if !requestIDPattern.MatchString(requestID) {
 			requestID = uuid.NewString()
 		}
 		ctx := context.WithValue(r.Context(), middleware.RequestIDKey, requestID)

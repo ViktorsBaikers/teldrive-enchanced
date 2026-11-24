@@ -14,6 +14,7 @@ import (
 	"github.com/tgdrive/teldrive/v2/internal/api/gen"
 	"github.com/tgdrive/teldrive/v2/internal/bots"
 	"github.com/tgdrive/teldrive/v2/internal/jobs"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 	"github.com/tgdrive/teldrive/v2/internal/principal"
 	"github.com/tgdrive/teldrive/v2/internal/secureblob"
 	testpostgres "github.com/tgdrive/teldrive/v2/internal/testutil/postgres"
@@ -48,8 +49,13 @@ func TestProvisionBotRequiresOwnershipAndQueuesManualJob(t *testing.T) {
 	if _, err := svc.InsertPending(ctx, 1001, []string{"777:secret"}); err != nil {
 		t.Fatal(err)
 	}
-	runtime, err := jobs.NewRuntimeWithSchemaAndBotProvision(db.Pool, manualProvisionStorage{}, "teldrive", svc, cipher, 7*24*time.Hour)
+	storage := manualProvisionStorage{}
+	policy := lifecycle.NewService(db.Pool, storage)
+	runtime, err := jobs.NewRuntimeWithSchemaAndBotProvision(db.Pool, storage, "teldrive", svc, cipher, 7*24*time.Hour, policy)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := policy.BindReceiptEnqueuer(runtime); err != nil {
 		t.Fatal(err)
 	}
 	handler := &Handler{Bots: svc, Jobs: runtime}
@@ -145,8 +151,13 @@ func TestProvisionAllBotsIncludesEveryOwnedBotAndReusesSingleTasks(t *testing.T)
 	if _, err := db.Pool.Exec(ctx, "UPDATE bots SET enabled=true WHERE user_id=1001 AND bot_id % 2 = 0"); err != nil {
 		t.Fatal(err)
 	}
-	runtime, err := jobs.NewRuntimeWithSchemaAndBotProvision(db.Pool, manualProvisionStorage{}, "teldrive", svc, cipher, 7*24*time.Hour)
+	storage := manualProvisionStorage{}
+	policy := lifecycle.NewService(db.Pool, storage)
+	runtime, err := jobs.NewRuntimeWithSchemaAndBotProvision(db.Pool, storage, "teldrive", svc, cipher, 7*24*time.Hour, policy)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := policy.BindReceiptEnqueuer(runtime); err != nil {
 		t.Fatal(err)
 	}
 	handler := &Handler{Bots: svc, Jobs: runtime}
@@ -225,8 +236,13 @@ func TestCreateBotsQueuesIndependentTasks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime, err := jobs.NewRuntimeWithSchemaAndBotProvision(db.Pool, manualProvisionStorage{}, "teldrive", svc, cipher, 7*24*time.Hour)
+	storage := manualProvisionStorage{}
+	policy := lifecycle.NewService(db.Pool, storage)
+	runtime, err := jobs.NewRuntimeWithSchemaAndBotProvision(db.Pool, storage, "teldrive", svc, cipher, 7*24*time.Hour, policy)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := policy.BindReceiptEnqueuer(runtime); err != nil {
 		t.Fatal(err)
 	}
 	handler := &Handler{Bots: svc, Jobs: runtime}

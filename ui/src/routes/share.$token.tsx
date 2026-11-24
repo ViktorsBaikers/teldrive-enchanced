@@ -4,8 +4,9 @@ import { useEffect, useState } from "react";
 import { FileTrigger, type Selection } from "react-aria-components";
 import { toast } from "sonner";
 import { apiFetch } from "@/api/client";
-import { ApiError, userMessage } from "@/api/errors";
-import type { FileEntry, PublicShare } from "@/api/types";
+import { ApiError, invalidResponse, userMessage } from "@/api/errors";
+import type { components } from "@/api/schema";
+import type { FileEntry, PublicShare, UploadSession } from "@/api/types";
 import { AppDialog } from "@/components/dialogs/app-dialog";
 import { FilePreviewDialog, isPreviewable } from "@/components/file-preview-dialog";
 import { Page, PageContent } from "@/components/page";
@@ -29,7 +30,7 @@ export const Route = createFileRoute("/share/$token")({
 });
 
 type ShareFilePage = { items: FileEntry[] };
-type UploadSession = { id: string; partSize: number };
+type UploadCompleteRequest = components["schemas"]["UploadCompleteRequest"];
 
 function PublicSharePage() {
   const { token } = Route.useParams();
@@ -282,27 +283,42 @@ function PublicSharePage() {
     setUploading(true);
     let uploadId = "";
     try {
+      if (!Number.isSafeInteger(file.size) || file.size < 0)
+        throw invalidResponse("The upload session response is malformed.");
+      const createKey = newIdempotencyKey();
+      const createPayload = JSON.stringify({
+        parentId: currentParentId,
+        name: file.name,
+        size: file.size,
+        mimeType: file.type || undefined,
+        modTime: new Date(file.lastModified || Date.now()).toISOString(),
+        conflictPolicy: "rename",
+      });
       const createResponse = await apiFetch(
         `/v1/public/shares/${encodeURIComponent(token)}/uploads`,
         {
           method: "POST",
           headers: {
             ...jsonShareHeaders(activePassword),
-            "Idempotency-Key": newIdempotencyKey(),
+            "Idempotency-Key": createKey,
           },
-          body: JSON.stringify({
-            parentId: currentParentId,
-            name: file.name,
-            size: file.size,
-            mimeType: file.type || undefined,
-            modTime: new Date(file.lastModified || Date.now()).toISOString(),
-            conflictPolicy: "rename",
-          }),
+          body: createPayload,
         },
       );
       const session = (await createResponse.json()) as UploadSession;
+      if (
+        !session ||
+        typeof session.id !== "string" ||
+        session.requiresCompletionManifest !== true ||
+        !Number.isSafeInteger(session.partSize) ||
+        session.partSize <= 0 ||
+        session.partSize % (16 * 1024 * 1024) !== 0 ||
+        Math.ceil(file.size / session.partSize) > 2147483647 ||
+        session.state !== "open"
+      )
+        throw invalidResponse("The upload session response is malformed.");
       uploadId = session.id;
-      const partSize = Math.max(1, session.partSize);
+      const partSize = session.partSize;
       let partNo = 1;
       for (let offset = 0; offset < file.size; offset += partSize, partNo += 1) {
         const chunk = file.slice(offset, Math.min(file.size, offset + partSize));
@@ -310,7 +326,10 @@ function PublicSharePage() {
           `/v1/public/shares/${encodeURIComponent(token)}/uploads/${encodeURIComponent(uploadId)}/parts/${partNo}`,
           {
             method: "PUT",
-            headers: shareHeaders(activePassword),
+            headers: {
+              ...shareHeaders(activePassword),
+              "Content-Type": "application/octet-stream",
+            },
             body: chunk,
           },
         );
@@ -320,13 +339,18 @@ function PublicSharePage() {
         {
           method: "POST",
           headers: {
-            ...(shareHeaders(activePassword) ?? {}),
+            ...jsonShareHeaders(activePassword),
             "Idempotency-Key": newIdempotencyKey(),
           },
+          body: JSON.stringify({ size: file.size } satisfies UploadCompleteRequest),
         },
       );
-      await refreshItems();
       toast.success(t("pub.uploaded", { name: file.name }));
+      try {
+        await refreshItems();
+      } catch (cause) {
+        setError(userMessage(cause));
+      }
     } catch (cause) {
       if (uploadId) {
         void apiFetch(

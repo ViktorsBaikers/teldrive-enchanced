@@ -1,19 +1,26 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
+	"hash"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/tgdrive/teldrive/v2/internal/api/gen"
 	"github.com/tgdrive/teldrive/v2/internal/authn"
 	"github.com/tgdrive/teldrive/v2/internal/catalog"
 	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
 	"github.com/tgdrive/teldrive/v2/internal/dbtypes"
+	"github.com/tgdrive/teldrive/v2/internal/fileops"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 	"github.com/tgdrive/teldrive/v2/internal/shares"
 	"github.com/tgdrive/teldrive/v2/internal/transfer"
 	"github.com/tgdrive/teldrive/v2/internal/uploads"
@@ -338,18 +345,39 @@ func (h *Handler) CreatePublicShareUpload(ctx context.Context, req *gen.UploadCr
 	if h.Shares == nil || h.Uploads == nil || req == nil {
 		return nil, mapServiceError(ErrOperationUnavailable)
 	}
-	var requestedParent *uuid.UUID
-	if value, ok := req.ParentId.Get(); ok {
-		id := googleUUID(value)
-		requestedParent = &id
-	}
-	resolved, parentID, err := h.Shares.ResolvePublicEditableParent(ctx, params.Token, params.XSharePassword.Or(""), requestedParent)
+	resolved, err := h.Shares.Resolve(ctx, params.Token, params.XSharePassword.Or(""))
 	if err != nil {
 		return nil, mapServiceError(err)
 	}
-	session, err := h.createUploadForOwner(ctx, resolved.Share.OwnerID, &parentID, req)
+	shareID := uuid.UUID(resolved.Share.ID.Bytes)
+	admission, err := uploadRequestAdmission(lifecycle.RequestScope{PublicShareID: &shareID}, googleUUID(params.IdempotencyKey), req)
 	if err != nil {
-		return nil, err
+		return nil, mapServiceError(err)
+	}
+	session, found, err := h.replayUploadAdmission(ctx, admission, params.Token, params.XSharePassword.Or(""))
+	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	if !found {
+		requestedParent := optionalGoogleUUID(req.ParentId)
+		resolved, parentID, resolveErr := h.Shares.ResolvePublicEditableParent(ctx, params.Token, params.XSharePassword.Or(""), requestedParent)
+		if resolveErr != nil {
+			return nil, mapServiceError(resolveErr)
+		}
+		session, err = h.createUploadForOwner(ctx, resolved.Share.OwnerID, &parentID, req, admission)
+	}
+	if err != nil {
+		retained, exists, replayErr := h.replayUploadAdmission(ctx, admission, params.Token, params.XSharePassword.Or(""))
+		if replayErr != nil {
+			return nil, mapServiceError(replayErr)
+		}
+		if !exists {
+			return nil, err
+		}
+		session = retained
+	}
+	if _, err := h.resolvePublicUploadOwner(ctx, params.Token, params.XSharePassword.Or(""), uuid.UUID(session.ID.Bytes)); err != nil {
+		return nil, mapServiceError(err)
 	}
 	response, err := uploadSession(session)
 	if err != nil {
@@ -375,6 +403,9 @@ func (h *Handler) PutPublicShareUploadPart(ctx context.Context, req gen.PutPubli
 		UserID: ownerID, UploadID: googleUUID(params.UploadId), PartNo: params.PartNo,
 		PlainSize: params.ContentLength, Checksum: checksum, Body: req.Data,
 	})
+	if _, accessErr := h.resolvePublicUploadOwner(ctx, params.Token, params.XSharePassword.Or(""), googleUUID(params.UploadId)); accessErr != nil {
+		return nil, mapServiceError(accessErr)
+	}
 	if err != nil {
 		return nil, mapServiceError(err)
 	}
@@ -390,7 +421,7 @@ func (h *Handler) PutPublicShareUploadPart(ctx context.Context, req gen.PutPubli
 	return &response, nil
 }
 
-func (h *Handler) CompletePublicShareUpload(ctx context.Context, params gen.CompletePublicShareUploadParams) (gen.CompletePublicShareUploadRes, error) {
+func (h *Handler) CompletePublicShareUpload(ctx context.Context, req *gen.UploadCompleteRequest, params gen.CompletePublicShareUploadParams) (gen.CompletePublicShareUploadRes, error) {
 	if h.Shares == nil || h.Uploads == nil {
 		return nil, mapServiceError(ErrOperationUnavailable)
 	}
@@ -398,8 +429,16 @@ func (h *Handler) CompletePublicShareUpload(ctx context.Context, params gen.Comp
 	if err != nil {
 		return nil, mapServiceError(err)
 	}
-	file, err := h.Uploads.Complete(ctx, ownerID, googleUUID(params.UploadId))
+	in := uploads.CompleteInput{UserID: ownerID, UploadID: googleUUID(params.UploadId), Size: req.Size}
+	if hash, ok := req.Hash.Get(); ok {
+		algorithm, value := string(hash.Algorithm), string(hash.Value)
+		in.HashAlgorithm, in.HashValue = &algorithm, &value
+	}
+	file, err := h.Uploads.Complete(ctx, in)
 	if err != nil {
+		return nil, mapServiceError(err)
+	}
+	if _, err := h.Shares.ResolvePublicEditableFile(ctx, params.Token, params.XSharePassword.Or(""), uuid.UUID(file.ID.Bytes)); err != nil {
 		return nil, mapServiceError(err)
 	}
 	entry, err := fileEntry(file)
@@ -468,13 +507,31 @@ func (h *Handler) resolveAuthenticatedUploadOwner(ctx context.Context, uploadID 
 	if err != nil {
 		return 0, err
 	}
+	if session.State == sqlcgen.UploadStateCompleted {
+		fileID, ok := dbtypes.GoogleUUID(session.FileID)
+		if !ok {
+			return 0, shares.ErrNotFound
+		}
+		access, err := h.resolveAuthenticatedFileAccess(ctx, fileID, requireEdit)
+		if err != nil {
+			return 0, err
+		}
+		if access.OwnerID != session.UserID {
+			return 0, shares.ErrForbidden
+		}
+		if _, err := h.Uploads.Get(ctx, session.UserID, uploadID); err != nil {
+			return 0, err
+		}
+		return session.UserID, nil
+	}
 	if session.UserID == actorID {
 		return actorID, nil
 	}
 	if h.Shares == nil {
 		return 0, shares.ErrForbidden
 	}
-	parentID, ok := dbtypes.GoogleUUID(session.ParentID)
+	targetID := session.ParentID
+	parentID, ok := dbtypes.GoogleUUID(targetID)
 	if !ok {
 		return 0, shares.ErrForbidden
 	}
@@ -493,8 +550,28 @@ func (h *Handler) resolvePublicUploadOwner(ctx context.Context, token, password 
 	if err != nil {
 		return 0, err
 	}
+	if session.State == sqlcgen.UploadStateCompleted {
+		fileID, ok := dbtypes.GoogleUUID(session.FileID)
+		if !ok {
+			return 0, shares.ErrNotFound
+		}
+		resolved, err := h.Shares.ResolvePublicEditableFile(ctx, token, password, fileID)
+		if err != nil {
+			return 0, err
+		}
+		if resolved.Share.OwnerID != session.UserID {
+			return 0, shares.ErrForbidden
+		}
+		if _, err := h.Uploads.Get(ctx, session.UserID, uploadID); err != nil {
+			return 0, err
+		}
+		return session.UserID, nil
+	}
 	parentID, ok := dbtypes.GoogleUUID(session.ParentID)
 	if !ok {
+		if _, err := h.Shares.Resolve(ctx, token, password); err != nil {
+			return 0, err
+		}
 		return 0, shares.ErrForbidden
 	}
 	resolved, _, err := h.Shares.ResolvePublicEditableParent(ctx, token, password, &parentID)
@@ -507,10 +584,11 @@ func (h *Handler) resolvePublicUploadOwner(ctx context.Context, token, password 
 	return session.UserID, nil
 }
 
-func (h *Handler) createUploadForOwner(ctx context.Context, ownerID int64, parentID *uuid.UUID, req *gen.UploadCreateRequest) (*sqlcgen.UploadSession, error) {
+func (h *Handler) createUploadForOwner(ctx context.Context, ownerID int64, parentID *uuid.UUID, req *gen.UploadCreateRequest, admission *lifecycle.RequestAdmissionInput) (*sqlcgen.UploadSession, error) {
 	input := uploads.CreateInput{
 		UserID: ownerID, ParentID: parentID, Name: req.Name, ExpectedSize: req.Size,
-		ModTime: req.ModTime, PartSize: req.PreferredPartSize.Or(0), Encryption: false,
+		Admission: admission,
+		ModTime:   req.ModTime, PartSize: req.PreferredPartSize.Or(0), Encryption: false,
 		ConflictPolicy: sqlcgen.NameConflictPolicyFail,
 	}
 	if value, ok := req.MimeType.Get(); ok {
@@ -539,6 +617,121 @@ func (h *Handler) createUploadForOwner(ctx context.Context, ownerID int64, paren
 		return nil, mapServiceError(err)
 	}
 	return session, nil
+}
+
+// The decoded caller request is frozen before owner resolution or server defaults.
+func uploadRequestAdmission(scope lifecycle.RequestScope, key uuid.UUID, req *gen.UploadCreateRequest) (*lifecycle.RequestAdmissionInput, error) {
+	if key == uuid.Nil {
+		return nil, uploads.ErrInvalidInput
+	}
+	h := admissionHasher{digest: sha256.New()}
+	h.text("teldrive.request.upload.v1")
+	h.parent(req.ParentId)
+	h.text(req.Name)
+	h.number(req.Size)
+	proof, present := req.Hash.Get()
+	h.present(present)
+	if present {
+		h.text(string(proof.Algorithm))
+		h.text(string(proof.Value))
+	}
+	mime, present := req.MimeType.Get()
+	h.optionalText(mime, present)
+	h.number(req.ModTime.UTC().UnixMicro())
+	h.present(req.Encryption.Or(false))
+	h.text(string(req.ConflictPolicy.Or("fail")))
+	size, present := req.PreferredPartSize.Get()
+	h.present(present)
+	if present {
+		h.number(size)
+	}
+	in := &lifecycle.RequestAdmissionInput{Scope: scope, RequestKey: key}
+	h.digest.Sum(in.RequestFingerprint[:0])
+	return in, nil
+}
+
+func copyRequestAdmission(scope lifecycle.RequestScope, key uuid.UUID, source gen.UUID, req *gen.FileCopyRequest) (*lifecycle.RequestAdmissionInput, error) {
+	if key == uuid.Nil {
+		return nil, fileops.ErrInvalidInput
+	}
+	h := admissionHasher{digest: sha256.New()}
+	h.text("teldrive.request.copy.v1")
+	id := googleUUID(source)
+	_, _ = h.digest.Write(id[:])
+	h.parent(req.ParentId)
+	name, present := req.Name.Get()
+	h.optionalText(name, present)
+	h.text(string(req.ConflictPolicy.Or("fail")))
+	in := &lifecycle.RequestAdmissionInput{Scope: scope, RequestKey: key}
+	h.digest.Sum(in.RequestFingerprint[:0])
+	return in, nil
+}
+
+type admissionHasher struct {
+	digest hash.Hash
+	buffer [8]byte
+}
+
+func (h *admissionHasher) number(value int64) {
+	binary.BigEndian.PutUint64(h.buffer[:], uint64(value))
+	_, _ = h.digest.Write(h.buffer[:])
+}
+
+func (h *admissionHasher) present(value bool) {
+	h.buffer[0] = 0
+	if value {
+		h.buffer[0] = 1
+	}
+	_, _ = h.digest.Write(h.buffer[:1])
+}
+
+func (h *admissionHasher) text(value string) {
+	h.number(int64(len(value)))
+	_, _ = h.digest.Write([]byte(value))
+}
+
+func (h *admissionHasher) optionalText(value string, present bool) {
+	h.present(present)
+	if present {
+		h.text(value)
+	}
+}
+
+func (h *admissionHasher) parent(value gen.OptUUID) {
+	id, present := value.Get()
+	h.present(present)
+	if present {
+		converted := googleUUID(id)
+		_, _ = h.digest.Write(converted[:])
+	}
+}
+
+func (h *Handler) replayUploadAdmission(ctx context.Context, admission *lifecycle.RequestAdmissionInput, token, password string) (*sqlcgen.UploadSession, bool, error) {
+	binding, err := h.Uploads.GetRequestAdmission(ctx, admission.Scope, admission.RequestKey)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	id, ok := dbtypes.GoogleUUID(binding.UploadID)
+	if !ok {
+		return nil, true, uploads.ErrNotFound
+	}
+	var ownerID int64
+	if admission.Scope.PublicShareID != nil {
+		ownerID, err = h.resolvePublicUploadOwner(ctx, token, password, id)
+	} else {
+		ownerID, err = h.resolveAuthenticatedUploadOwner(ctx, id, true)
+	}
+	if err != nil {
+		return nil, true, err
+	}
+	if ownerID != binding.UserID || !bytes.Equal(binding.RequestFingerprint, admission.RequestFingerprint[:]) {
+		return nil, true, lifecycle.ErrRequestMismatch
+	}
+	session, err := h.Uploads.Get(ctx, ownerID, id)
+	return session, true, err
 }
 
 func adminUserSummary(row *sqlcgen.User) gen.AdminUserSummary {

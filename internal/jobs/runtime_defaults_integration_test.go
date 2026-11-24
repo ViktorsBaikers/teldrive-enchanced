@@ -8,16 +8,16 @@ import (
 	"io"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 	"github.com/tgdrive/teldrive/v2/internal/telegramstore"
 	testpostgres "github.com/tgdrive/teldrive/v2/internal/testutil/postgres"
 )
 
 func TestRuntimeAppliesProductionDefaults(t *testing.T) {
 	db := testpostgres.New(t)
-	runtime, err := NewRuntime(db.Pool, defaultsStorage{})
-	if err != nil {
-		t.Fatalf("NewRuntime() error = %v", err)
-	}
+	runtime := newDefaultsRuntime(t, db.Pool)
 	ctx := context.Background()
 	if err := runtime.Start(ctx); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -36,10 +36,7 @@ func TestRuntimeAppliesProductionDefaults(t *testing.T) {
 func TestRuntimeSeedsFolderSizeRollupOnStart(t *testing.T) {
 	db := testpostgres.New(t)
 	ctx := context.Background()
-	runtime, err := NewRuntime(db.Pool, defaultsStorage{})
-	if err != nil {
-		t.Fatalf("NewRuntime() error = %v", err)
-	}
+	runtime := newDefaultsRuntime(t, db.Pool)
 	if err := runtime.Start(ctx); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -67,10 +64,7 @@ func TestRuntimeSeedsFolderSizeRollupOnStart(t *testing.T) {
 func TestRuntimePreservesPeriodicJobConfigurationOnRestart(t *testing.T) {
 	db := testpostgres.New(t)
 	ctx := context.Background()
-	runtime, err := NewRuntime(db.Pool, defaultsStorage{})
-	if err != nil {
-		t.Fatalf("NewRuntime() error = %v", err)
-	}
+	runtime := newDefaultsRuntime(t, db.Pool)
 	if err := runtime.Start(ctx); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -92,10 +86,7 @@ func TestRuntimePreservesPeriodicJobConfigurationOnRestart(t *testing.T) {
 		t.Fatalf("Stop() error = %v", err)
 	}
 
-	restarted, err := NewRuntime(db.Pool, defaultsStorage{})
-	if err != nil {
-		t.Fatalf("NewRuntime() after restart error = %v", err)
-	}
+	restarted := newDefaultsRuntime(t, db.Pool)
 	if err := restarted.Start(ctx); err != nil {
 		t.Fatalf("Start() after restart error = %v", err)
 	}
@@ -119,10 +110,7 @@ func TestRuntimePreservesPeriodicJobConfigurationOnRestart(t *testing.T) {
 func TestRuntimeResetPeriodicJobsRestoresDefaults(t *testing.T) {
 	db := testpostgres.New(t)
 	ctx := context.Background()
-	runtime, err := NewRuntime(db.Pool, defaultsStorage{})
-	if err != nil {
-		t.Fatalf("NewRuntime() error = %v", err)
-	}
+	runtime := newDefaultsRuntime(t, db.Pool)
 	if err := runtime.Start(ctx); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -149,12 +137,12 @@ func TestRuntimeResetPeriodicJobsRestoresDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResetPeriodicJobs() error = %v", err)
 	}
-	if len(reset) != 3 {
-		t.Fatalf("reset periodic jobs = %d, want 3", len(reset))
-	}
 	resetByID := make(map[string]PeriodicJob, len(reset))
 	for _, job := range reset {
 		resetByID[job.ID] = job
+	}
+	if _, exists := resetByID["custom-upload-cleanup"]; exists {
+		t.Fatal("reset retained custom schedule")
 	}
 	if job := resetByID[uploadCleanupPeriodicID]; job.Schedule.CronExpression != uploadCleanupDefaultCron || len(job.Args) != 0 {
 		t.Fatalf("reset upload cleanup job = %#v", job)
@@ -165,14 +153,43 @@ func TestRuntimeResetPeriodicJobsRestoresDefaults(t *testing.T) {
 	if job := resetByID[folderSizeRollupPeriodicID]; job.Schedule.CronExpression != folderSizeRollupDefaultCron || len(job.Args) != 0 {
 		t.Fatalf("reset folder size rollup job = %#v", job)
 	}
+	if job := resetByID["receipt_cleanup_sweep"]; job.Kind != ReceiptDiscoverySweepKind || job.Schedule.CronExpression != uploadCleanupDefaultCron || job.Schedule.CronTimezone != maintenanceTimezone || job.Paused || len(job.Args) != 0 {
+		t.Fatalf("reset receipt discovery job = %#v", job)
+	}
 
 	persisted, err := runtime.ListPeriodicJobs(ctx)
 	if err != nil {
 		t.Fatalf("ListPeriodicJobs() error = %v", err)
 	}
-	if len(persisted) != 3 {
-		t.Fatalf("persisted periodic jobs after reset = %#v", persisted)
+	foundDiscovery := false
+	for _, job := range persisted {
+		if job.ID == "custom-upload-cleanup" {
+			t.Fatal("reset persisted custom schedule")
+		}
+		if job.ID == "receipt_cleanup_sweep" {
+			foundDiscovery = true
+			if job.Kind != ReceiptDiscoverySweepKind || job.Paused {
+				t.Fatalf("persisted mandatory discovery = %#v", job)
+			}
+		}
 	}
+	if !foundDiscovery {
+		t.Fatal("reset lost mandatory receipt discovery")
+	}
+}
+
+func newDefaultsRuntime(t testing.TB, pool *pgxpool.Pool) *Runtime {
+	t.Helper()
+	storage := defaultsStorage{}
+	policy := lifecycle.NewService(pool, storage)
+	runtime, err := NewRuntime(pool, storage, policy)
+	if err != nil {
+		t.Fatalf("NewRuntime() error = %v", err)
+	}
+	if err := policy.BindReceiptEnqueuer(runtime); err != nil {
+		t.Fatalf("BindReceiptEnqueuer() error = %v", err)
+	}
+	return runtime
 }
 
 type defaultsStorage struct{}

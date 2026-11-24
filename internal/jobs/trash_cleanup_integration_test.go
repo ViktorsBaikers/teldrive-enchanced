@@ -12,6 +12,8 @@ import (
 	"github.com/riverqueue/river"
 
 	"github.com/tgdrive/teldrive/v2/internal/jobs"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
+	fixture "github.com/tgdrive/teldrive/v2/internal/testutil/lifecycle"
 	testpostgres "github.com/tgdrive/teldrive/v2/internal/testutil/postgres"
 )
 
@@ -83,11 +85,24 @@ func TestTrashCleanupWorkerDrainsMultiplePages(t *testing.T) {
 	if _, err := db.Pool.Exec(ctx, "INSERT INTO users (user_id) VALUES (1001)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Pool.Exec(ctx, `
+	// The fixture stands in for an already-populated library; the ordinary 512
+	// append bound is proven by TestB3BulkCatalogLane.
+	seedTx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer seedTx.Rollback(ctx)
+	if _, err := seedTx.Exec(ctx, "SET LOCAL teldrive.event_bulk = 'on'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seedTx.Exec(ctx, `
 INSERT INTO files (user_id, name, kind, size, status, mod_time, deleted_at)
 SELECT 1001, 'trashed-' || value, 'file', 0, 'trashed', now(), now() - interval '40 days'
 FROM generate_series(1, 1001) AS value
 `); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedTx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -111,9 +126,14 @@ FROM generate_series(1, 1001) AS value
 func TestRuntimePersistsTrashCleanupPeriodicJob(t *testing.T) {
 	db := testpostgres.New(t)
 	ctx := context.Background()
-	runtime, err := jobs.NewRuntime(db.Pool, &cleanupStorage{}, &recordingPurgeService{})
+	storage := fixture.NewStorage(t, []fixture.ChannelScope{{ChannelID: 9001, Actors: []int64{1001}}})
+	policy := lifecycle.NewService(db.Pool, storage)
+	runtime, err := jobs.NewRuntime(db.Pool, storage, policy, &recordingPurgeService{})
 	if err != nil {
 		t.Fatalf("NewRuntime() error = %v", err)
+	}
+	if err := policy.BindReceiptEnqueuer(runtime); err != nil {
+		t.Fatal(err)
 	}
 	if err := runtime.Start(ctx); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -144,4 +164,8 @@ func TestRuntimePersistsTrashCleanupPeriodicJob(t *testing.T) {
 		return
 	}
 	t.Fatal("trash cleanup periodic job not found")
+}
+
+func TestB2TrashSweepContinuation(t *testing.T) {
+	testRetainedCatalogSweep(t, true, false)
 }

@@ -1,6 +1,8 @@
 package jobs
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -26,12 +28,13 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/tgdrive/teldrive/v2/internal/catalog"
 	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
 	"github.com/tgdrive/teldrive/v2/internal/dbtypes"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 	"github.com/tgdrive/teldrive/v2/internal/transfer"
+	"github.com/tgdrive/teldrive/v2/internal/treehash"
 	"github.com/tgdrive/teldrive/v2/internal/uploads"
 )
 
@@ -112,12 +115,15 @@ func (UploadSourceArgs) InsertOpts() river.InsertOpts {
 
 type UploadBatchWorker struct {
 	river.WorkerDefaults[UploadBatchArgs]
+	pool             *pgxpool.Pool
+	uploads          *uploads.Service
 	httpClient       *http.Client
 	catalog          *catalog.Service
 	localImportRoots []string
+	commit           func(context.Context, pgx.Tx) error
 }
 
-func NewUploadBatchWorker(httpClient *http.Client, catalogService *catalog.Service, localImportRoots ...[]string) *UploadBatchWorker {
+func NewUploadBatchWorker(pool *pgxpool.Pool, httpClient *http.Client, catalogService *catalog.Service, uploadService *uploads.Service, localImportRoots ...[]string) *UploadBatchWorker {
 	if httpClient == nil {
 		httpClient = NewUploadHTTPClient()
 	}
@@ -125,99 +131,165 @@ func NewUploadBatchWorker(httpClient *http.Client, catalogService *catalog.Servi
 	if len(localImportRoots) > 0 {
 		roots = append([]string(nil), localImportRoots[0]...)
 	}
-	return &UploadBatchWorker{httpClient: httpClient, catalog: catalogService, localImportRoots: roots}
+	return &UploadBatchWorker{pool: pool, uploads: uploadService, httpClient: httpClient, catalog: catalogService, localImportRoots: roots, commit: func(ctx context.Context, tx pgx.Tx) error { return tx.Commit(ctx) }}
 }
 
 func (w *UploadBatchWorker) Timeout(*river.Job[UploadBatchArgs]) time.Duration { return time.Hour }
 
-func (w *UploadBatchWorker) Work(ctx context.Context, job *river.Job[UploadBatchArgs]) error {
-	if job.Args.UserID <= 0 || len(job.Args.Sources) == 0 {
+func (w *UploadBatchWorker) Work(ctx context.Context, job *river.Job[UploadBatchArgs]) (workErr error) {
+	if w == nil || w.pool == nil || w.uploads == nil || w.catalog == nil || job == nil || job.JobRow == nil || job.ID <= 0 {
+		return ErrRuntimeNotConfigured
+	}
+	defer func() {
+		if errors.Is(workErr, uploads.ErrParentUnavailable) || errors.Is(workErr, catalog.ErrParentUnavailable) {
+			workErr = river.JobCancel(workErr)
+		}
+	}()
+	if job.Args.UserID <= 0 || job.Args.BatchID == "" {
 		return errInvalidUploadSource
 	}
-	parentID, err := w.resolveDestination(ctx, job.Args)
+	args, err := canonicalUploadBatchArgs(job.Args)
 	if err != nil {
 		return err
+	}
+	batchID := uuid.MustParse(args.BatchID)
+	fingerprint, err := uploadBatchFingerprint(args)
+	if err != nil {
+		return err
+	}
+	batch, err := w.uploads.GetImportBatch(ctx, args.UserID, batchID, job.ID)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(batch.RequestFingerprint, fingerprint[:]) {
+		return lifecycle.ErrRequestMismatch
+	}
+	if batch.TerminalFailureCode.Valid {
+		return river.JobCancel(uploads.ErrParentUnavailable)
+	}
+	// Validate persisted Q pins even on a dispatched replay, without resolving paths.
+	pins, err := sqlcgen.New(w.pool).ListImportDestinationPins(ctx, sqlcgen.ListImportDestinationPinsParams{UserID: args.UserID, BatchID: dbtypes.UUID(batchID)})
+	if err != nil {
+		return err
+	}
+	if len(pins) != len(args.Sources)+1 {
+		return lifecycle.ErrRequestMismatch
+	}
+	for i, pin := range pins {
+		if pin.DestinationOrdinal != int32(i)-1 || pin.AnchorIsRoot == pin.AnchorID.Valid || len(pin.SpecFingerprint) != 32 || len(pin.RemainderFingerprint) != 32 || pin.RemainderSegments < 0 {
+			return lifecycle.ErrRequestMismatch
+		}
+	}
+	if batch.Dispatched {
+		return nil
 	}
 	client, err := river.ClientFromContextSafely[pgx.Tx](ctx)
 	if err != nil {
 		return fmt.Errorf("get River client: %w", err)
 	}
-	filter, err := newUploadFilter(job.Args.Exclude, job.Args.MinSize, job.Args.MaxSize)
+	filter, err := newUploadFilter(args.Exclude, args.MinSize, args.MaxSize)
 	if err != nil {
 		return err
 	}
-	partConcurrency := job.Args.PartConcurrency
-	if partConcurrency <= 0 {
-		partConcurrency = 4
+	concurrency := args.PartConcurrency
+	if concurrency <= 0 {
+		concurrency = 4
 	}
-	if partConcurrency > 16 {
-		return fmt.Errorf("%w: part concurrency exceeds 16", errInvalidUploadSource)
+	if concurrency > 16 {
+		return errInvalidUploadSource
 	}
-	chunkSize, err := normalizeUploadChunkSize(job.Args.ChunkSize)
+	chunkSize, err := normalizeUploadChunkSize(args.ChunkSize)
 	if err != nil {
 		return err
 	}
-	batchID := job.Args.BatchID
-	if _, err := uuid.Parse(batchID); err != nil {
-		return fmt.Errorf("%w: invalid batch id", errInvalidUploadSource)
-	}
-	index := 0
-	insertParams := make([]river.InsertManyParams, 0)
-	for _, source := range job.Args.Sources {
-		files, err := w.expand(ctx, source, job.Args.Headers, filter)
-		if err != nil {
-			return err
+	var sources []UploadFileSource
+	var destinations []uploads.ImportSourceDestination
+	for ordinal, source := range args.Sources {
+		files, expandErr := w.expand(ctx, source, args.Headers, filter)
+		if expandErr != nil {
+			return expandErr
 		}
 		for _, file := range files {
-			args := UploadSourceArgs{BatchID: batchID, SourceIndex: index, UserID: job.Args.UserID, ParentID: parentID, Source: file, PartConcurrency: partConcurrency, ChunkSize: chunkSize, Encryption: job.Args.Encryption}
-			insertParams = append(insertParams, river.InsertManyParams{Args: args})
-			index++
+			directory, name := path.Split(file.DestinationPath)
+			if name == "" || name == "." || len(sources) >= math.MaxInt32 {
+				return errInvalidUploadSource
+			}
+			destinations = append(destinations, uploads.ImportSourceDestination{AttemptID: uuid.New(), SourceIndex: int32(len(sources)), DestinationOrdinal: int32(ordinal), Directory: strings.TrimSuffix(directory, "/")})
+			sources = append(sources, file)
 		}
 	}
-	if len(insertParams) > 0 {
-		if _, err := client.InsertMany(ctx, insertParams); err != nil {
-			return fmt.Errorf("insert upload source jobs: %w", err)
-		}
-	}
-	return nil
-}
-
-func (w *UploadBatchWorker) resolveDestination(ctx context.Context, args UploadBatchArgs) (string, error) {
-	// ParentID is retained for jobs queued before destination paths were resolved by the worker.
-	if args.Destination == "" {
-		if args.ParentID == "" {
-			return "", nil
-		}
-		if _, err := uuid.Parse(args.ParentID); err != nil {
-			return "", fmt.Errorf("%w: invalid parent id", errInvalidUploadSource)
-		}
-		return args.ParentID, nil
-	}
-	if w.catalog == nil {
-		return "", errors.New("upload catalog is not configured")
-	}
-	destination := strings.TrimSpace(args.Destination)
-	if id, err := uuid.Parse(destination); err == nil {
-		file, err := w.catalog.Get(ctx, args.UserID, id)
-		if err != nil {
-			return "", fmt.Errorf("resolve upload destination: %w", err)
-		}
-		if file.Kind != sqlcgen.FileKindFolder || file.Status != sqlcgen.FileStatusActive {
-			return "", fmt.Errorf("%w: destination is not an active folder", errInvalidUploadSource)
-		}
-		return id.String(), nil
-	}
-	if !strings.HasPrefix(destination, "/") {
-		return "", fmt.Errorf("%w: destination path must be absolute", errInvalidUploadSource)
-	}
-	id, err := w.catalog.EnsureFolderPath(ctx, args.UserID, nil, destination)
+	tx, err := w.pool.Begin(ctx)
 	if err != nil {
-		return "", fmt.Errorf("create upload destination: %w", err)
+		return err
 	}
-	if id == nil {
-		return "", nil
+	defer rollbackJobTransaction(tx, &workErr)
+	if err = lifecycle.LockOwnerTx(ctx, tx, args.UserID); err != nil {
+		return err
 	}
-	return id.String(), nil
+	base, err := parseOptionalUUID(args.ParentID)
+	if err != nil {
+		return err
+	}
+	reservation, err := w.uploads.ReserveImportBatchTx(ctx, tx, uploads.ReserveImportBatchInput{
+		UserID: args.UserID, BatchID: batchID, OriginJobID: job.ID, RequestFingerprint: fingerprint,
+		BaseParentID: base, Destination: args.Destination, SourceDestinations: uploadBatchSourceDestinations(args), Sources: destinations,
+	})
+	if err != nil {
+		return err
+	}
+	if reservation.Dispatched {
+		return nil
+	}
+	if len(reservation.Sources) != len(sources) {
+		return lifecycle.ErrRequestMismatch
+	}
+	params := make([]river.InsertManyParams, len(sources))
+	for i, destination := range reservation.Sources {
+		parent := ""
+		if destination.ParentID != nil {
+			parent = destination.ParentID.String()
+		}
+		params[i] = river.InsertManyParams{Args: UploadSourceArgs{BatchID: args.BatchID, SourceIndex: int(destination.SourceIndex), UserID: args.UserID, ParentID: parent, Source: sources[i], PartConcurrency: concurrency, ChunkSize: chunkSize, Encryption: args.Encryption},
+			InsertOpts: &river.InsertOpts{Metadata: ownerJobMetadata(args.UserID)}}
+	}
+	children := make([]uploads.ImportChild, len(params))
+	if len(params) > 0 {
+		results, insertErr := client.InsertManyTx(ctx, tx, params)
+		if insertErr != nil {
+			return fmt.Errorf("insert upload source jobs: %w", insertErr)
+		}
+		if len(results) != len(params) {
+			return errors.New("upload source insert returned wrong child count")
+		}
+		for i, result := range results {
+			if result == nil || result.Job == nil || result.Job.ID <= 0 {
+				return errors.New("upload source insert returned no positive job ID")
+			}
+			children[i] = uploads.ImportChild{AttemptID: reservation.Sources[i].AttemptID, SourceIndex: reservation.Sources[i].SourceIndex, JobID: result.Job.ID}
+		}
+	}
+	if err = w.uploads.RecordImportChildrenTx(ctx, tx, uploads.RecordImportChildrenInput{UserID: args.UserID, BatchID: batchID, OriginJobID: job.ID, Destinations: reservation, Children: children}); err != nil {
+		return err
+	}
+	if err = w.commit(ctx, tx); err == nil {
+		return nil
+	}
+	if errors.Is(err, pgx.ErrTxCommitRollback) {
+		return fmt.Errorf("commit import dispatch: %w", err)
+	}
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	committed, readErr := w.uploads.GetImportBatch(readCtx, args.UserID, batchID, job.ID)
+	if readErr != nil {
+		return errors.Join(fmt.Errorf("commit import dispatch: %w", err), readErr)
+	}
+	if committed.TerminalFailureCode.Valid {
+		return errors.Join(err, river.JobCancel(uploads.ErrParentUnavailable))
+	}
+	if committed.Dispatched && bytes.Equal(committed.RequestFingerprint, fingerprint[:]) {
+		return nil
+	}
+	return fmt.Errorf("commit import dispatch: %w", err)
 }
 
 func (w *UploadBatchWorker) expand(ctx context.Context, source UploadSource, defaults map[string]string, batchFilter uploadFilter) ([]UploadFileSource, error) {
@@ -251,22 +323,113 @@ type UploadSourceWorker struct {
 	httpClient         *http.Client
 	activeKeyVersion   int32
 	encryptionRequired bool
+	localImportRoots   []string
+	commit             func(context.Context, pgx.Tx) error
+	create             func(context.Context, uploads.CreateInput) (*sqlcgen.UploadSession, error)
 }
 
-func NewUploadSourceWorker(pool *pgxpool.Pool, catalogService *catalog.Service, uploadService *uploads.Service, pipeline *transfer.Pipeline, httpClient *http.Client, activeKeyVersion int32, encryptionRequired bool) *UploadSourceWorker {
+func NewUploadSourceWorker(pool *pgxpool.Pool, catalogService *catalog.Service, uploadService *uploads.Service, pipeline *transfer.Pipeline, httpClient *http.Client, activeKeyVersion int32, encryptionRequired bool, localImportRoots []string) *UploadSourceWorker {
 	if httpClient == nil {
 		httpClient = NewUploadHTTPClient()
 	}
-	return &UploadSourceWorker{pool: pool, queries: sqlcgen.New(pool), catalog: catalogService, uploads: uploadService, pipeline: pipeline, httpClient: httpClient, activeKeyVersion: activeKeyVersion, encryptionRequired: encryptionRequired}
+	return &UploadSourceWorker{pool: pool, queries: sqlcgen.New(pool), catalog: catalogService, uploads: uploadService, pipeline: pipeline, httpClient: httpClient, activeKeyVersion: activeKeyVersion, encryptionRequired: encryptionRequired, localImportRoots: append([]string(nil), localImportRoots...), commit: func(ctx context.Context, tx pgx.Tx) error { return tx.Commit(ctx) }}
 }
 
 func (w *UploadSourceWorker) Timeout(*river.Job[UploadSourceArgs]) time.Duration {
 	return 24 * time.Hour
 }
 
-func (w *UploadSourceWorker) Work(ctx context.Context, job *river.Job[UploadSourceArgs]) error {
-	if w == nil || w.pool == nil || w.catalog == nil || w.uploads == nil || w.pipeline == nil || job.Args.UserID <= 0 {
+func (w *UploadSourceWorker) Work(ctx context.Context, job *river.Job[UploadSourceArgs]) (workErr error) {
+	if w == nil || w.pool == nil || w.catalog == nil || w.uploads == nil || w.pipeline == nil || job == nil || job.JobRow == nil || job.ID <= 0 || job.Args.UserID <= 0 {
 		return ErrRuntimeNotConfigured
+	}
+	defer func() {
+		if errors.Is(workErr, uploads.ErrParentUnavailable) || errors.Is(workErr, catalog.ErrParentUnavailable) {
+			workErr = river.JobCancel(workErr)
+		}
+	}()
+	batchID, err := uuid.Parse(job.Args.BatchID)
+	if err != nil || batchID == uuid.Nil || job.Args.SourceIndex < 0 || job.Args.SourceIndex > math.MaxInt32 {
+		return errInvalidUploadSource
+	}
+	attempt, err := w.uploads.GetImportAttempt(ctx, job.Args.UserID, batchID, int32(job.Args.SourceIndex), job.ID)
+	if err != nil {
+		return err
+	}
+	if attempt.TerminalFailureCode.Valid {
+		return river.JobCancel(uploads.ErrParentUnavailable)
+	}
+	parentValue, hasParent := dbtypes.GoogleUUID(attempt.ParentID)
+	var parentID *uuid.UUID
+	if hasParent {
+		parentID = &parentValue
+	}
+	requestParent, err := parseOptionalUUID(job.Args.ParentID)
+	if err != nil {
+		return err
+	}
+	if dbtypes.OptionalUUID(requestParent) != attempt.ParentID {
+		return lifecycle.ErrRequestMismatch
+	}
+	if attempt.ResultFileID.Valid {
+		id := uuid.UUID(attempt.ResultFileID.Bytes)
+		result, getErr := w.catalog.Get(ctx, job.Args.UserID, id)
+		if getErr != nil {
+			return getErr
+		}
+		if (job.Args.Encryption || w.encryptionRequired) && !result.Encryption {
+			return uploads.ErrInvalidState
+		}
+		var key *int32
+		if result.EncryptionKeyVersion.Valid {
+			value := result.EncryptionKeyVersion.Int32
+			key = &value
+		}
+		_, err = w.catalog.CheckActiveImportResult(ctx, catalog.CheckActiveImportResultInput{UserID: job.Args.UserID, FileID: id, ParentID: parentID, Encryption: result.Encryption, EncryptionKeyVersion: key})
+		return err
+	}
+	var selected *sqlcgen.UploadSession
+	var frozen uploads.CreateInput
+	if attempt.UploadID.Valid {
+		frozen, err = uploads.SelectedImportCreateInput(attempt)
+		if err != nil {
+			return err
+		}
+		if (job.Args.Encryption || w.encryptionRequired) && !frozen.Encryption {
+			return uploads.ErrInvalidState
+		}
+		selected, err = w.uploads.Get(ctx, job.Args.UserID, uuid.UUID(attempt.UploadID.Bytes))
+		if err != nil {
+			if errors.Is(err, uploads.ErrParentUnavailable) {
+				return river.JobCancel(err)
+			}
+			if attempt.SessionMaterialized || !errors.Is(err, uploads.ErrNotFound) {
+				return err
+			}
+		}
+		if selected != nil && selected.State == sqlcgen.UploadStateCompleted {
+			if !selected.FileID.Valid {
+				return uploads.ErrNotFound
+			}
+			var key *int32
+			if selected.EncryptionKeyVersion.Valid {
+				value := selected.EncryptionKeyVersion.Int32
+				key = &value
+			}
+			_, err = w.catalog.CheckActiveImportResult(ctx, catalog.CheckActiveImportResultInput{UserID: job.Args.UserID, FileID: uuid.UUID(selected.FileID.Bytes), ParentID: parentID, Encryption: selected.Encryption, EncryptionKeyVersion: key})
+			return err
+		}
+		if selected != nil && (job.Args.Encryption || w.encryptionRequired) && !selected.Encryption {
+			return uploads.ErrInvalidState
+		}
+		if frozen.Encryption {
+			if frozen.EncryptionKeyVersion == nil {
+				return transfer.ErrEncryptionKey
+			}
+			if err = w.pipeline.ValidateUploadKey(ctx, job.Args.UserID, *frozen.EncryptionKeyVersion); err != nil {
+				return err
+			}
+		}
 	}
 	if job.Args.PartConcurrency <= 0 {
 		job.Args.PartConcurrency = 4
@@ -275,131 +438,186 @@ func (w *UploadSourceWorker) Work(ctx context.Context, job *river.Job[UploadSour
 	if job.Args.PartConcurrency > 16 {
 		return fmt.Errorf("%w: part concurrency exceeds 16", errInvalidUploadSource)
 	}
-	chunkSize, err := normalizeUploadChunkSize(job.Args.ChunkSize)
-	if err != nil {
-		return err
+	var chunkSize int64
+	if !attempt.UploadID.Valid {
+		chunkSize, err = normalizeUploadChunkSize(job.Args.ChunkSize)
+		if err != nil {
+			return err
+		}
 	}
 	client, _ := river.ClientFromContextSafely[pgx.Tx](ctx)
-	parentID, err := parseOptionalUUID(job.Args.ParentID)
-	if err != nil {
-		return err
-	}
-	directory, name := path.Split(path.Clean(strings.TrimPrefix(job.Args.Source.DestinationPath, "/")))
+	_, name := path.Split(job.Args.Source.DestinationPath)
 	if name == "" || name == "." {
 		return errInvalidUploadSource
 	}
-	parentID, err = w.ensureFolders(ctx, job.Args.UserID, parentID, directory)
-	if err != nil {
-		return err
-	}
-	job.Args.Source.MIMEType, err = w.detectSourceMIME(ctx, job.Args.Source)
-	if err != nil {
-		return err
-	}
-	existing, err := w.queries.ResolveActiveChild(ctx, sqlcgen.ResolveActiveChildParams{UserID: job.Args.UserID, ParentID: dbtypes.OptionalUUID(parentID), Name: name})
-	if err == nil {
-		if existing.Kind != sqlcgen.FileKindFile {
-			return uploads.ErrNameConflict
+	if !attempt.UploadID.Valid {
+		probe := job.Args.Source
+		if parsed, _, e := mime.ParseMediaType(probe.MIMEType); e == nil {
+			probe.MIMEType = parsed
 		}
-		if existing.Size.Valid && existing.Size.Int64 == job.Args.Source.Size && job.Args.Source.HasModTime && modTimesEqual(existing.ModTime.Time, job.Args.Source.ModTime) && existing.MimeType.Valid && existing.MimeType.String == job.Args.Source.MIMEType {
-			output := UploadSourceOutput{Path: job.Args.Source.DestinationPath, SourceType: job.Args.Source.Type, Stage: "skipped", Reason: "destination_matches", Progress: 100, TotalBytes: job.Args.Source.Size, UpdatedAt: time.Now().UTC()}
-			if client != nil && job.JobRow != nil {
+		if _, _, err = w.findResumableUpload(ctx, job.Args.UserID, parentID, name, probe, job.Args.Encryption); err != nil {
+			return err
+		}
+	}
+	hadModTime := job.Args.Source.HasModTime
+	sourceReader, err := w.openSource(ctx, &job.Args.Source)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := sourceReader.Close(); closeErr != nil {
+			workErr = errors.Join(workErr, fmt.Errorf("close upload source: %w", closeErr))
+		}
+	}()
+	if parsed, _, parseErr := mime.ParseMediaType(job.Args.Source.MIMEType); parseErr == nil {
+		job.Args.Source.MIMEType = parsed
+	}
+	buffered := bufio.NewReader(sourceReader)
+	if job.Args.Source.MIMEType == "" || job.Args.Source.MIMEType == "application/octet-stream" {
+		prefix, peekErr := buffered.Peek(512)
+		if peekErr != nil && !errors.Is(peekErr, io.EOF) {
+			return fmt.Errorf("read upload source prefix failed: %w", peekErr)
+		}
+		job.Args.Source.MIMEType = http.DetectContentType(prefix)
+		if parsed, _, parseErr := mime.ParseMediaType(job.Args.Source.MIMEType); parseErr == nil {
+			job.Args.Source.MIMEType = parsed
+		}
+		if job.Args.Source.MIMEType == "application/octet-stream" {
+			if inferred := mime.TypeByExtension(path.Ext(job.Args.Source.DestinationPath)); inferred != "" {
+				if parsed, _, parseErr := mime.ParseMediaType(inferred); parseErr == nil {
+					job.Args.Source.MIMEType = parsed
+				}
+			}
+		}
+	}
+	var session *sqlcgen.UploadSession
+	if attempt.UploadID.Valid {
+		session = selected
+	} else {
+		candidate, _, findErr := w.findResumableUpload(ctx, job.Args.UserID, parentID, name, job.Args.Source, job.Args.Encryption)
+		if findErr != nil {
+			return findErr
+		}
+		existing, resolveErr := w.queries.ResolveActiveChild(ctx, sqlcgen.ResolveActiveChildParams{UserID: job.Args.UserID, ParentID: attempt.ParentID, Name: name})
+		if resolveErr != nil && !errors.Is(resolveErr, pgx.ErrNoRows) {
+			return resolveErr
+		}
+		var matching *sqlcgen.File
+		if resolveErr == nil {
+			if existing.Kind != sqlcgen.FileKindFile {
+				return uploads.ErrNameConflict
+			}
+			if job.Args.Source.Type == "local" && (!job.Args.Encryption || existing.Encryption) && existing.Size.Valid && existing.Size.Int64 == job.Args.Source.Size && existing.HashAlgorithm.String == "blake3" && existing.HashValue.Valid && w.localSourceMatches(ctx, job.Args.Source, existing.HashValue.String) {
+				matching = existing
+			}
+		}
+		input := uploads.CreateInput{UserID: job.Args.UserID, ParentID: parentID, Name: name, ExpectedSize: job.Args.Source.Size, MIMEType: optionalString(job.Args.Source.MIMEType), ModTime: job.Args.Source.ModTime, ConflictPolicy: sqlcgen.NameConflictPolicyReplace, Encryption: job.Args.Encryption, PartSize: chunkSize}
+		if candidate != nil {
+			input.ID = uuid.UUID(candidate.ID.Bytes)
+			input.PartSize = candidate.PartSize
+			if candidate.EncryptionKeyVersion.Valid {
+				value := candidate.EncryptionKeyVersion.Int32
+				input.EncryptionKeyVersion = &value
+			}
+		} else if matching == nil {
+			input.ID = uuid.New()
+			if input.Encryption {
+				if w.activeKeyVersion <= 0 {
+					return transfer.ErrEncryptionKey
+				}
+				input.EncryptionKeyVersion = &w.activeKeyVersion
+			}
+		}
+		attempt, err = w.selectImportAttempt(ctx, job, batchID, input, candidate != nil, matching)
+		if err != nil {
+			return err
+		}
+		if attempt.UploadID.Valid {
+			frozen, err = uploads.SelectedImportCreateInput(attempt)
+			if err != nil {
+				return err
+			}
+		}
+		if attempt.ResultFileID.Valid {
+			output := UploadSourceOutput{Path: job.Args.Source.DestinationPath, SourceType: job.Args.Source.Type, Stage: "skipped", Reason: "destination_matches", Progress: 100, TotalBytes: job.Args.Source.Size, UpdatedAt: time.Now().UTC(), FileID: uuid.UUID(attempt.ResultFileID.Bytes).String()}
+			if client != nil {
 				return river.RecordOutput(ctx, output)
 			}
 			return nil
 		}
-	} else if !errors.Is(err, pgx.ErrNoRows) {
-		return fmt.Errorf("resolve upload destination: %w", err)
 	}
-
-	session, storedParts, err := w.findResumableUpload(ctx, job.Args.UserID, parentID, name, job.Args.Source, job.Args.Encryption)
-	if err != nil {
-		return err
+	if !attempt.UploadID.Valid {
+		return uploads.ErrInvalidState
+	}
+	if name != frozen.Name || job.Args.Source.Size != frozen.ExpectedSize || (frozen.MIMEType == nil && job.Args.Source.MIMEType != "") || (frozen.MIMEType != nil && job.Args.Source.MIMEType != *frozen.MIMEType) || ((hadModTime || job.Args.Source.HasModTime) && !job.Args.Source.ModTime.UTC().Truncate(time.Microsecond).Equal(frozen.ModTime)) {
+		return fmt.Errorf("%w: source metadata differs from selected upload", errInvalidUploadSource)
 	}
 	if session == nil {
-		input := uploads.CreateInput{UserID: job.Args.UserID, ParentID: parentID, Name: name, ExpectedSize: job.Args.Source.Size, MIMEType: optionalString(job.Args.Source.MIMEType), ModTime: job.Args.Source.ModTime, ConflictPolicy: sqlcgen.NameConflictPolicyReplace, Encryption: job.Args.Encryption, PartSize: chunkSize}
-		if input.Encryption {
-			if w.activeKeyVersion <= 0 {
-				return transfer.ErrEncryptionKey
-			}
-			input.EncryptionKeyVersion = &w.activeKeyVersion
+		input := frozen
+		if w.create != nil {
+			session, err = w.create(ctx, input)
+		} else {
+			session, err = w.uploads.Create(ctx, input)
 		}
-		session, err = w.uploads.Create(ctx, input)
 	}
 	if err != nil {
 		return err
 	}
-	if session.State == sqlcgen.UploadStateCompleted {
-		return nil
+	if session.State != sqlcgen.UploadStateOpen {
+		return uploads.ErrInvalidState
 	}
 	uploadID, ok := dbtypes.GoogleUUID(session.ID)
 	if !ok {
 		return errInvalidUploadSource
 	}
-	partCount := int((session.ExpectedSize + session.PartSize - 1) / session.PartSize)
+	partCount := int(session.ExpectedSize / session.PartSize)
+	if session.ExpectedSize%session.PartSize != 0 {
+		partCount++
+	}
 	var jobID int64
 	if job.JobRow != nil {
 		jobID = job.ID
 	}
-	tracker := newUploadProgressTracker(client, jobID, uploadID, job.Args.Source, session.PartSize, job.Args.PartConcurrency, partCount, storedParts)
+	tracker := newUploadProgressTracker(client, jobID, uploadID, job.Args.Source, session.PartSize, 1, partCount, nil)
 	if err := tracker.update(ctx, "uploading", false); err != nil {
 		return err
 	}
-	if partCount == 0 {
-		file, completeErr := w.uploads.Complete(ctx, job.Args.UserID, uploadID)
-		if completeErr != nil {
-			_ = tracker.finish(ctx, "failed", nil)
-			return completeErr
-		}
-		fileID, _ := dbtypes.GoogleUUID(file.ID)
-		return tracker.finish(ctx, "completed", &fileID)
-	}
-	group, groupCtx := errgroup.WithContext(ctx)
-	group.SetLimit(job.Args.PartConcurrency)
-	progressCtx, stopProgress := context.WithCancel(ctx)
-	var progressWG sync.WaitGroup
-	progressWG.Go(func() {
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-progressCtx.Done():
-				return
-			case <-ticker.C:
-				_ = tracker.update(progressCtx, "uploading", false)
-			}
-		}
-	})
+	var consumed int64
 	for part := range partCount {
-		if _, ok := storedParts[int32(part+1)]; ok {
-			continue
-		}
-		group.Go(func() error {
-			offset := int64(part) * session.PartSize
-			size := min(session.PartSize, session.ExpectedSize-offset)
-			reader, closeReader, err := w.openPart(groupCtx, job.Args.Source, offset, size)
-			if err != nil {
-				return err
-			}
-			defer closeReader()
-			reader = io.TeeReader(reader, tracker)
-			_, err = w.pipeline.UploadPart(groupCtx, transfer.UploadPartRequest{UserID: job.Args.UserID, UploadID: uploadID, PartNo: int32(part + 1), PlainSize: size, Body: reader})
-			if err == nil {
-				tracker.partCompleted(groupCtx, size)
-			}
+		if err := ctx.Err(); err != nil {
 			return err
-		})
+		}
+		size := min(session.PartSize, session.ExpectedSize-consumed)
+		// Limit each part so the pipeline EOF probe cannot consume the next part.
+		body := &io.LimitedReader{R: buffered, N: size}
+		_, err = w.pipeline.UploadPart(ctx, transfer.UploadPartRequest{UserID: job.Args.UserID, UploadID: uploadID, PartNo: int32(part + 1), PlainSize: size, Body: io.TeeReader(body, tracker)})
+		if err != nil {
+			_ = tracker.finish(ctx, "failed", nil)
+			return err
+		}
+		if body.N != 0 {
+			return io.ErrUnexpectedEOF
+		}
+		consumed += size
+		tracker.partCompleted(ctx, size)
 	}
-	groupErr := group.Wait()
-	stopProgress()
-	progressWG.Wait()
-	if groupErr != nil {
+	if _, err := buffered.ReadByte(); !errors.Is(err, io.EOF) {
 		_ = tracker.finish(ctx, "failed", nil)
-		return groupErr
+		return errors.New("upload source did not end at declared size")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if job.Args.Source.Type == "local" {
-		info, statErr := os.Stat(job.Args.Source.Location)
-		if statErr != nil || info.Size() != job.Args.Source.Size || !info.ModTime().Equal(job.Args.Source.ModTime) {
+		current, openErr := w.openLocalSource(job.Args.Source.Location)
+		if openErr != nil {
+			_ = tracker.finish(ctx, "failed", nil)
+			return fmt.Errorf("%w: local source changed during upload", errInvalidUploadSource)
+		}
+		info, statErr := current.Stat()
+		_ = current.Close()
+		opened, openedErr := sourceReader.(*os.File).Stat()
+		if statErr != nil || openedErr != nil || !os.SameFile(opened, info) || info.Size() != job.Args.Source.Size || !info.ModTime().Equal(job.Args.Source.ModTime) {
 			_ = tracker.finish(ctx, "failed", nil)
 			return fmt.Errorf("%w: local source changed during upload", errInvalidUploadSource)
 		}
@@ -407,13 +625,60 @@ func (w *UploadSourceWorker) Work(ctx context.Context, job *river.Job[UploadSour
 	if err := tracker.update(ctx, "completing", false); err != nil {
 		return err
 	}
-	file, err := w.uploads.Complete(ctx, job.Args.UserID, uploadID)
+	file, err := w.uploads.Complete(ctx, uploads.CompleteInput{UserID: job.Args.UserID, UploadID: uploadID, Size: consumed})
 	if err != nil {
 		_ = tracker.finish(ctx, "failed", nil)
 		return err
 	}
 	fileID, _ := dbtypes.GoogleUUID(file.ID)
 	return tracker.finish(ctx, "completed", &fileID)
+}
+
+// Selection commits before materialization; uncertain acknowledgements never select another UUID.
+func (w *UploadSourceWorker) selectImportAttempt(ctx context.Context, job *river.Job[UploadSourceArgs], batchID uuid.UUID, input uploads.CreateInput, candidate bool, matching *sqlcgen.File) (attempt *sqlcgen.ImportJobAttempt, workErr error) {
+	tx, err := w.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rollbackJobTransaction(tx, &workErr)
+	if err = lifecycle.LockOwnerTx(ctx, tx, job.Args.UserID); err != nil {
+		return nil, err
+	}
+	if matching != nil {
+		var key *int32
+		if matching.EncryptionKeyVersion.Valid {
+			value := matching.EncryptionKeyVersion.Int32
+			key = &value
+		}
+		if _, err = w.catalog.CheckActiveImportResultTx(ctx, tx, catalog.CheckActiveImportResultInput{UserID: job.Args.UserID, FileID: uuid.UUID(matching.ID.Bytes), ParentID: input.ParentID, Encryption: matching.Encryption, EncryptionKeyVersion: key}); err != nil {
+			return nil, err
+		}
+		attempt, err = w.uploads.RecordImportResultTx(ctx, tx, uploads.RecordImportResultInput{UserID: job.Args.UserID, BatchID: batchID, SourceIndex: int32(job.Args.SourceIndex), JobID: job.ID, ResultFileID: uuid.UUID(matching.ID.Bytes), Encryption: matching.Encryption, EncryptionKeyVersion: key})
+	} else {
+		attempt, err = w.uploads.ReserveImportAttemptTx(ctx, tx, uploads.ReserveImportAttemptInput{UserID: job.Args.UserID, BatchID: batchID, SourceIndex: int32(job.Args.SourceIndex), JobID: job.ID, UploadID: input.ID, Candidate: candidate, Create: input})
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err = w.commit(ctx, tx); err == nil {
+		return attempt, nil
+	}
+	if errors.Is(err, pgx.ErrTxCommitRollback) {
+		return nil, fmt.Errorf("commit import selection: %w", err)
+	}
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	retained, readErr := w.uploads.GetImportAttempt(readCtx, job.Args.UserID, batchID, int32(job.Args.SourceIndex), job.ID)
+	if readErr != nil {
+		return nil, errors.Join(fmt.Errorf("commit import selection: %w", err), readErr)
+	}
+	if retained.TerminalFailureCode.Valid {
+		return nil, errors.Join(err, river.JobCancel(uploads.ErrParentUnavailable))
+	}
+	if retained.UploadID == attempt.UploadID && retained.ResultFileID == attempt.ResultFileID {
+		return retained, nil
+	}
+	return nil, fmt.Errorf("commit import selection: %w", err)
 }
 
 type UploadSourceOutput struct {
@@ -528,8 +793,18 @@ func (w *UploadSourceWorker) findResumableUpload(ctx context.Context, userID int
 		return nil, map[int32]int64{}, nil
 	}
 	uploadIDs := make([]pgtype.UUID, 0, len(sessions))
-	for _, session := range sessions {
-		uploadIDs = append(uploadIDs, session.ID)
+	for i, session := range sessions {
+		id, ok := dbtypes.GoogleUUID(session.ID)
+		if !ok {
+			return nil, nil, errInvalidUploadSource
+		}
+		// The exact candidate veto precedes part compatibility and any new selection.
+		current, getErr := w.uploads.Get(ctx, userID, id)
+		if getErr != nil {
+			return nil, nil, getErr
+		}
+		sessions[i] = current
+		uploadIDs = append(uploadIDs, current.ID)
 	}
 	parts, err := w.queries.ListUploadPartsByUploadIDs(ctx, uploadIDs)
 	if err != nil {
@@ -556,13 +831,23 @@ func (w *UploadSourceWorker) findResumableUpload(ctx context.Context, userID int
 }
 
 func resumableStoredParts(parts []*sqlcgen.UploadPart, totalSize, partSize int64) (map[int32]int64, bool) {
+	if totalSize < 0 || partSize <= 0 || partSize%uploadChunkBlock != 0 || totalSize/partSize > math.MaxInt32 || (totalSize/partSize == math.MaxInt32 && totalSize%partSize != 0) {
+		return nil, false
+	}
 	stored := make(map[int32]int64)
 	for _, part := range parts {
 		if part.State != sqlcgen.UploadPartStateStored {
 			continue
 		}
+		if part.PartNo <= 0 || int64(part.PartNo-1) > totalSize/partSize {
+			return nil, false
+		}
 		offset := int64(part.PartNo-1) * partSize
-		if offset < 0 || offset >= totalSize || part.PlainSize != min(partSize, totalSize-offset) {
+		digestCount := part.PlainSize / treehash.BlockSize
+		if part.PlainSize%treehash.BlockSize != 0 {
+			digestCount++
+		}
+		if part.PlainSize <= 0 || digestCount > math.MaxInt32 || int64(len(part.BlockHashes)) != digestCount*treehash.DigestSize || !part.Checksum.Valid || part.Checksum.String != treehash.SumToHex(treehash.ComputeTreeHash(part.BlockHashes)) || part.ChannelID == 0 || !part.MessageID.Valid || part.MessageID.Int64 == 0 || !part.StoredSize.Valid || part.StoredSize.Int64 <= 0 || offset < 0 || offset >= totalSize || part.PlainSize != min(partSize, totalSize-offset) {
 			return nil, false
 		}
 		stored[part.PartNo] = part.PlainSize
@@ -582,126 +867,116 @@ func (t *uploadProgressTracker) finish(ctx context.Context, stage string, fileID
 	return t.update(ctx, stage, true)
 }
 
-func (w *UploadSourceWorker) ensureFolders(ctx context.Context, userID int64, parentID *uuid.UUID, directory string) (*uuid.UUID, error) {
-	for name := range strings.SplitSeq(strings.Trim(directory, "/"), "/") {
-		if name == "" || name == "." {
-			continue
-		}
-		id, err := w.queries.ResolveActiveChildFolder(ctx, sqlcgen.ResolveActiveChildFolderParams{UserID: userID, ParentID: dbtypes.OptionalUUID(parentID), Name: name})
-		if errors.Is(err, pgx.ErrNoRows) {
-			folder, createErr := w.catalog.CreateFolder(ctx, catalog.CreateFolderInput{UserID: userID, ParentID: parentID, Name: name})
-			if errors.Is(createErr, catalog.ErrConflict) {
-				id, err = w.queries.ResolveActiveChildFolder(ctx, sqlcgen.ResolveActiveChildFolderParams{UserID: userID, ParentID: dbtypes.OptionalUUID(parentID), Name: name})
-			} else if createErr != nil {
-				return nil, createErr
-			} else {
-				id = folder.ID
-				err = nil
-			}
-		}
+func (w *UploadSourceWorker) openSource(ctx context.Context, source *UploadFileSource) (io.ReadCloser, error) {
+	if source.Type == "local" {
+		file, err := w.openLocalSource(source.Location)
 		if err != nil {
-			return nil, fmt.Errorf("resolve destination folder: %w", err)
+			return nil, errors.New("open local upload source failed")
 		}
-		value, ok := dbtypes.GoogleUUID(id)
-		if !ok {
+		info, err := file.Stat()
+		if err != nil || !info.Mode().IsRegular() {
+			_ = file.Close()
 			return nil, errInvalidUploadSource
 		}
-		parentID = &value
+		source.Size, source.ModTime, source.HasModTime = info.Size(), info.ModTime(), true
+		return file, nil
 	}
-	return parentID, nil
-}
-
-func (w *UploadSourceWorker) detectSourceMIME(ctx context.Context, source UploadFileSource) (string, error) {
-	declared := strings.TrimSpace(source.MIMEType)
-	if parsed, _, err := mime.ParseMediaType(declared); err == nil {
-		declared = parsed
-	}
-	if declared != "" && declared != "application/octet-stream" {
-		return declared, nil
-	}
-
-	var reader io.ReadCloser
-	switch source.Type {
-	case "local":
-		file, err := os.Open(source.Location)
-		if err != nil {
-			return "", fmt.Errorf("open source for MIME detection: %w", err)
-		}
-		reader = file
-	case "http":
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, source.Location, nil)
-		if err != nil {
-			return "", fmt.Errorf("create MIME detection request: %w", err)
-		}
-		applyUploadHeaders(request.Header, source.Headers)
-		request.Header.Set("Range", "bytes=0-511")
-		response, err := w.httpClient.Do(request)
-		if err != nil {
-			return "", errors.New("read HTTP source for MIME detection failed")
-		}
-		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			_ = response.Body.Close()
-			return "", fmt.Errorf("read HTTP source for MIME detection: %s", response.Status)
-		}
-		reader = response.Body
-	default:
-		return "", fmt.Errorf("%w: unsupported source type %q", errInvalidUploadSource, source.Type)
-	}
-	defer reader.Close()
-
-	buffer := make([]byte, 512)
-	read, err := io.ReadFull(reader, buffer)
-	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-		return "", fmt.Errorf("read source for MIME detection: %w", err)
-	}
-	if read > 0 {
-		detected := http.DetectContentType(buffer[:read])
-		if detected != "application/octet-stream" {
-			if parsed, _, err := mime.ParseMediaType(detected); err == nil {
-				return parsed, nil
-			}
-			return detected, nil
-		}
-	}
-	if inferred := mime.TypeByExtension(path.Ext(source.DestinationPath)); inferred != "" {
-		if parsed, _, err := mime.ParseMediaType(inferred); err == nil {
-			return parsed, nil
-		}
-		return inferred, nil
-	}
-	return "application/octet-stream", nil
-}
-
-func (w *UploadSourceWorker) openPart(ctx context.Context, source UploadFileSource, offset, size int64) (io.Reader, func(), error) {
-	if source.Type == "local" {
-		file, err := os.Open(source.Location)
-		if err != nil {
-			return nil, func() {}, fmt.Errorf("open local upload source: %w", err)
-		}
-		return io.NewSectionReader(file, offset, size), func() { _ = file.Close() }, nil
+	if source.Type != "http" {
+		return nil, errInvalidUploadSource
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, source.Location, nil)
 	if err != nil {
-		return nil, func() {}, err
+		return nil, errInvalidUploadSource
+	}
+	if request.URL.Scheme != "http" && request.URL.Scheme != "https" {
+		return nil, errInvalidUploadSource
 	}
 	applyUploadHeaders(request.Header, source.Headers)
-	request.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+size-1))
-	if source.Validator != "" {
-		request.Header.Set("If-Range", source.Validator)
+	for _, name := range []string{"Range", "If-Range", "If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since"} {
+		request.Header.Del(name)
 	}
+	request.Header.Set("Accept-Encoding", "identity")
 	response, err := w.httpClient.Do(request)
 	if err != nil {
-		return nil, func() {}, errors.New("open HTTP upload part request failed")
+		return nil, errors.New("open HTTP upload source failed")
 	}
-	if response.StatusCode != http.StatusPartialContent && !(offset == 0 && size == source.Size && response.StatusCode == http.StatusOK) {
+	encoding := strings.TrimSpace(response.Header.Get("Content-Encoding"))
+	if response.StatusCode != http.StatusOK || response.ContentLength < 0 || response.Header.Get("Content-Range") != "" || response.Uncompressed || (encoding != "" && !strings.EqualFold(encoding, "identity")) {
 		_ = response.Body.Close()
-		return nil, func() {}, fmt.Errorf("HTTP upload source does not support byte ranges: %s", response.Status)
+		return nil, errors.New("HTTP upload source requires a full identity response with content length")
 	}
-	if response.StatusCode == http.StatusPartialContent && !validContentRange(response.Header.Get("Content-Range"), offset, size, source.Size) {
-		_ = response.Body.Close()
-		return nil, func() {}, fmt.Errorf("HTTP upload source returned an invalid content range")
+	source.Size = response.ContentLength
+	source.MIMEType = strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0])
+	source.ModTime, err = http.ParseTime(response.Header.Get("Last-Modified"))
+	source.HasModTime = err == nil
+	return response.Body, nil
+}
+
+func (w *UploadSourceWorker) localSourceMatches(ctx context.Context, source UploadFileSource, expected string) bool {
+	file, err := w.openLocalSource(source.Location)
+	if err != nil {
+		return false
 	}
-	return response.Body, func() { _ = response.Body.Close() }, nil
+	defer file.Close()
+	before, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	hasher := treehash.NewBlockHasher()
+	buffer := make([]byte, 64*1024)
+	var size int64
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		n, readErr := file.Read(buffer)
+		_, _ = hasher.Write(buffer[:n])
+		size += int64(n)
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return false
+		}
+	}
+	current, err := w.openLocalSource(source.Location)
+	if err != nil {
+		return false
+	}
+	defer current.Close()
+	after, err := current.Stat()
+	return err == nil && os.SameFile(before, after) && before.Size() == after.Size() && before.ModTime().Equal(after.ModTime()) && size == source.Size && expected == treehash.SumToHex(treehash.ComputeTreeHash(hasher.Sum()))
+}
+
+func (w *UploadSourceWorker) openLocalSource(location string) (*os.File, error) {
+	location = filepath.Clean(strings.TrimSpace(location))
+	if !filepath.IsAbs(location) || len(w.localImportRoots) == 0 {
+		return nil, errInvalidUploadSource
+	}
+	resolvedLocation, err := filepath.EvalSymlinks(location)
+	if err != nil || resolvedLocation != location {
+		return nil, errInvalidUploadSource
+	}
+	for _, configuredRoot := range w.localImportRoots {
+		root := filepath.Clean(strings.TrimSpace(configuredRoot))
+		if !filepath.IsAbs(root) {
+			continue
+		}
+		resolvedRoot, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			continue
+		}
+		relative, err := filepath.Rel(resolvedRoot, resolvedLocation)
+		if err != nil || !filepath.IsLocal(relative) {
+			continue
+		}
+		// Resolution preserves configured aliases; the rooted open enforces containment even if paths change.
+		file, err := os.OpenInRoot(resolvedRoot, relative)
+		if err == nil {
+			return file, nil
+		}
+	}
+	return nil, errInvalidUploadSource
 }
 
 type uploadFilter struct {
@@ -818,6 +1093,17 @@ func compileUploadGlob(pattern string) (*regexp.Regexp, error) {
 	return compiled, nil
 }
 
+// redactPathError keeps the syscall cause while hiding the local path.
+func redactPathError(err error) error {
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) {
+		return err
+	}
+	redacted := *pathErr
+	redacted.Path = "<redacted>"
+	return &redacted
+}
+
 func validateLocalImportSource(location string, roots []string) error {
 	location = filepath.Clean(strings.TrimSpace(location))
 	if !filepath.IsAbs(location) {
@@ -828,7 +1114,7 @@ func validateLocalImportSource(location string, roots []string) error {
 	}
 	resolvedLocation, err := filepath.EvalSymlinks(location)
 	if err != nil {
-		return fmt.Errorf("inspect local upload source: %w", err)
+		return fmt.Errorf("inspect local upload source: %w", redactPathError(err))
 	}
 	for _, configuredRoot := range roots {
 		root := filepath.Clean(strings.TrimSpace(configuredRoot))
@@ -854,10 +1140,14 @@ func expandLocalSource(source UploadSource, batchFilter uploadFilter) ([]UploadF
 	}
 	info, err := os.Lstat(location)
 	if err != nil {
-		return nil, fmt.Errorf("inspect local upload source: %w", err)
+		return nil, fmt.Errorf("inspect local upload source: %w", redactPathError(err))
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("%w: symlink sources are not supported", errInvalidUploadSource)
+	}
+	location, err = filepath.EvalSymlinks(location)
+	if err != nil {
+		return nil, fmt.Errorf("resolve local upload source: %w", redactPathError(err))
 	}
 	filter, err := newUploadFilter(source.Exclude, "", "")
 	if err != nil {
@@ -887,7 +1177,7 @@ func expandLocalSource(source UploadSource, batchFilter uploadFilter) ([]UploadF
 	files := make([]UploadFileSource, 0)
 	err = filepath.WalkDir(location, func(filePath string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return walkErr
+			return redactPathError(walkErr)
 		}
 		relative, err := filepath.Rel(location, filePath)
 		if err != nil || relative == "." {
@@ -908,7 +1198,7 @@ func expandLocalSource(source UploadSource, batchFilter uploadFilter) ([]UploadF
 		}
 		info, err := entry.Info()
 		if err != nil {
-			return err
+			return redactPathError(err)
 		}
 		if !info.Mode().IsRegular() || uploadSkipReason(batchFilter, filter, relative, info.Size()) != "" {
 			return nil
@@ -917,7 +1207,7 @@ func expandLocalSource(source UploadSource, batchFilter uploadFilter) ([]UploadF
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("walk local upload source: %w", err)
+		return nil, fmt.Errorf("walk local upload source: %w", redactPathError(err))
 	}
 	return files, nil
 }
@@ -1055,24 +1345,11 @@ func optionalString(value string) *string {
 	return &value
 }
 
-func modTimesEqual(left, right time.Time) bool {
-	difference := left.Sub(right)
-	return difference >= -time.Second && difference <= time.Second
-}
-
 func uploadSkipReason(batch, source uploadFilter, name string, size int64) string {
 	if reason := batch.skipReason(name, size); reason != "" {
 		return reason
 	}
 	return source.skipReason(name, size)
-}
-
-func validContentRange(value string, offset, size, total int64) bool {
-	var start, end, reportedTotal int64
-	if _, err := fmt.Sscanf(strings.TrimSpace(value), "bytes %d-%d/%d", &start, &end, &reportedTotal); err != nil {
-		return false
-	}
-	return start == offset && end == offset+size-1 && reportedTotal == total
 }
 
 func NewUploadHTTPClient() *http.Client {

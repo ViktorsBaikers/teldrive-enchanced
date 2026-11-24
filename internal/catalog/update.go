@@ -11,6 +11,7 @@ import (
 
 	"github.com/tgdrive/teldrive/v2/internal/db/sqlcgen"
 	"github.com/tgdrive/teldrive/v2/internal/dbtypes"
+	"github.com/tgdrive/teldrive/v2/internal/lifecycle"
 )
 
 type UpdateInput struct {
@@ -32,7 +33,31 @@ func (s *Service) Update(ctx context.Context, in UpdateInput) (*sqlcgen.File, er
 	if in.Name != nil {
 		name = dbtypes.Text(*in.Name)
 	}
-	file, err := s.queries.UpdateFileMetadata(ctx, sqlcgen.UpdateFileMetadataParams{
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if err = lifecycle.LockOwnerTx(ctx, tx, in.UserID); err != nil {
+		return nil, err
+	}
+	q := s.queries.WithTx(tx)
+	current, err := q.GetFileForUser(ctx, sqlcgen.GetFileForUserParams{FileID: dbtypes.UUID(in.FileID), UserID: in.UserID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var parentID *uuid.UUID
+	if current.ParentID.Valid {
+		parent := uuid.UUID(current.ParentID.Bytes)
+		parentID = &parent
+	}
+	if err = checkActiveParent(ctx, q, in.UserID, parentID); err != nil {
+		return nil, err
+	}
+	file, err := q.UpdateFileMetadata(ctx, sqlcgen.UpdateFileMetadataParams{
 		Name:               name,
 		ModTime:            dbtypes.OptionalTime(in.ModTime),
 		FileID:             dbtypes.UUID(in.FileID),
@@ -47,6 +72,9 @@ func (s *Service) Update(ctx context.Context, in UpdateInput) (*sqlcgen.File, er
 	}
 	if err != nil {
 		return nil, classifyWriteError("update file", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
 	}
 	s.invalidateFile(ctx, in.UserID, in.FileID)
 	return file, nil

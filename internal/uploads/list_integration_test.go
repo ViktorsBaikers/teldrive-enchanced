@@ -16,7 +16,7 @@ func TestListUploadsAndPartsAgainstRealPostgres(t *testing.T) {
 	db := testpostgres.New(t)
 	ctx := context.Background()
 	seedUploadOwner(t, db.Pool, 1001, 9001)
-	svc := uploads.NewService(db.Pool)
+	svc, policy := newUploadFixtureService(t, db.Pool)
 
 	first, err := svc.Create(ctx, uploads.CreateInput{UserID: 1001, Name: "first.bin", ExpectedSize: 1, PartSize: 1})
 	if err != nil {
@@ -66,8 +66,9 @@ func TestListUploadsAndPartsAgainstRealPostgres(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	receiptID := observeUploadFixturePart(t, ctx, policy, firstID, 1, claim.LeaseToken, 99)
 	if _, err := svc.StorePart(ctx, uploads.StorePartInput{
-		UploadID: firstID, PartNo: 1, LeaseToken: claim.LeaseToken,
+		UploadID: firstID, ReceiptID: receiptID, PartNo: 1, LeaseToken: claim.LeaseToken,
 		MessageID: 99, StoredSize: 1, Checksum: checksum, BlockHashes: blockHashes,
 	}); err != nil {
 		t.Fatal(err)
