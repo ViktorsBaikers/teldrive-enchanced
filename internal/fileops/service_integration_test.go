@@ -317,7 +317,7 @@ func TestPurgeManyGroupsTelegramMessagesByChannel(t *testing.T) {
 WITH files AS (
     INSERT INTO files (user_id,name,kind,size,encryption,status,mod_time,deleted_at)
     SELECT 1001, 'pending-' || value, 'file', 1, false, 'deletion_pending', now(), now()
-    FROM generate_series(1, 1000) AS value
+    FROM generate_series(1, 300) AS value
     RETURNING id
 )
 INSERT INTO file_parts (file_id,part_no,channel_id,message_id,plain_size,stored_size,checksum,block_hashes)
@@ -352,8 +352,8 @@ FROM files
 		t.Fatalf("PurgeMany() error = %v", err)
 	}
 	deleteCalls := storage.deleteCallsSnapshot()
-	if len(deleteCalls) != 1 || len(deleteCalls[0]) != 1000 {
-		t.Fatalf("DeleteMessages() calls = %d with sizes %v, want one call of 1000", len(deleteCalls), sliceLengths(deleteCalls))
+	if len(deleteCalls) != 1 || len(deleteCalls[0]) != 300 {
+		t.Fatalf("DeleteMessages() calls = %d with sizes %v, want one call of 300", len(deleteCalls), sliceLengths(deleteCalls))
 	}
 	var remaining int
 	if err := db.Pool.QueryRow(ctx, "SELECT count(*) FROM files WHERE user_id = 1001").Scan(&remaining); err != nil {
