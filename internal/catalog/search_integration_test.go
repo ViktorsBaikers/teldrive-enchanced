@@ -35,16 +35,17 @@ func TestFilenameSearchWordsAndIndex(t *testing.T) {
 	ctx := context.Background()
 	seedUser(t, db.Pool, 1001)
 	seedUser(t, db.Pool, 2002)
+	// The event transaction budget is five seconds; seed in bounded batches so a
+	// slow CI runner cannot exhaust it while inserting the search corpus.
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(ctx)
-	// This fixture seed inserts thousands of event-emitting rows in one transaction.
 	if _, err := tx.Exec(ctx, "SET LOCAL teldrive.event_bulk = 'on'"); err != nil {
+		tx.Rollback(ctx)
 		t.Fatal(err)
 	}
-	_, err = tx.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 INSERT INTO files (id, user_id, name, kind, size, encryption, status, mod_time, deleted_at)
 VALUES
     (gen_random_uuid(), 1001, 'The.Terminal.List.S02.720p.10bit.WEBRip.2CH.x265.HEVC-PSA', 'file', 1, false, 'active', now(), NULL),
@@ -52,15 +53,32 @@ VALUES
     (gen_random_uuid(), 1001, 'The.Other.Series.S02.720p.mkv', 'file', 1, false, 'active', now(), NULL),
     (gen_random_uuid(), 1001, 'Terminal.documentary.720p.mkv', 'file', 1, false, 'active', now(), NULL),
     (gen_random_uuid(), 1001, 'The.Terminal.deleted.mkv', 'file', 1, false, 'trashed', now(), now()),
-    (gen_random_uuid(), 2002, 'The.Terminal.private.mkv', 'file', 1, false, 'active', now(), NULL);
-INSERT INTO files (id, user_id, name, kind, size, encryption, status, mod_time)
-SELECT gen_random_uuid(), 1001, md5(i::text) || '.unrelated.mkv', 'file', 1, false, 'active', now()
-FROM generate_series(1, 3000) i;`)
-	if err != nil {
+    (gen_random_uuid(), 2002, 'The.Terminal.private.mkv', 'file', 1, false, 'active', now(), NULL)`); err != nil {
+		tx.Rollback(ctx)
 		t.Fatal(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
+	}
+	for batch := range 6 {
+		tx, err := db.Pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, "SET LOCAL teldrive.event_bulk = 'on'"); err != nil {
+			tx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `
+INSERT INTO files (id, user_id, name, kind, size, encryption, status, mod_time)
+SELECT gen_random_uuid(), 1001, md5(i::text) || '.unrelated.mkv', 'file', 1, false, 'active', now()
+FROM generate_series($1::int, $2::int) i`, batch*500+1, (batch+1)*500); err != nil {
+			tx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := db.Pool.Exec(ctx, "VACUUM ANALYZE files"); err != nil {
 		t.Fatal(err)
