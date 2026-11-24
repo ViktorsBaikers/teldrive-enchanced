@@ -1369,6 +1369,9 @@ func runB3HeldCompleteAfterCommit(t *testing.T, binary string) {
 // TestB3PairedMountConsistency drives the actual generated server stack with a
 // supervised VFS child over a private channel.
 func TestB3PairedMountConsistency(t *testing.T) {
+	if os.Getenv("B3_VFS_TEST_BIN") == "" || os.Getenv("B3_VFS_TEST_SHA256") == "" {
+		t.Skip("private B3 paired VFS authority not supplied; paired proof NOT-RUN")
+	}
 	binary := b3ChildBinary(t)
 	start := time.Now()
 	t.Run("retained_stream_recovery", func(t *testing.T) { runB3RetentionRecovery(t, binary) })

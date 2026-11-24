@@ -791,6 +791,9 @@ func validateModeledDetachment(s legacyScenario, parent uuid.UUID) error {
 
 func newRestoredFixture(t *testing.T, mode string) *restoredFixture {
 	t.Helper()
+	if os.Getenv("B2_ISOLATION_APPROVAL") == "" || os.Getenv("B2_RESTORE_CASES") == "" {
+		t.Skip("private B2 restore authority not supplied; restore proof NOT-RUN")
+	}
 	ctx := context.Background()
 	var cases map[string]restoreCase
 	privateJSON(t, os.Getenv("B2_RESTORE_CASES"), &cases)

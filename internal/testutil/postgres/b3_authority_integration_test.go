@@ -23,22 +23,22 @@ import (
 )
 
 const (
-	b3InsertWork    = `INSERT INTO b3_qual_control.work_rows (payload) VALUES ('qualification')`
-	b3StaleUse      = `SELECT payload FROM b3_qual_control.work_rows`
-	b3StaleCleanup  = `DELETE FROM b3_qual_control.work_rows WHERE payload = 'qualification'`
-	b3ArchiveSchema = "b3_qual_archive"
-	b3ControlSchema = "b3_qual_control"
-	b3WriterBegin = "BEGIN"
-	b3WriterXID = `SELECT pg_current_xact_id()::text`
-	b3WriterCommit = "COMMIT"
-	b3Setval = `SELECT setval('b3_qual_control.existing_rows_id_seq'::regclass, 12345, true)`
-	b3Nextval = `SELECT nextval('b3_qual_control.existing_rows_id_seq'::regclass)`
-	b3Undeclared = `INSERT INTO b3_qual_control.existing_rows (payload) VALUES ('must-not-exist')`
-	b3XactStatus = `SELECT pg_xact_status($1::text::xid8)`
-	b3NoWork = `SELECT NOT EXISTS (SELECT FROM b3_qual_control.work_rows)`
-	b3NoTrigger = `SELECT NOT EXISTS (SELECT FROM b3_qual_control.trigger_rows)`
+	b3InsertWork     = `INSERT INTO b3_qual_control.work_rows (payload) VALUES ('qualification')`
+	b3StaleUse       = `SELECT payload FROM b3_qual_control.work_rows`
+	b3StaleCleanup   = `DELETE FROM b3_qual_control.work_rows WHERE payload = 'qualification'`
+	b3ArchiveSchema  = "b3_qual_archive"
+	b3ControlSchema  = "b3_qual_control"
+	b3WriterBegin    = "BEGIN"
+	b3WriterXID      = `SELECT pg_current_xact_id()::text`
+	b3WriterCommit   = "COMMIT"
+	b3Setval         = `SELECT setval('b3_qual_control.existing_rows_id_seq'::regclass, 12345, true)`
+	b3Nextval        = `SELECT nextval('b3_qual_control.existing_rows_id_seq'::regclass)`
+	b3Undeclared     = `INSERT INTO b3_qual_control.existing_rows (payload) VALUES ('must-not-exist')`
+	b3XactStatus     = `SELECT pg_xact_status($1::text::xid8)`
+	b3NoWork         = `SELECT NOT EXISTS (SELECT FROM b3_qual_control.work_rows)`
+	b3NoTrigger      = `SELECT NOT EXISTS (SELECT FROM b3_qual_control.trigger_rows)`
 	b3ExistingLedger = `SELECT ARRAY(SELECT id::text || ':' || payload FROM b3_qual_control.existing_rows ORDER BY id, payload COLLATE "C")`
-	b3AbsentSQL = `SELECT NOT EXISTS (SELECT FROM pg_namespace WHERE nspname = 'b3_qual_archive')
+	b3AbsentSQL      = `SELECT NOT EXISTS (SELECT FROM pg_namespace WHERE nspname = 'b3_qual_archive')
 AND NOT EXISTS (SELECT FROM pg_class WHERE oid = ANY($1::text::oid[]))`
 	b3DeferredCatalog = `SELECT count(*) = 1 FROM pg_trigger
 WHERE tgrelid = 'b3_qual_control.work_rows'::regclass AND tgname = 'qualification_deferred'
@@ -74,27 +74,27 @@ func b3SyntheticQueries(caseName string) []string {
 }
 
 type b3DatabaseIdentity struct {
-	name string
-	oid uint32
-	ownerOID uint32
-	writer string
-	writerOID uint32
-	observer string
+	name        string
+	oid         uint32
+	ownerOID    uint32
+	writer      string
+	writerOID   uint32
+	observer    string
 	observerOID uint32
-	cluster string
-	system string
-	port uint16
+	cluster     string
+	system      string
+	port        uint16
 }
 
 type b3SequenceState struct {
-	start int64
+	start     int64
 	increment int64
-	min int64
-	max int64
-	cache int64
-	last int64
-	called bool
-	cycle bool
+	min       int64
+	max       int64
+	cache     int64
+	last      int64
+	called    bool
+	cycle     bool
 }
 
 func (s b3SequenceState) next() (int64, bool) {
@@ -112,9 +112,9 @@ func (s b3SequenceState) next() (int64, bool) {
 
 type b3SequenceObservation struct {
 	tableOID, sequenceOID uint32
-	column int16
-	state b3SequenceState
-	owned string
+	column                int16
+	state                 b3SequenceState
+	owned                 string
 }
 
 type b3SequenceName struct {
@@ -123,7 +123,7 @@ type b3SequenceName struct {
 
 var (
 	b3IdentitySequence = b3SequenceName{b3ArchiveSchema, "identity_rows", "identity_rows_id_seq"}
-	b3SerialSequence = b3SequenceName{b3ArchiveSchema, "serial_rows", "serial_rows_id_seq"}
+	b3SerialSequence   = b3SequenceName{b3ArchiveSchema, "serial_rows", "serial_rows_id_seq"}
 	b3ExistingSequence = b3SequenceName{b3ControlSchema, "existing_rows", "existing_rows_id_seq"}
 )
 
@@ -288,6 +288,9 @@ func b3ObserveExistingRows(t *testing.T, ctx context.Context, tx pgx.Tx) []strin
 
 // TestB3FencedTailQualification verifies only the sealed qualification lane.
 func TestB3FencedTailQualification(t *testing.T) {
+	if os.Getenv(b3QualificationEnv) == "" {
+		t.Skip("private B3 qualification custody not supplied; qualification proof NOT-RUN")
+	}
 	if path := os.Getenv(b3CustodianEnv); path != "" {
 		if err := b3ServeCustody(t.Context(), path, b3ArchiveRules, b3ObserverQueries, b3SyntheticQueries); err != nil {
 			t.Fatal("qualification custodian startup or resource verification failed")
@@ -349,11 +352,11 @@ func TestB3FencedTailQualification(t *testing.T) {
 }
 
 type b3RunCase struct {
-	q *b3Qualification
-	ctx context.Context
-	name string
+	q        *b3Qualification
+	ctx      context.Context
+	name     string
 	deadline uint64
-	peer uint32
+	peer     uint32
 }
 
 func b3BeginCase(t *testing.T, ctx context.Context, q *b3Qualification, name string) b3RunCase {
@@ -698,8 +701,8 @@ func b3AssertDeniedSequenceOrigin(t *testing.T, r b3RunCase, denial b3Receipt, b
 
 type b3RestoreEvidence struct {
 	caseName string
-	xid uint64
-	state [2]b3SequenceObservation
+	xid      uint64
+	state    [2]b3SequenceObservation
 }
 
 func b3RestoreState(kind string, detail string) (b3SequenceObservation, bool) {
@@ -721,8 +724,8 @@ func b3RestoreState(kind string, detail string) (b3SequenceObservation, bool) {
 }
 
 var b3RestoredKinds = [...]struct {
-	kind, ownership string
-	name b3SequenceName
+	kind, ownership              string
+	name                         b3SequenceName
 	start, increment, last, next int64
 }{
 	{"identity", "i", b3IdentitySequence, 17, 5, 22, 27},
@@ -826,8 +829,8 @@ func b3MarkArchiveRule(t *testing.T, seen []bool, detail string) {
 
 type b3RetiredSession struct {
 	conn *pgx.Conn
-	pid uint32
-	xid uint64
+	pid  uint32
+	xid  uint64
 }
 
 func (r b3RunCase) retired(t *testing.T) b3RetiredSession {
@@ -968,43 +971,43 @@ func b3ConfirmRestoredSequence(t *testing.T, ctx context.Context, q *b3Qualifica
 }
 
 type b3ArchiveSourceSequence struct {
-	Kind string `json:"kind"`
-	TableOID uint32 `json:"table_oid"`
-	SequenceOID uint32 `json:"sequence_oid"`
-	Column int16 `json:"column"`
-	CreatedLast int64 `json:"created_last"`
-	CreatedCalled bool `json:"created_called"`
-	Increment int64 `json:"increment"`
-	Min int64 `json:"min"`
-	Max int64 `json:"max"`
-	Cache int64 `json:"cache"`
-	Cycle bool `json:"cycle"`
-	ArchivedLast int64 `json:"archived_last"`
-	ArchivedCalled bool `json:"archived_called"`
-	ArchivedNext int64 `json:"archived_next"`
-	SeedXID uint64 `json:"seed_xid,string"`
-	Allocations []uint64 `json:"allocations_at_ns"`
-	Deadline uint64 `json:"deadline_ns,string"`
+	Kind           string   `json:"kind"`
+	TableOID       uint32   `json:"table_oid"`
+	SequenceOID    uint32   `json:"sequence_oid"`
+	Column         int16    `json:"column"`
+	CreatedLast    int64    `json:"created_last"`
+	CreatedCalled  bool     `json:"created_called"`
+	Increment      int64    `json:"increment"`
+	Min            int64    `json:"min"`
+	Max            int64    `json:"max"`
+	Cache          int64    `json:"cache"`
+	Cycle          bool     `json:"cycle"`
+	ArchivedLast   int64    `json:"archived_last"`
+	ArchivedCalled bool     `json:"archived_called"`
+	ArchivedNext   int64    `json:"archived_next"`
+	SeedXID        uint64   `json:"seed_xid,string"`
+	Allocations    []uint64 `json:"allocations_at_ns"`
+	Deadline       uint64   `json:"deadline_ns,string"`
 }
 
 type b3ArchiveProvenance struct {
-	Version int `json:"version"`
-	RunNonce string `json:"run_nonce"`
-	Candidate string `json:"candidate"`
-	SourceRunNonce string `json:"source_run_nonce"`
-	SourceApprovalSHA256 string `json:"source_approval_sha256"`
-	SourceEvidenceSHA256 string `json:"source_evidence_sha256"`
-	SourceDatabase string `json:"source_database"`
-	SourceDatabaseOID uint32 `json:"source_database_oid"`
-	SourceSystemIdentifier string `json:"source_system_identifier"`
-	SourceWriter string `json:"source_writer"`
-	SourceWriterOID uint32 `json:"source_writer_oid"`
-	DumpSHA256 string `json:"pg_dump_sha256"`
-	ArchiveSHA256 string `json:"archive_sha256"`
-	TOCSHA256 string `json:"toc_sha256"`
-	ScriptSHA256 string `json:"script_sha256"`
-	DumpArgs []string `json:"dump_args"`
-	Sequences []b3ArchiveSourceSequence `json:"sequences"`
+	Version                int                       `json:"version"`
+	RunNonce               string                    `json:"run_nonce"`
+	Candidate              string                    `json:"candidate"`
+	SourceRunNonce         string                    `json:"source_run_nonce"`
+	SourceApprovalSHA256   string                    `json:"source_approval_sha256"`
+	SourceEvidenceSHA256   string                    `json:"source_evidence_sha256"`
+	SourceDatabase         string                    `json:"source_database"`
+	SourceDatabaseOID      uint32                    `json:"source_database_oid"`
+	SourceSystemIdentifier string                    `json:"source_system_identifier"`
+	SourceWriter           string                    `json:"source_writer"`
+	SourceWriterOID        uint32                    `json:"source_writer_oid"`
+	DumpSHA256             string                    `json:"pg_dump_sha256"`
+	ArchiveSHA256          string                    `json:"archive_sha256"`
+	TOCSHA256              string                    `json:"toc_sha256"`
+	ScriptSHA256           string                    `json:"script_sha256"`
+	DumpArgs               []string                  `json:"dump_args"`
+	Sequences              []b3ArchiveSourceSequence `json:"sequences"`
 }
 
 func b3ArchiveRules(ctx context.Context, q *b3Qualification) (b3RestoreRules, error) {
@@ -1065,19 +1068,19 @@ func (source b3ArchiveProvenance) valid(q *b3Qualification) bool {
 }
 
 type b3SourceEvidence struct {
-	Version int `json:"version"`
-	Nonce string `json:"nonce"`
-	Candidate string `json:"candidate"`
-	SystemIdentifier string `json:"system_identifier"`
-	DatabaseOID uint32 `json:"database_oid"`
-	ObserverOID uint32 `json:"observer_oid"`
-	Receipts []b3Receipt `json:"server_receipts"`
-	Outcomes []b3SourceOutcome `json:"observer_outcomes"`
+	Version          int               `json:"version"`
+	Nonce            string            `json:"nonce"`
+	Candidate        string            `json:"candidate"`
+	SystemIdentifier string            `json:"system_identifier"`
+	DatabaseOID      uint32            `json:"database_oid"`
+	ObserverOID      uint32            `json:"observer_oid"`
+	Receipts         []b3Receipt       `json:"server_receipts"`
+	Outcomes         []b3SourceOutcome `json:"observer_outcomes"`
 }
 
 type b3SourceOutcome struct {
-	XID uint64 `json:"xid,string"`
-	At uint64 `json:"monotonic_ns,string"`
+	XID    uint64 `json:"xid,string"`
+	At     uint64 `json:"monotonic_ns,string"`
 	Status string `json:"status"`
 }
 
@@ -1211,7 +1214,9 @@ func b3ValidateArchiveTOC(toc []byte, source b3ArchiveProvenance) bool {
 		case "SEQUENCE OWNED BY b3_qual_archive serial_rows_id_seq", "DEFAULT b3_qual_archive serial_rows id",
 			"ACL - SCHEMA b3_qual_archive", "ACL b3_qual_archive TABLE identity_rows", "ACL b3_qual_archive TABLE serial_rows",
 			"ACL b3_qual_archive SEQUENCE identity_rows_id_seq", "ACL b3_qual_archive SEQUENCE serial_rows_id_seq":
-			if n != 1 { return false }
+			if n != 1 {
+				return false
+			}
 		default:
 			return false
 		}
@@ -1223,8 +1228,8 @@ func b3RestoreMetadata(writer, observer string) (required, optional []string) {
 	required = []string{"CREATE SCHEMA b3_qual_archive", "ALTER SCHEMA b3_qual_archive OWNER TO " + writer,
 		"GRANT USAGE ON SCHEMA b3_qual_archive TO " + observer}
 	for _, kind := range b3RestoredKinds {
-		table := b3ArchiveSchema+"."+kind.name.table
-		seq := b3ArchiveSchema+"."+kind.name.sequence
+		table := b3ArchiveSchema + "." + kind.name.table
+		seq := b3ArchiveSchema + "." + kind.name.sequence
 		required = append(required, "ALTER TABLE "+table+" OWNER TO "+writer,
 			"GRANT SELECT ON TABLE "+table+" TO "+observer, "GRANT SELECT ON SEQUENCE "+seq+" TO "+observer)
 		optional = append(optional, "ALTER SEQUENCE "+seq+" OWNER TO "+writer,
@@ -1333,15 +1338,15 @@ func b3RestoreStructuralSQL() map[string][]string {
 	serial := "b3_qual_archive.serial_rows"
 	identitySeq, serialSeq := identity+"_id_seq", serial+"_id_seq"
 	return map[string][]string{
-		"CREATE TABLE "+identity+" ( id bigint NOT NULL, payload text NOT NULL )": ddl,
-		"CREATE TABLE "+serial+" ( id bigint NOT NULL, payload text NOT NULL )": ddl,
-		"ALTER TABLE "+identity+" ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY ( SEQUENCE NAME "+identitySeq+
+		"CREATE TABLE " + identity + " ( id bigint NOT NULL, payload text NOT NULL )": ddl,
+		"CREATE TABLE " + serial + " ( id bigint NOT NULL, payload text NOT NULL )":   ddl,
+		"ALTER TABLE " + identity + " ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY ( SEQUENCE NAME " + identitySeq +
 			" START WITH 17 INCREMENT BY 5 NO MINVALUE NO MAXVALUE CACHE 1 )": ddl,
-		"CREATE SEQUENCE "+serialSeq+" START WITH 29 INCREMENT BY 7 NO MINVALUE NO MAXVALUE CACHE 1": ddl,
-		"ALTER SEQUENCE "+serialSeq+" OWNED BY "+serial+".id": ddl,
-		"ALTER TABLE ONLY "+serial+" ALTER COLUMN id SET DEFAULT nextval('"+serialSeq+"'::regclass)": ddl,
-		"COPY "+identity+" (id, payload) FROM stdin": {"17\tidentity-first", "22\tidentity-second"},
-		"COPY "+serial+" (id, payload) FROM stdin": {"29\tserial-first", "36\tserial-second"},
+		"CREATE SEQUENCE " + serialSeq + " START WITH 29 INCREMENT BY 7 NO MINVALUE NO MAXVALUE CACHE 1":     ddl,
+		"ALTER SEQUENCE " + serialSeq + " OWNED BY " + serial + ".id":                                        ddl,
+		"ALTER TABLE ONLY " + serial + " ALTER COLUMN id SET DEFAULT nextval('" + serialSeq + "'::regclass)": ddl,
+		"COPY " + identity + " (id, payload) FROM stdin":                                                     {"17\tidentity-first", "22\tidentity-second"},
+		"COPY " + serial + " (id, payload) FROM stdin":                                                       {"29\tserial-first", "36\tserial-second"},
 	}
 }
 
@@ -1368,7 +1373,6 @@ func b3RestoreScaffolding(sql string) bool {
 	}
 	return false
 }
-
 
 func b3SourceAllocationOrigin(sequences []b3ArchiveSourceSequence, rec b3Receipt) bool {
 	for _, seq := range sequences {

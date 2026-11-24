@@ -62,7 +62,7 @@ func (s *Service) Create(ctx context.Context, userID int64, name string, selecte
 	}
 	remote, err := s.creator.Create(ctx, userID, name)
 	if err != nil {
-		return nil, s.retainAllocation(userID, remote.ID, nil, fmt.Errorf("create Telegram channel: %w", err))
+		return nil, s.retainAllocation(nil, userID, remote.ID, nil, fmt.Errorf("create Telegram channel: %w", err))
 	}
 	if remote.ID == 0 {
 		return nil, errors.New("Telegram returned an empty channel id")
@@ -72,33 +72,33 @@ func (s *Service) Create(ctx context.Context, userID int64, name string, selecte
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, s.retainAllocation(userID, remote.ID, nil, err)
+		return nil, s.retainAllocation(nil, userID, remote.ID, nil, err)
 	}
 	defer tx.Rollback(ctx)
 	if err := lifecycle.LockOwnerTx(ctx, tx, userID); err != nil {
-		return nil, s.retainAllocation(userID, remote.ID, tx, err)
+		return nil, s.retainAllocation(nil, userID, remote.ID, tx, err)
 	}
 	if err := lifecycle.RequireWritableChannelsTx(ctx, tx, []int64{remote.ID}); err != nil {
-		return nil, s.retainAllocation(userID, remote.ID, tx, err)
+		return nil, s.retainAllocation(nil, userID, remote.ID, tx, err)
 	}
 	q := s.queries.WithTx(tx)
 	if selected {
 		if err := q.ClearSelectedChannel(ctx, userID); err != nil {
-			return nil, s.retainAllocation(userID, remote.ID, tx, fmt.Errorf("clear selected channel: %w", err))
+			return nil, s.retainAllocation(nil, userID, remote.ID, tx, fmt.Errorf("clear selected channel: %w", err))
 		}
 	}
 	row, err := q.CreateChannel(ctx, sqlcgen.CreateChannelParams{ChannelID: remote.ID, UserID: userID, Name: remote.Name})
 	if err != nil {
-		return nil, s.retainAllocation(userID, remote.ID, tx, fmt.Errorf("create channel record: %w", err))
+		return nil, s.retainAllocation(nil, userID, remote.ID, tx, fmt.Errorf("create channel record: %w", err))
 	}
 	if selected {
 		row, err = q.SelectChannel(ctx, sqlcgen.SelectChannelParams{UserID: userID, ChannelID: remote.ID})
 		if err != nil {
-			return nil, s.retainAllocation(userID, remote.ID, tx, fmt.Errorf("select created channel: %w", err))
+			return nil, s.retainAllocation(nil, userID, remote.ID, tx, fmt.Errorf("select created channel: %w", err))
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, s.retainAllocation(userID, remote.ID, nil, fmt.Errorf("commit created channel: %w", err))
+		return nil, s.retainAllocation(nil, userID, remote.ID, nil, fmt.Errorf("commit created channel: %w", err))
 	}
 	return row, nil
 }

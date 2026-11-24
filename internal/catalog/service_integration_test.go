@@ -133,7 +133,7 @@ FROM generate_series(1, 500) AS value`); err != nil {
 	if len(moved) != len(fileIDs) {
 		t.Fatalf("moved files = %d, want %d", len(moved), len(fileIDs))
 	}
-	for _, name := range []string{"LockActiveFiles", "ListFileAncestorIDs", "LockActiveDestinationEntries", "MoveFilesWithNames"} {
+	for _, name := range []string{"ListActiveFilesForLifecycle", "ListFileAncestorIDs", "ListActiveDestinationEntries", "MoveFilesWithNames"} {
 		if got := tracer.Count(name); got != 1 {
 			t.Fatalf("%s queries = %d, want 1", name, got)
 		}
@@ -417,8 +417,8 @@ func TestCatalogRejectsInvalidParent(t *testing.T) {
 	seedUser(t, db.Pool, 1001)
 	svc := catalog.NewService(db.Pool, nil)
 	missing := uuid.New()
-	if _, err := svc.CreateFolder(ctx, catalog.CreateFolderInput{UserID: 1001, ParentID: &missing, Name: "child"}); !errors.Is(err, catalog.ErrInvalidParent) {
-		t.Fatalf("invalid parent error = %v", err)
+	if _, err := svc.CreateFolder(ctx, catalog.CreateFolderInput{UserID: 1001, ParentID: &missing, Name: "child"}); !errors.Is(err, catalog.ErrParentUnavailable) {
+		t.Fatalf("invalid parent error = %v, want ErrParentUnavailable", err)
 	}
 }
 

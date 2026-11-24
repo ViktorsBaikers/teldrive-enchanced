@@ -128,7 +128,7 @@ SELECT EXISTS (
 	}
 }
 
-func TestRollbackOneMigrationAndReapply(t *testing.T) {
+func TestRollbackRefusesForwardOnlyMigration(t *testing.T) {
 	for _, schema := range []string{database.DefaultSchema, "tenant_rollback"} {
 		t.Run(schema, func(t *testing.T) {
 			db := testpostgres.New(t)
@@ -138,33 +138,31 @@ func TestRollbackOneMigrationAndReapply(t *testing.T) {
 				t.Fatal(err)
 			}
 			table := pgx.Identifier{schema, "migrations"}.Sanitize()
-			var latest, previous int64
+			var latest int64
 			if err := db.Pool.QueryRow(ctx, "SELECT max(version_id) FROM "+table+" WHERE is_applied").Scan(&latest); err != nil {
-				t.Fatal(err)
-			}
-			if err := db.Pool.QueryRow(ctx, "SELECT max(version_id) FROM "+table+" WHERE is_applied AND version_id < $1", latest).Scan(&previous); err != nil {
 				t.Fatal(err)
 			}
 			var riverBefore int
 			if err := db.Pool.QueryRow(ctx, "SELECT count(*) FROM "+pgx.Identifier{schema, "river_migration"}.Sanitize()).Scan(&riverBefore); err != nil {
 				t.Fatal(err)
 			}
-			if err := database.Rollback(ctx, cfg); err != nil {
-				t.Fatal(err)
+			err := database.Rollback(ctx, cfg)
+			if err == nil || !strings.Contains(err.Error(), "forward-only") {
+				t.Fatalf("rollback of forward-only migration = %v, want refusal", err)
 			}
 			var after int64
 			if err := db.Pool.QueryRow(ctx, "SELECT max(version_id) FROM "+table+" WHERE is_applied").Scan(&after); err != nil {
 				t.Fatal(err)
 			}
-			if after != previous {
-				t.Fatalf("rollback version = %d, want exactly previous %d (was %d)", after, previous, latest)
+			if after != latest {
+				t.Fatalf("refused rollback changed version: %d, want %d", after, latest)
 			}
 			var riverAfter int
 			if err := db.Pool.QueryRow(ctx, "SELECT count(*) FROM "+pgx.Identifier{schema, "river_migration"}.Sanitize()).Scan(&riverAfter); err != nil {
 				t.Fatal(err)
 			}
 			if riverAfter != riverBefore {
-				t.Fatalf("rollback changed River migrations: %d -> %d", riverBefore, riverAfter)
+				t.Fatalf("refused rollback changed River migrations: %d -> %d", riverBefore, riverAfter)
 			}
 			if schema != database.DefaultSchema {
 				var other int64
@@ -172,22 +170,12 @@ func TestRollbackOneMigrationAndReapply(t *testing.T) {
 					t.Fatal(err)
 				}
 				if other != latest {
-					t.Fatalf("rollback affected another schema: %d", other)
+					t.Fatalf("refused rollback affected another schema: %d", other)
 				}
-			}
-			if err := database.Migrate(ctx, cfg); err != nil {
-				t.Fatal(err)
-			}
-			if err := db.Pool.QueryRow(ctx, "SELECT max(version_id) FROM "+table+" WHERE is_applied").Scan(&after); err != nil {
-				t.Fatal(err)
-			}
-			if after != latest {
-				t.Fatalf("up version = %d, want %d", after, latest)
 			}
 		})
 	}
 }
-
 func TestRollbackMissingSchemaDoesNotCreateObjects(t *testing.T) {
 	db := testpostgres.New(t)
 	ctx := context.Background()

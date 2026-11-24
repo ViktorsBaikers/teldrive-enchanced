@@ -95,7 +95,7 @@ func (s *Service) Resolve(ctx context.Context, userID, requestedChannelID int64)
 		if full {
 			return 0, ErrChannelFull
 		}
-		if err := s.requireWritableHint(ctx, userID, requestedChannelID); err != nil {
+		if err := s.requireWritableHint(ctx, nil, userID, requestedChannelID); err != nil {
 			return 0, err
 		}
 		return requestedChannelID, nil
@@ -109,7 +109,7 @@ func (s *Service) Resolve(ctx context.Context, userID, requestedChannelID int64)
 				return 0, countErr
 			}
 			if !full {
-				if err := s.requireWritableHint(ctx, userID, selected.ChannelID); err != nil {
+				if err := s.requireWritableHint(ctx, nil, userID, selected.ChannelID); err != nil {
 					return 0, err
 				}
 				return selected.ChannelID, nil
@@ -177,7 +177,7 @@ func (s *Service) ResolveMany(ctx context.Context, userID int64, count int) (cha
 			capacity = min(capacity, count-len(channelIDs))
 		}
 		if channelID != 0 && capacity > 0 {
-			if err := s.requireWritableHint(ctx, userID, channelID); err != nil {
+			if err := s.requireWritableHint(ctx, conn, userID, channelID); err != nil {
 				return nil, err
 			}
 			for range capacity {
@@ -210,7 +210,7 @@ func (s *Service) createSelectedChannel(ctx context.Context, conn *pgxpool.Conn,
 	name := fmt.Sprintf("%s_%s", strings.TrimSpace(s.config.NamePrefix), s.now().UTC().Format("20060102_150405"))
 	remote, err := s.creator.Create(ctx, userID, name)
 	if err != nil {
-		return nil, s.retainAllocation(userID, remote.ID, nil, fmt.Errorf("create Telegram channel: %w", err))
+		return nil, s.retainAllocation(conn, userID, remote.ID, nil, fmt.Errorf("create Telegram channel: %w", err))
 	}
 	if remote.ID == 0 {
 		return nil, errors.New("Telegram returned an empty channel id")
@@ -220,28 +220,28 @@ func (s *Service) createSelectedChannel(ctx context.Context, conn *pgxpool.Conn,
 	}
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return nil, s.retainAllocation(userID, remote.ID, nil, fmt.Errorf("begin channel allocation: %w", err))
+		return nil, s.retainAllocation(conn, userID, remote.ID, nil, fmt.Errorf("begin channel allocation: %w", err))
 	}
 	defer tx.Rollback(ctx)
 	if err := lifecycle.LockOwnerTx(ctx, tx, userID); err != nil {
-		return nil, s.retainAllocation(userID, remote.ID, tx, err)
+		return nil, s.retainAllocation(conn, userID, remote.ID, tx, err)
 	}
 	if err := lifecycle.RequireWritableChannelsTx(ctx, tx, []int64{remote.ID}); err != nil {
-		return nil, s.retainAllocation(userID, remote.ID, tx, err)
+		return nil, s.retainAllocation(conn, userID, remote.ID, tx, err)
 	}
 	q := queries.WithTx(tx)
 	if err := q.ClearSelectedChannel(ctx, userID); err != nil {
-		return nil, s.retainAllocation(userID, remote.ID, tx, fmt.Errorf("clear selected channel: %w", err))
+		return nil, s.retainAllocation(conn, userID, remote.ID, tx, fmt.Errorf("clear selected channel: %w", err))
 	}
 	if _, err := q.CreateChannel(ctx, sqlcgen.CreateChannelParams{ChannelID: remote.ID, UserID: userID, Name: remote.Name}); err != nil {
-		return nil, s.retainAllocation(userID, remote.ID, tx, fmt.Errorf("create channel record: %w", err))
+		return nil, s.retainAllocation(conn, userID, remote.ID, tx, fmt.Errorf("create channel record: %w", err))
 	}
 	selected, err := q.SelectChannel(ctx, sqlcgen.SelectChannelParams{UserID: userID, ChannelID: remote.ID})
 	if err != nil {
-		return nil, s.retainAllocation(userID, remote.ID, tx, fmt.Errorf("select channel record: %w", err))
+		return nil, s.retainAllocation(conn, userID, remote.ID, tx, fmt.Errorf("select channel record: %w", err))
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, s.retainAllocation(userID, remote.ID, nil, fmt.Errorf("commit channel allocation: %w", err))
+		return nil, s.retainAllocation(conn, userID, remote.ID, nil, fmt.Errorf("commit channel allocation: %w", err))
 	}
 	return selected, nil
 }
@@ -292,7 +292,7 @@ func (s *Service) rollover(ctx context.Context, userID int64) (channelID int64, 
 			return 0, countErr
 		}
 		if !full {
-			if err := s.requireWritableHint(ctx, userID, selected.ChannelID); err != nil {
+			if err := s.requireWritableHint(ctx, conn, userID, selected.ChannelID); err != nil {
 				return 0, err
 			}
 			return selected.ChannelID, nil
@@ -328,7 +328,7 @@ func (e *AllocationFailure) Unwrap() []error {
 	return []error{e.Cause, e.Secondary}
 }
 
-func (s *Service) retainAllocation(userID, channelID int64, tx pgx.Tx, cause error) error {
+func (s *Service) retainAllocation(conn *pgxpool.Conn, userID, channelID int64, tx pgx.Tx, cause error) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	report := &AllocationFailure{UserID: userID, ChannelID: channelID,
@@ -350,14 +350,29 @@ func (s *Service) retainAllocation(userID, channelID int64, tx pgx.Tx, cause err
 			rolledBack = true
 		}
 	}
-	// A separate pool acquisition never reuses the failed allocation transaction.
-	conn, err := s.pool.Acquire(ctx)
-	if err != nil {
-		report.Secondary = errors.Join(report.Secondary, fmt.Errorf("read retained allocation: %w", err))
-		return report
+	// Try a separate connection briefly so pool-level failures stay visible,
+	// but never block the advisory-lock path on an exhausted pool.
+	var q *sqlcgen.Queries
+	if conn == nil {
+		acquired, err := s.pool.Acquire(ctx)
+		if err != nil {
+			report.Secondary = errors.Join(report.Secondary, fmt.Errorf("read retained allocation: %w", err))
+			return report
+		}
+		defer acquired.Release()
+		q = sqlcgen.New(acquired)
+	} else {
+		acquireCtx, cancel := context.WithTimeout(ctx, time.Second)
+		acquired, err := s.pool.Acquire(acquireCtx)
+		cancel()
+		if err != nil {
+			report.Secondary = errors.Join(report.Secondary, fmt.Errorf("read retained allocation: %w", err))
+			q = sqlcgen.New(conn)
+		} else {
+			defer acquired.Release()
+			q = sqlcgen.New(acquired)
+		}
 	}
-	defer conn.Release()
-	q := sqlcgen.New(conn)
 	var rowErr error
 	if channelID != 0 {
 		_, rowErr = q.GetChannelForUser(ctx, sqlcgen.GetChannelForUserParams{UserID: userID, ChannelID: channelID})
@@ -377,8 +392,16 @@ func (s *Service) retainAllocation(userID, channelID int64, tx pgx.Tx, cause err
 	return report
 }
 
-func (s *Service) requireWritableHint(ctx context.Context, userID, channelID int64) error {
-	tx, err := s.pool.Begin(ctx)
+func (s *Service) requireWritableHint(ctx context.Context, conn *pgxpool.Conn, userID, channelID int64) error {
+	var (
+		tx  pgx.Tx
+		err error
+	)
+	if conn != nil {
+		tx, err = conn.Begin(ctx)
+	} else {
+		tx, err = s.pool.Begin(ctx)
+	}
 	if err != nil {
 		return err
 	}

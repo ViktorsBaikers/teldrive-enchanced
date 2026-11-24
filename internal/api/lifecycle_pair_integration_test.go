@@ -146,6 +146,9 @@ func pairPrivatePath(t *testing.T, path string, directory bool) {
 }
 
 func pairCandidate(t *testing.T) string {
+	if os.Getenv("B2_ISOLATION_APPROVAL") == "" || os.Getenv("B2_PROOF_DIR") == "" || os.Getenv("B2_PAIRED_RESTORE_INPUT") == "" {
+		t.Skip("private B2 paired authority not supplied; paired proof NOT-RUN")
+	}
 	t.Helper()
 	binary, expected := os.Getenv("B2_RCLONE_BINARY"), os.Getenv("B2_RCLONE_SHA256")
 	if !filepath.IsAbs(binary) || filepath.Clean(binary) != binary || len(expected) != 64 {
@@ -187,6 +190,9 @@ func pairCandidate(t *testing.T) string {
 }
 
 func newPair(t *testing.T, binary string) *pairFixture {
+	if os.Getenv("B2_ISOLATION_APPROVAL") == "" || os.Getenv("B2_PROOF_DIR") == "" {
+		t.Skip("private B2 paired authority not supplied; paired proof NOT-RUN")
+	}
 	t.Helper()
 	db := testpostgres.New(t)
 	// Leave cleanup headroom within the root's 90-second per-leaf bound.
@@ -2158,6 +2164,9 @@ func pairLegacyTriggers(t *testing.T, pool *pgxpool.Pool, retained map[string]st
 }
 
 func runPairLegacy(t *testing.T, binary string) {
+	if os.Getenv("B2_ISOLATION_APPROVAL") == "" || os.Getenv("B2_PAIRED_RESTORE_INPUT") == "" {
+		t.Skip("private B2 paired restore authority not supplied; paired legacy proof NOT-RUN")
+	}
 	approvalPath, inputPath, rawURL := os.Getenv("B2_ISOLATION_APPROVAL"), os.Getenv("B2_PAIRED_RESTORE_INPUT"), os.Getenv("TEST_DATABASE_URL")
 	snapshotPath, evidencePath := os.Getenv("B2_PAIRED_LEGACY_SNAPSHOT"), os.Getenv("B2_PAIRED_LEGACY_EVIDENCE")
 	if inputPath == "" || snapshotPath == "" || evidencePath == "" {
